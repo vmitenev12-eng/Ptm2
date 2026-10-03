@@ -43,16 +43,32 @@ public class Patcher implements Opcodes {
         try (ZipFile zin = new ZipFile(base);
              ZipFile fz = new ZipFile(fixes);
              ZipOutputStream zout = new ZipOutputStream(new FileOutputStream(out))) {
+            // В некоторых архивах имена записей начинаются с "/", из-за чего классы не находятся.
+            // Нормализуем имена (убираем ведущие "/"), манифест пишем первым.
+            java.util.List<ZipEntry> entries = new java.util.ArrayList<>();
             Enumeration<? extends ZipEntry> en = zin.entries();
             while (en.hasMoreElements()) {
-                ZipEntry e = en.nextElement();
-                byte[] data;
-                try (InputStream in = zin.getInputStream(e)) {
-                    data = in.readAllBytes();
+                entries.add(en.nextElement());
+            }
+            entries.sort((a, b) -> Boolean.compare(!normalize(a.getName()).equals("META-INF/MANIFEST.MF"),
+                                                   !normalize(b.getName()).equals("META-INF/MANIFEST.MF")));
+            int fixedNames = 0;
+            for (ZipEntry e : entries) {
+                String name = normalize(e.getName());
+                if (!name.equals(e.getName())) {
+                    fixedNames++;
                 }
-                String name = e.getName();
-                if (name.endsWith(".class")) {
-                    data = patchClass(name.substring(0, name.length() - 6), data);
+                if (name.isEmpty() || written.contains(name)) {
+                    continue;
+                }
+                byte[] data = new byte[0];
+                if (!e.isDirectory()) {
+                    try (InputStream in = zin.getInputStream(e)) {
+                        data = in.readAllBytes();
+                    }
+                    if (name.endsWith(".class")) {
+                        data = patchClass(name.substring(0, name.length() - 6), data);
+                    }
                 }
                 ZipEntry ne = new ZipEntry(name);
                 ne.setTime(e.getTime());
@@ -61,6 +77,7 @@ public class Patcher implements Opcodes {
                 zout.closeEntry();
                 written.add(name);
             }
+            System.out.println("entries written: " + written.size() + ", names normalized: " + fixedNames);
             Enumeration<? extends ZipEntry> fe = fz.entries();
             int added = 0;
             while (fe.hasMoreElements()) {
@@ -98,6 +115,14 @@ public class Patcher implements Opcodes {
             System.err.println("ERROR: indefinite flags were not found");
             System.exit(1);
         }
+    }
+
+    static String normalize(String name) {
+        String n = name.replace('\\', '/');
+        while (n.startsWith("/")) {
+            n = n.substring(1);
+        }
+        return n;
     }
 
     static byte[] patchClass(String name, byte[] data) {

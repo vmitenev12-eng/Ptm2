@@ -146,9 +146,13 @@ public class Patcher implements Opcodes {
             }
         }
         if (name.equals(ATM)) {
+            // Вызываем PtmFixes.atmDeposit(player, level), затем обнуляем сумму: исходный код ничего не делает.
             InsnList list = new InsnList();
             list.add(new VarInsnNode(ALOAD, 0));
-            list.add(new MethodInsnNode(INVOKESTATIC, ATM_MENU, "getTotatlValue", "(Lnet/minecraft/world/entity/Entity;)D", false));
+            list.add(new VarInsnNode(ALOAD, 0));
+            list.add(new MethodInsnNode(INVOKEVIRTUAL, "net/minecraft/world/entity/player/Player", "m_9236_", "()Lnet/minecraft/world/level/Level;", false));
+            list.add(new MethodInsnNode(INVOKESTATIC, FIXES, "atmDeposit", "(Lnet/minecraft/world/entity/player/Player;Lnet/minecraft/world/level/Level;)V", false));
+            list.add(new InsnNode(DCONST_0));
             list.add(new VarInsnNode(DSTORE, 1));
             if (insertAtStart(cn, "handle", "(Lnet/minecraft/world/entity/player/Player;D)V", list)) {
                 done.add("atm-amount");

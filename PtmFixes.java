@@ -4,10 +4,18 @@ import com.rinventor.ptm2.core.properties.VDMemoryIDs;
 import com.rinventor.ptm2.dimension.virtual.storage.VDStorageHandler;
 import com.rinventor.ptm2.dimension.virtual.types.VDPlatform;
 import com.rinventor.ptm2.dimension.virtual.types.VDStation;
+import com.rinventor.ptm2.dimension.virtual.util.PaymentUtils;
+import com.rinventor.ptm2.dimension.virtual.util.VDUtils;
+import com.rinventor.ptm2.engine.base.PTMChat;
+import com.rinventor.ptm2.engine.base.PTMEntity;
 import com.rinventor.ptm2.engine.base.PTMLogger;
+import com.rinventor.ptm2.engine.base.PTMScreen;
 import com.rinventor.ptm2.engine.base.PTMWorld;
+import com.rinventor.ptm2.engine.util.Translation;
+import com.rinventor.ptm2.objects.blockentities.atm.ATMMenu;
 import java.util.HashMap;
 import java.util.Map;
+import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.level.Level;
 
 /**
@@ -83,6 +91,50 @@ public final class PtmFixes {
             } catch (Exception e) {
                 PTMLogger.error(e);
             }
+        }
+    }
+
+
+    /**
+     * Вклад в банкомат. Вызывается из ATMButtonServerboundPacket.handle(Player, double) вместо
+     * исходной логики (исходная после этого получает сумму 0 и ничего не делает).
+     * Работает только на сервере: сумма считается по предметам в слотах, результат пишется в чат.
+     */
+    public static void atmDeposit(Player player, Level level) {
+        try {
+            if (player == null || level == null || PTMWorld.isClient(player)) {
+                return;
+            }
+            boolean hasInput = !PTMScreen.isSlotEmpty(0, player) || !PTMScreen.isSlotEmpty(1, player);
+            double amount = ATMMenu.getTotatlValue(player);
+            double x = PTMEntity.getX(player);
+            double y = PTMEntity.getY(player);
+            double z = PTMEntity.getZ(player);
+            String ok = "green";
+            String bad = "red";
+            if (!hasInput) {
+                PTMChat.msgNearest("ATM: \u0441\u043b\u043e\u0442\u044b \u043f\u0443\u0441\u0442\u044b", bad, level, x, y, z);
+                return;
+            }
+            if (!(amount > 0.0D)) {
+                PTMChat.msgNearest("ATM: \u0443 \u043f\u0440\u0435\u0434\u043c\u0435\u0442\u043e\u0432 \u043d\u0435\u0442 \u0446\u0435\u043d\u044b (\u0441\u0443\u043c\u043c\u0430 0)", bad, level, x, y, z);
+                return;
+            }
+            var before = VDUtils.getWorker(player);
+            if (before == null) {
+                PTMChat.msgNearest("ATM: \u0441\u0447\u0451\u0442 \u0438\u0433\u0440\u043e\u043a\u0430 \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d", bad, level, x, y, z);
+                return;
+            }
+            double oldMoney = before.getSecond().money;
+            PaymentUtils.add(player, amount, Translation.get("ptm2.banking.description.atm_deposit"));
+            PTMScreen.setSlotEmpty(0, player);
+            PTMScreen.setSlotEmpty(1, player);
+            var after = VDUtils.getWorker(player);
+            double newMoney = after == null ? -1.0D : after.getSecond().money;
+            PTMChat.msgNearest("ATM: +" + amount + " | \u0431\u0430\u043b\u0430\u043d\u0441 " + oldMoney + " -> " + newMoney,
+                newMoney > oldMoney ? ok : bad, level, x, y, z);
+        } catch (Exception e) {
+            PTMLogger.error(e);
         }
     }
 

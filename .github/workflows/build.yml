@@ -81,6 +81,17 @@ jobs:
           java -cp tools:tools/asm.jar:tools/asm-tree.jar Patcher base/ptm2-base.jar build/libs/fixes.jar out/ptm2-patched.jar
           ls -l out
 
+      - name: Add Russian translation
+        run: |
+          if [ -f ru_ru.json ]; then
+            mkdir -p tmpjar/assets/ptm2/lang
+            cp ru_ru.json tmpjar/assets/ptm2/lang/ru_ru.json
+            (cd tmpjar && zip -u ../out/ptm2-patched.jar assets/ptm2/lang/ru_ru.json)
+            unzip -l out/ptm2-patched.jar | grep ru_ru.json
+          else
+            echo "ru_ru.json not found, skipping"
+          fi
+
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}

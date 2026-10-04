@@ -31,6 +31,9 @@ public class Patcher implements Opcodes {
     static final String ATM_MENU = "com/rinventor/ptm2/objects/blockentities/atm/ATMMenu";
     static final String VU = "com/rinventor/ptm2/dimension/virtual/storage/requests/ValueUpdateServerboundPacket";
     static final String WSD = "com/rinventor/ptm2/core/data/WorldSavedData";
+    static final String VSH = "com/rinventor/ptm2/dimension/virtual/storage/VDStorageHandler";
+    static final String PTE = "com/rinventor/ptm2/engine/base/PTMEntity";
+    static final String TRN = "com/rinventor/ptm2/objects/entities/vehicle/Transport";
 
     static final Set<String> done = new HashSet<>();
     static int flagReplacements = 0;
@@ -104,7 +107,7 @@ public class Patcher implements Opcodes {
             }
         }
         System.out.println("patched: " + done + ", indefinite-flag reads replaced: " + flagReplacements);
-        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook"};
+        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay"};
         for (String r : required) {
             if (!done.contains(r)) {
                 System.err.println("ERROR: patch not applied: " + r);
@@ -126,7 +129,7 @@ public class Patcher implements Opcodes {
     }
 
     static byte[] patchClass(String name, byte[] data) {
-        boolean target = name.equals(OPD) || name.equals(ATM) || name.equals(VU);
+        boolean target = name.equals(OPD) || name.equals(ATM) || name.equals(VU) || name.equals(VSH) || name.equals(PTE) || name.equals(TRN);
         boolean flags = contains(data, "INDEFINITE_BANK_ACCOUNT") || contains(data, "INDEFINITE_TRANSPORT_CARD");
         if (!target && !flags) {
             return data;
@@ -165,6 +168,47 @@ public class Patcher implements Opcodes {
                     if (hooks > 0) {
                         done.add("diag-hook");
                         changed = true;
+                    }
+                }
+            }
+        }
+        if (name.equals(VSH)) {
+            InsnList l = new InsnList();
+            l.add(new VarInsnNode(ALOAD, 0));
+            l.add(new VarInsnNode(ALOAD, 1));
+            l.add(new VarInsnNode(ALOAD, 2));
+            l.add(new MethodInsnNode(INVOKESTATIC, FIXES, "onRemove",
+                "(Lnet/minecraft/world/level/Level;Ljava/lang/String;Lcom/rinventor/ptm2/core/properties/VDMemoryIDs;)V", false));
+            if (insertAtStart(cn, "remove",
+                "(Lnet/minecraft/world/level/Level;Ljava/lang/String;Lcom/rinventor/ptm2/core/properties/VDMemoryIDs;)V", l)) {
+                done.add("remove-hook");
+                changed = true;
+            }
+        }
+        if (name.equals(PTE)) {
+            InsnList l = new InsnList();
+            l.add(new VarInsnNode(ALOAD, 0));
+            l.add(new VarInsnNode(ALOAD, 1));
+            l.add(new MethodInsnNode(INVOKESTATIC, FIXES, "onDespawn",
+                "(Ljava/lang/String;Lnet/minecraft/world/entity/Entity;)V", false));
+            if (insertAtStart(cn, "syncedDespawn", "(Ljava/lang/String;Lnet/minecraft/world/entity/Entity;)V", l)) {
+                done.add("despawn-hook");
+                changed = true;
+            }
+        }
+        if (name.equals(TRN)) {
+            // Возврат автоматического водителя после ухода игрока: 30 с -> 5 с
+            for (MethodNode m : cn.methods) {
+                if (m.name.equals("updateAutomaticDriverHandoff") && m.desc.equals("()V")) {
+                    for (AbstractInsnNode insn : m.instructions.toArray()) {
+                        if (insn instanceof org.objectweb.asm.tree.LdcInsnNode) {
+                            org.objectweb.asm.tree.LdcInsnNode ldc = (org.objectweb.asm.tree.LdcInsnNode) insn;
+                            if (ldc.cst instanceof Double && ((Double) ldc.cst).doubleValue() == 30.0D) {
+                                ldc.cst = Double.valueOf(5.0D);
+                                done.add("driver-delay");
+                                changed = true;
+                            }
+                        }
                     }
                 }
             }

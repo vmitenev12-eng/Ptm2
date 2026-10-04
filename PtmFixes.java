@@ -14,6 +14,7 @@ import com.rinventor.ptm2.dimension.virtual.types.VDOperationalData;
 import com.rinventor.ptm2.engine.util.TimeHelper;
 import com.rinventor.ptm2.dimension.physical.TransportModelData;
 import com.rinventor.ptm2.engine.bezier.utility.Pair;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
 import com.rinventor.ptm2.dimension.virtual.storage.VDStorageHandler;
@@ -31,6 +32,7 @@ import com.rinventor.ptm2.objects.blockentities.atm.ATMMenu;
 import java.util.HashMap;
 import java.util.Map;
 import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.entity.Entity;
 import net.minecraft.world.level.Level;
 
 /**
@@ -154,6 +156,107 @@ public final class PtmFixes {
     }
 
 
+
+    private static final ArrayDeque<String> REMOVALS = new ArrayDeque<>();
+
+    private static void remember(String line) {
+        synchronized (REMOVALS) {
+            REMOVALS.addFirst(line);
+            while (REMOVALS.size() > 8) {
+                REMOVALS.removeLast();
+            }
+        }
+    }
+
+    private static String caller() {
+        StackTraceElement[] st = new Throwable().getStackTrace();
+        StringBuilder sb = new StringBuilder();
+        int found = 0;
+        for (StackTraceElement e : st) {
+            String c = e.getClassName();
+            if (c.endsWith("PtmFixes") || c.endsWith("VDStorageHandler") || c.endsWith("PTMEntity")) {
+                continue;
+            }
+            String simple = c.substring(c.lastIndexOf('.') + 1);
+            if (found > 0) {
+                sb.append(" < ");
+            }
+            sb.append(simple).append('.').append(e.getMethodName()).append(':').append(e.getLineNumber());
+            if (++found >= 2) {
+                break;
+            }
+        }
+        return sb.toString();
+    }
+
+    /** Вызывается перед VDStorageHandler.remove(Level, String, VDMemoryIDs): запоминаем, кто удалил автобус. */
+    public static void onRemove(Level level, String id, VDMemoryIDs mapID) {
+        try {
+            if (level == null || mapID != VDMemoryIDs.TRACKABLE_VEHICLE || PTMWorld.isClient(level)) {
+                return;
+            }
+            String data = VDStorageHandler.get(level, id, VDMemoryIDs.TRACKABLE_VEHICLE);
+            String info = "";
+            if (data != null && !data.isEmpty()) {
+                VDTrackableVehicle v = new VDTrackableVehicle(data);
+                info = " \u043b\u0438\u043d\u0438\u044f=" + v.lineID + " \u0440\u0435\u0439\u0441=" + v.routeID
+                    + " \u043f\u043b\u0430\u0442\u0444\u043e\u0440\u043c\u0430=" + v.nextPlatformID
+                    + (v.virtual ? " \u0432\u0438\u0440\u0442." : " \u0444\u0438\u0437.");
+            }
+            remember(String.format("%02d:%02d:%02d", TimeHelper.hour(level), TimeHelper.minute(level),
+                (int) ((System.currentTimeMillis() / 1000L) % 60L)) + " " + caller() + info);
+        } catch (Exception e) {
+            // диагностика не должна ломать игру
+        }
+    }
+
+    /** Вызывается в начале PTMEntity.syncedDespawn(String, Entity). */
+    public static void onDespawn(String reason, Entity entity) {
+        try {
+            if (entity == null || reason == null || reason.isEmpty()) {
+                return;
+            }
+            if (PTMWorld.isClient(entity)) {
+                return;
+            }
+            String cls = entity.getClass().getSimpleName();
+            if (cls.contains("Transport") || cls.contains("Bus") || cls.contains("Tram") || cls.contains("Driver")
+                || entity.getClass().getName().contains("vehicle")) {
+                remember("\u0441\u0443\u0449\u043d\u043e\u0441\u0442\u044c " + cls + ": " + reason + " < " + caller());
+            }
+        } catch (Exception e) {
+            // диагностика не должна ломать игру
+        }
+    }
+
+    private static void removalLines(Level level, int companyID, List<VDOperationalData> entries) {
+        List<String> copy;
+        synchronized (REMOVALS) {
+            copy = new ArrayList<>(REMOVALS);
+        }
+        if (copy.isEmpty()) {
+            entries.add(new VDOperationalData(companyID, OperationalSeverity.INFO,
+                "\u0414\u0418\u0410\u0413: \u0443\u0434\u0430\u043b\u0435\u043d\u0438\u0439 \u0430\u0432\u0442\u043e\u0431\u0443\u0441\u043e\u0432 \u043d\u0435 \u0431\u044b\u043b\u043e"));
+            return;
+        }
+        for (String c : copy) {
+            entries.add(new VDOperationalData(companyID, OperationalSeverity.INFO, "\u0414\u0418\u0410\u0413: \u0443\u0434\u0430\u043b\u0435\u043d " + c));
+        }
+    }
+
+    private static void workerLines(Level level, int companyID, List<VDOperationalData> entries) {
+        StringBuilder sb = new StringBuilder("\u0414\u0418\u0410\u0413: \u0441\u0447\u0435\u0442\u0430 \u0438\u0433\u0440\u043e\u043a\u043e\u0432 (\u0441\u0435\u0440\u0432\u0435\u0440): ");
+        int n = 0;
+        for (Map.Entry<Integer, String> e : VDStorageHandler.getAll(level, VDMemoryIDs.WORKER).entrySet()) {
+            if (n++ >= 6) {
+                break;
+            }
+            com.rinventor.ptm2.dimension.virtual.types.VDWorker w = new com.rinventor.ptm2.dimension.virtual.types.VDWorker(e.getValue());
+            sb.append('#').append(e.getKey()).append(' ').append(w.name).append('=').append(w.money).append("; ");
+        }
+        entries.add(new VDOperationalData(companyID, OperationalSeverity.INFO, sb.toString()));
+    }
+
     private static String yn(boolean v) {
         return v ? "\u0434\u0430" : "\u041d\u0415\u0422";
     }
@@ -265,6 +368,8 @@ public final class PtmFixes {
                         + (noPath == null || noPath.isEmpty() ? "\u0435\u0441\u0442\u044c" : "\u041d\u0415\u0422 (" + noPath.size() + ")")));
                 }
             }
+            removalLines(level, companyID, entries);
+            workerLines(level, companyID, entries);
         } catch (Exception e) {
             PTMLogger.error(e);
         }

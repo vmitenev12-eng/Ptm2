@@ -104,7 +104,7 @@ public class Patcher implements Opcodes {
             }
         }
         System.out.println("patched: " + done + ", indefinite-flag reads replaced: " + flagReplacements);
-        String[] required = {"hook-tick", "atm-amount", "value-update-filter"};
+        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook"};
         for (String r : required) {
             if (!done.contains(r)) {
                 System.err.println("ERROR: patch not applied: " + r);
@@ -143,6 +143,30 @@ public class Patcher implements Opcodes {
             if (insertAtStart(cn, "run", "()V", list)) {
                 done.add("hook-tick");
                 changed = true;
+            }
+        }
+        if (name.equals(OPD)) {
+            // Диагностика: перед каждым возвратом из collectEntries(int) вызываем PtmFixes.diag(level, companyID, entries)
+            for (MethodNode m : cn.methods) {
+                if (m.name.equals("collectEntries") && m.desc.equals("(I)Ljava/util/List;")) {
+                    int hooks = 0;
+                    for (AbstractInsnNode insn : m.instructions.toArray()) {
+                        if (insn.getOpcode() == ARETURN) {
+                            InsnList l = new InsnList();
+                            l.add(new VarInsnNode(ALOAD, 0));
+                            l.add(new FieldInsnNode(GETFIELD, cn.name, "level", "Lnet/minecraft/world/level/Level;"));
+                            l.add(new VarInsnNode(ILOAD, 1));
+                            l.add(new VarInsnNode(ALOAD, 2));
+                            l.add(new MethodInsnNode(INVOKESTATIC, FIXES, "diag", "(Lnet/minecraft/world/level/Level;ILjava/util/List;)V", false));
+                            m.instructions.insertBefore(insn, l);
+                            hooks++;
+                        }
+                    }
+                    if (hooks > 0) {
+                        done.add("diag-hook");
+                        changed = true;
+                    }
+                }
             }
         }
         if (name.equals(ATM)) {

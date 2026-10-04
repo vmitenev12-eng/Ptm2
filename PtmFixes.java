@@ -1,6 +1,21 @@
 package com.rinventor.ptm2.fixes;
 
+import com.rinventor.ptm2.PTM;
+import com.rinventor.ptm2.core.data.WorldSavedData;
 import com.rinventor.ptm2.core.properties.VDMemoryIDs;
+import com.rinventor.ptm2.core.properties.VehicleTypes;
+import com.rinventor.ptm2.dimension.virtual.types.VDRoute;
+import com.rinventor.ptm2.dimension.virtual.types.VDTrackableVehicle;
+import com.rinventor.ptm2.dimension.virtual.types.VDTransportLine;
+import com.rinventor.ptm2.dimension.virtual.util.ScheduleUtils;
+import com.rinventor.ptm2.dimension.virtual.util.VDErrors;
+import com.rinventor.ptm2.engine.data.OperationalSeverity;
+import com.rinventor.ptm2.dimension.virtual.types.VDOperationalData;
+import com.rinventor.ptm2.engine.util.TimeHelper;
+import com.rinventor.ptm2.dimension.physical.TransportModelData;
+import com.rinventor.ptm2.engine.bezier.utility.Pair;
+import java.util.ArrayList;
+import java.util.List;
 import com.rinventor.ptm2.dimension.virtual.storage.VDStorageHandler;
 import com.rinventor.ptm2.dimension.virtual.types.VDPlatform;
 import com.rinventor.ptm2.dimension.virtual.types.VDStation;
@@ -133,6 +148,123 @@ public final class PtmFixes {
             double newMoney = after == null ? -1.0D : after.getSecond().money;
             PTMChat.msgNearest("ATM: +" + amount + " | \u0431\u0430\u043b\u0430\u043d\u0441 " + oldMoney + " -> " + newMoney,
                 newMoney > oldMoney ? ok : bad, level, x, y, z);
+        } catch (Exception e) {
+            PTMLogger.error(e);
+        }
+    }
+
+
+    private static String yn(boolean v) {
+        return v ? "\u0434\u0430" : "\u041d\u0415\u0422";
+    }
+
+    /**
+     * Диагностика для экрана «Операционная информация»: добавляет информационные строки с
+     * состоянием цепочки линия -> рейс -> расписание -> автобус. Вызывается из
+     * OperationalDataUpdater.collectEntries перед возвратом списка.
+     */
+    public static void diag(Level level, int companyID, List<VDOperationalData> entries) {
+        try {
+            if (level == null || entries == null) {
+                return;
+            }
+            WorldSavedData data = (WorldSavedData) PTM.DATA.get(level);
+            int hour = TimeHelper.hour(level);
+            int minute = TimeHelper.minute(level);
+            int nowMin = hour * 60 + minute;
+            int day = Math.floorMod(TimeHelper.weekday(level) - 1, 7);
+            entries.add(new VDOperationalData(companyID, OperationalSeverity.INFO,
+                "\u0414\u0418\u0410\u0413: \u0440\u0435\u0430\u043b\u044c\u043d\u044b\u0439 \u0446\u0438\u043a\u043b=" + yn(data.REAL_DAYLIGHT)
+                + ", \u0441\u043f\u0430\u0432\u043d \u0442\u0440\u0430\u043d\u0441\u043f\u043e\u0440\u0442\u0430=" + yn(data.SPAWN_TRANSPORT)
+                + ", \u0432\u0440\u0435\u043c\u044f \u043e\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d\u043e=" + yn(TimeHelper.isTimeStopped(level))
+                + ", \u0432\u0440\u0435\u043c\u044f " + String.format("%02d:%02d", hour, minute) + ", \u0434\u0435\u043d\u044c " + day));
+
+            Map<Integer, VDTransportLine> lines = VDUtils.loadLinesForCompany(level, companyID);
+            Map<Integer, String> routes = VDStorageHandler.getAll(level, VDMemoryIDs.ROUTE);
+            Map<String, String> stored = VDStorageHandler.getStrs(level, VDMemoryIDs.TRACKABLE_VEHICLE);
+            List<VDTrackableVehicle> vehicles = new ArrayList<>();
+            for (String v : stored.values()) {
+                try {
+                    vehicles.add(new VDTrackableVehicle(v));
+                } catch (Exception ignored) {
+                    // пропускаем повреждённые записи
+                }
+            }
+
+            for (Map.Entry<Integer, VDTransportLine> le : lines.entrySet()) {
+                int lineId = le.getKey();
+                VDTransportLine line = le.getValue();
+                String number = line.number == null || line.number.isEmpty() || line.number.equals("null") ? "?" : line.number;
+                int routeCount = 0;
+                for (String r : routes.values()) {
+                    if (r != null && !r.isEmpty() && new VDRoute(r).lineID == lineId) {
+                        routeCount++;
+                    }
+                }
+                List<Pair<Integer, Pair<Integer, String>>> sched = ScheduleUtils.getSimpleScheduleEntriesFor(level, lineId, day);
+                int entriesToday = sched == null ? 0 : sched.size();
+                int next = -1;
+                if (sched != null) {
+                    for (Pair<Integer, Pair<Integer, String>> e : sched) {
+                        int m = TimeHelper.parseTime(e.getSecond().getSecond());
+                        if (m >= nowMin && (next == -1 || m < next)) {
+                            next = m;
+                        }
+                    }
+                }
+                int models = TransportModelData.models(VehicleTypes.fromID(line.type)).size();
+                int active = 0;
+                for (VDTrackableVehicle v : vehicles) {
+                    if (v.lineID == lineId && v.isTransport()) {
+                        active++;
+                    }
+                }
+                entries.add(new VDOperationalData(companyID, OperationalSeverity.INFO,
+                    "\u0414\u0418\u0410\u0413: \u043b\u0438\u043d\u0438\u044f " + number
+                    + ": \u0440\u0430\u0441\u043f\u0438\u0441\u0430\u043d\u0438\u0435=" + (line.scheduleType == 0 ? "\u0443\u043f\u0440\u043e\u0449." : "\u0440\u0435\u0430\u043b.")
+                    + (line.suspended ? ", \u041f\u0420\u0418\u041e\u0421\u0422\u0410\u041d\u041e\u0412\u041b\u0415\u041d\u0410" : "")
+                    + ", \u0440\u0435\u0439\u0441\u043e\u0432=" + routeCount
+                    + ", \u043e\u0442\u043f\u0440\u0430\u0432\u043b\u0435\u043d\u0438\u0439 \u0441\u0435\u0433\u043e\u0434\u043d\u044f=" + entriesToday
+                    + (next >= 0 ? ", \u0431\u043b\u0438\u0436\u0430\u0439\u0448\u0435\u0435 " + String.format("%02d:%02d", next / 60, next % 60) : ", \u0431\u043b\u0438\u0436\u0430\u0439\u0448\u0438\u0445 \u043d\u0435\u0442")
+                    + ", \u043c\u043e\u0434\u0435\u043b\u0435\u0439 \u0442\u0440\u0430\u043d\u0441\u043f\u043e\u0440\u0442\u0430=" + models
+                    + ", \u043c\u0430\u0448\u0438\u043d \u0432 \u0438\u0433\u0440\u0435=" + active
+                    + ", \u0434\u0435\u043f\u043e=" + (line.depotID == -1 ? "\u043d\u0435\u0442" : String.valueOf(line.depotID))));
+
+                int shown = 0;
+                for (Map.Entry<Integer, String> re : routes.entrySet()) {
+                    if (shown >= 6) {
+                        break;
+                    }
+                    String raw = re.getValue();
+                    if (raw == null || raw.isEmpty()) {
+                        continue;
+                    }
+                    VDRoute route = new VDRoute(raw);
+                    if (route.lineID != lineId) {
+                        continue;
+                    }
+                    shown++;
+                    List<Integer> stops = VDUtils.parseStops(route.stops);
+                    int closed = 0;
+                    int missing = 0;
+                    for (int platformId : stops) {
+                        VDPlatform platform = VDUtils.getPlatform(level, platformId);
+                        if (platform == null) {
+                            missing++;
+                        } else if (platform.closed) {
+                            closed++;
+                        }
+                    }
+                    List<String> noPath = VDErrors.hasPathBetweenStops(level, re.getKey(), route);
+                    entries.add(new VDOperationalData(companyID, OperationalSeverity.INFO,
+                        "\u0414\u0418\u0410\u0413: \u0440\u0435\u0439\u0441 " + route.letter + " \u043b\u0438\u043d\u0438\u0438 " + number
+                        + ": \u043e\u0441\u0442\u0430\u043d\u043e\u0432\u043e\u043a=" + stops.size()
+                        + ", \u043d\u0435\u0442 \u043f\u043b\u0430\u0442\u0444\u043e\u0440\u043c\u044b=" + missing
+                        + ", \u0437\u0430\u043a\u0440\u044b\u0442\u043e=" + closed
+                        + ", \u043f\u0443\u0442\u044c \u043c\u0435\u0436\u0434\u0443 \u043e\u0441\u0442\u0430\u043d\u043e\u0432\u043a\u0430\u043c\u0438="
+                        + (noPath == null || noPath.isEmpty() ? "\u0435\u0441\u0442\u044c" : "\u041d\u0415\u0422 (" + noPath.size() + ")")));
+                }
+            }
         } catch (Exception e) {
             PTMLogger.error(e);
         }

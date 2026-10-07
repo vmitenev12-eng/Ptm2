@@ -34,6 +34,9 @@ public class Patcher implements Opcodes {
     static final String VSH = "com/rinventor/ptm2/dimension/virtual/storage/VDStorageHandler";
     static final String PTE = "com/rinventor/ptm2/engine/base/PTMEntity";
     static final String TRN = "com/rinventor/ptm2/objects/entities/vehicle/Transport";
+    static final String GATE_IN = "com/rinventor/ptm2/objects/blockentities/gate/GateIn";
+    static final String VEH = "com/rinventor/ptm2/objects/entities/vehicle/Vehicle";
+    static final String GATE_EXIT = "com/rinventor/ptm2/objects/blockentities/gate/GateExit";
 
     static final Set<String> done = new HashSet<>();
     static int flagReplacements = 0;
@@ -107,7 +110,7 @@ public class Patcher implements Opcodes {
             }
         }
         System.out.println("patched: " + done + ", indefinite-flag reads replaced: " + flagReplacements);
-        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay"};
+        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay", "gate-bankcard", "boarding-fare", "gate-exit-radius", "gate-exit-auto", "gate-in-radius"};
         for (String r : required) {
             if (!done.contains(r)) {
                 System.err.println("ERROR: patch not applied: " + r);
@@ -129,7 +132,7 @@ public class Patcher implements Opcodes {
     }
 
     static byte[] patchClass(String name, byte[] data) {
-        boolean target = name.equals(OPD) || name.equals(ATM) || name.equals(VU) || name.equals(VSH) || name.equals(PTE) || name.equals(TRN);
+        boolean target = name.equals(OPD) || name.equals(ATM) || name.equals(VU) || name.equals(VSH) || name.equals(PTE) || name.equals(TRN) || name.equals(GATE_IN) || name.equals(VEH) || name.equals(GATE_EXIT);
         boolean flags = contains(data, "INDEFINITE_BANK_ACCOUNT") || contains(data, "INDEFINITE_TRANSPORT_CARD");
         if (!target && !flags) {
             return data;
@@ -208,6 +211,140 @@ public class Patcher implements Opcodes {
                                 done.add("driver-delay");
                                 changed = true;
                             }
+                        }
+                    }
+                }
+            }
+        }
+        if (name.equals(GATE_IN)) {
+            // Банковская карта на входном турникете: вместо списания «поездок» (TransportCard.useCard)
+            // списываем цену билета со счёта игрока в пользу компании, как для смартфона.
+            for (MethodNode m : cn.methods) {
+                if (!m.name.equals("m_6227_")) {
+                    continue;
+                }
+                AbstractInsnNode[] all = m.instructions.toArray();
+                for (int i = 0; i < all.length; i++) {
+                    AbstractInsnNode insn = all[i];
+                    if (insn instanceof MethodInsnNode) {
+                        MethodInsnNode mi = (MethodInsnNode) insn;
+                        if (mi.getOpcode() == INVOKESTATIC && mi.name.equals("useCard")
+                            && mi.owner.equals("com/rinventor/ptm2/objects/items/TransportCard")
+                            && i >= 2 && all[i - 1].getOpcode() == ICONST_1 && all[i - 2].getOpcode() == ALOAD) {
+                            InsnList repl = new InsnList();
+                            repl.add(new VarInsnNode(ALOAD, 0));
+                            repl.add(new VarInsnNode(ALOAD, 2));
+                            repl.add(new VarInsnNode(ALOAD, 3));
+                            repl.add(new VarInsnNode(ALOAD, 4));
+                            repl.add(new VarInsnNode(ALOAD, 1));
+                            repl.add(new FieldInsnNode(GETSTATIC, GATE_IN, "COMPANY", "Lnet/minecraft/world/level/block/state/properties/IntegerProperty;"));
+                            repl.add(new MethodInsnNode(INVOKEVIRTUAL, "net/minecraft/world/level/block/state/BlockState", "m_61143_",
+                                "(Lnet/minecraft/world/level/block/state/properties/Property;)Ljava/lang/Comparable;", false));
+                            repl.add(new org.objectweb.asm.tree.TypeInsnNode(CHECKCAST, "java/lang/Integer"));
+                            repl.add(new MethodInsnNode(INVOKEVIRTUAL, "java/lang/Integer", "intValue", "()I", false));
+                            repl.add(new MethodInsnNode(INVOKEVIRTUAL, GATE_IN, "openWithSmartphone",
+                                "(Lnet/minecraft/world/level/Level;Lnet/minecraft/core/BlockPos;Lnet/minecraft/world/entity/player/Player;I)Z", false));
+                            m.instructions.insertBefore(all[i - 2], repl);
+                            m.instructions.remove(all[i - 2]);
+                            m.instructions.remove(all[i - 1]);
+                            m.instructions.remove(insn);
+                            done.add("gate-bankcard");
+                            changed = true;
+                            break; // только первое вхождение: ветка банковской карты
+                        }
+                    }
+                }
+            }
+        }
+        if (name.equals(VEH)) {
+            // Оплата проезда при посадке: оборачиваем Vehicle.startRiding(Entity,int).
+            // Оригинал переименовываем в ptmStartRiding, новый startRiding сначала спрашивает PtmFixes.allowBoard.
+            final String desc = "(Lnet/minecraft/world/entity/Entity;I)V";
+            MethodNode orig = null;
+            for (MethodNode m : cn.methods) {
+                if (m.name.equals("startRiding") && m.desc.equals(desc)) {
+                    orig = m;
+                }
+            }
+            if (orig != null) {
+                orig.name = "ptmStartRiding";
+                MethodNode w = new MethodNode(ACC_PUBLIC, "startRiding", desc, null, null);
+                org.objectweb.asm.tree.LabelNode end = new org.objectweb.asm.tree.LabelNode();
+                w.instructions.add(new VarInsnNode(ALOAD, 0));
+                w.instructions.add(new VarInsnNode(ALOAD, 1));
+                w.instructions.add(new VarInsnNode(ILOAD, 2));
+                w.instructions.add(new VarInsnNode(ALOAD, 1));
+                w.instructions.add(new MethodInsnNode(INVOKEVIRTUAL, "net/minecraft/world/entity/Entity", "m_9236_",
+                    "()Lnet/minecraft/world/level/Level;", false));
+                w.instructions.add(new MethodInsnNode(INVOKESTATIC, FIXES, "allowBoard",
+                    "(L" + VEH + ";Lnet/minecraft/world/entity/Entity;ILnet/minecraft/world/level/Level;)Z", false));
+                w.instructions.add(new org.objectweb.asm.tree.JumpInsnNode(IFEQ, end));
+                w.instructions.add(new VarInsnNode(ALOAD, 0));
+                w.instructions.add(new VarInsnNode(ALOAD, 1));
+                w.instructions.add(new VarInsnNode(ILOAD, 2));
+                w.instructions.add(new MethodInsnNode(INVOKEVIRTUAL, VEH, "ptmStartRiding", desc, false));
+                w.instructions.add(end);
+                w.instructions.add(new org.objectweb.asm.tree.FrameNode(F_SAME, 0, null, 0, null));
+                w.instructions.add(new InsnNode(RETURN));
+                w.maxStack = 5;
+                w.maxLocals = 3;
+                cn.methods.add(w);
+                done.add("boarding-fare");
+                changed = true;
+            }
+        }
+        if (name.equals(GATE_EXIT)) {
+            // Выходной турникет: игрок открывает его, просто подойдя (радиус 1.3 вместо 0.3, без условия «уже открыт»);
+            // правый клик тоже работает с большего расстояния.
+            for (MethodNode m : cn.methods) {
+                boolean isOpen = m.name.equals("gateOpen");
+                boolean isWay = m.name.equals("playerCorrectWay");
+                if (!isOpen && !isWay) {
+                    continue;
+                }
+                for (AbstractInsnNode insn : m.instructions.toArray()) {
+                    if (insn instanceof org.objectweb.asm.tree.LdcInsnNode) {
+                        org.objectweb.asm.tree.LdcInsnNode ldc = (org.objectweb.asm.tree.LdcInsnNode) insn;
+                        if (ldc.cst instanceof Double && ((Double) ldc.cst).doubleValue() == 0.3D) {
+                            ldc.cst = Double.valueOf(1.3D);
+                            changed = true;
+                            done.add("gate-exit-radius");
+                            break;
+                        }
+                    }
+                }
+                if (isOpen) {
+                    AbstractInsnNode[] all = m.instructions.toArray();
+                    for (int i = 0; i < all.length; i++) {
+                        if (all[i] instanceof FieldInsnNode) {
+                            FieldInsnNode f = (FieldInsnNode) all[i];
+                            if (f.getOpcode() == GETSTATIC && f.name.equals("OPEN") && f.owner.equals(GATE_EXIT)
+                                && i >= 1 && i + 3 < all.length
+                                && all[i - 1].getOpcode() == ALOAD
+                                && all[i + 3].getOpcode() == INVOKEVIRTUAL) {
+                                m.instructions.insertBefore(all[i - 1], new InsnNode(ICONST_1));
+                                for (int k = i - 1; k <= i + 3; k++) {
+                                    m.instructions.remove(all[k]);
+                                }
+                                changed = true;
+                                done.add("gate-exit-auto");
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (name.equals(GATE_IN)) {
+            // Входной турникет: проверка присутствия игрока в радиусе 1.2 вместо 0.3
+            for (MethodNode m : cn.methods) {
+                for (AbstractInsnNode insn : m.instructions.toArray()) {
+                    if (insn instanceof org.objectweb.asm.tree.LdcInsnNode) {
+                        org.objectweb.asm.tree.LdcInsnNode ldc = (org.objectweb.asm.tree.LdcInsnNode) insn;
+                        if (ldc.cst instanceof Double && ((Double) ldc.cst).doubleValue() == 0.3D) {
+                            ldc.cst = Double.valueOf(1.2D);
+                            changed = true;
+                            done.add("gate-in-radius");
                         }
                     }
                 }

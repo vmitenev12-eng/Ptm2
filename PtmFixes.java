@@ -15,6 +15,7 @@ import com.rinventor.ptm2.engine.util.TimeHelper;
 import com.rinventor.ptm2.dimension.physical.TransportModelData;
 import com.rinventor.ptm2.engine.bezier.utility.Pair;
 import java.util.ArrayDeque;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.ArrayList;
 import java.util.List;
 import com.rinventor.ptm2.dimension.virtual.storage.VDStorageHandler;
@@ -32,6 +33,8 @@ import com.rinventor.ptm2.objects.blockentities.atm.ATMMenu;
 import java.util.HashMap;
 import java.util.Map;
 import net.minecraft.world.entity.player.Player;
+import com.rinventor.ptm2.objects.entities.vehicle.Vehicle;
+import com.rinventor.ptm2.objects.items.TransportCard;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.level.Level;
 
@@ -196,8 +199,11 @@ public final class PtmFixes {
                 return;
             }
             String data = VDStorageHandler.get(level, id, VDMemoryIDs.TRACKABLE_VEHICLE);
-            String info = "";
-            if (data != null && !data.isEmpty()) {
+            if (data == null || data.isEmpty()) {
+                return; // служебная очистка записей секций: пропускаем
+            }
+            String info;
+            {
                 VDTrackableVehicle v = new VDTrackableVehicle(data);
                 info = " \u043b\u0438\u043d\u0438\u044f=" + v.lineID + " \u0440\u0435\u0439\u0441=" + v.routeID
                     + " \u043f\u043b\u0430\u0442\u0444\u043e\u0440\u043c\u0430=" + v.nextPlatformID
@@ -255,6 +261,88 @@ public final class PtmFixes {
             sb.append('#').append(e.getKey()).append(' ').append(w.name).append('=').append(w.money).append("; ");
         }
         entries.add(new VDOperationalData(companyID, OperationalSeverity.INFO, sb.toString()));
+    }
+
+
+    private static final ConcurrentHashMap<String, Long> PAID = new ConcurrentHashMap<>();
+    private static final long TRANSFER_WINDOW_MS = 5L * 60L * 1000L;
+
+    private static int readLineId(Object transport) {
+        try {
+            java.lang.reflect.Field f = transport.getClass().getDeclaredField("lineID");
+            f.setAccessible(true);
+            return f.getInt(transport);
+        } catch (Exception e) {
+            try {
+                java.lang.reflect.Field f = transport.getClass().getSuperclass().getDeclaredField("lineID");
+                f.setAccessible(true);
+                return f.getInt(transport);
+            } catch (Exception e2) {
+                return -1;
+            }
+        }
+    }
+
+    /**
+     * Оплата проезда при посадке игрока в автобус на линии. Вызывается из обёртки Vehicle.startRiding.
+     * Порядок: место водителя и не игроки пропускаются; линия бесплатная или не задана - можно;
+     * в течение 5 минут после оплаты пересадка бесплатна; иначе поездка с транспортной карты;
+     * иначе цена билета со счёта игрока на счёт компании линии; иначе посадка запрещена.
+     */
+    public static boolean allowBoard(Vehicle vehicle, Entity entity, int seat, Level level) {
+        try {
+            if (!(entity instanceof Player) || seat == 0 || level == null || PTMWorld.isClient(level)) {
+                return true;
+            }
+            Vehicle main = vehicle.getMainVehicle(vehicle);
+            if (main == null) {
+                main = vehicle;
+            }
+            int lineID = readLineId(main);
+            if (lineID == -1) {
+                return true;
+            }
+            String lineRaw = VDStorageHandler.get(level, lineID, VDMemoryIDs.TRANSPORT_LINE);
+            if (lineRaw == null || lineRaw.isEmpty()) {
+                return true;
+            }
+            VDTransportLine line = new VDTransportLine(lineRaw);
+            if (line.free) {
+                return true;
+            }
+            Player player = (Player) entity;
+            String key = PTMEntity.getName(player) + "@" + System.identityHashCode(main);
+            long now = System.currentTimeMillis();
+            Long last = PAID.get(key);
+            if (last != null && now - last < TRANSFER_WINDOW_MS) {
+                return true;
+            }
+            double x = PTMEntity.getX(player);
+            double y = PTMEntity.getY(player);
+            double z = PTMEntity.getZ(player);
+            if (TransportCard.useCard(player, 1)) {
+                PAID.put(key, now);
+                PTMChat.msgNearest("\u041f\u0440\u043e\u0435\u0437\u0434 \u043e\u043f\u043b\u0430\u0447\u0435\u043d \u0442\u0440\u0430\u043d\u0441\u043f\u043e\u0440\u0442\u043d\u043e\u0439 \u043a\u0430\u0440\u0442\u043e\u0439", "green", level, x, y, z);
+                return true;
+            }
+            double price = ((WorldSavedData) PTM.DATA.get(level)).PRC_TICKET;
+            String companyRaw = VDStorageHandler.get(level, line.companyID, VDMemoryIDs.TRANSPORT_COMPANY);
+            if (companyRaw == null || companyRaw.isEmpty()) {
+                return true;
+            }
+            String companyName = new com.rinventor.ptm2.dimension.virtual.types.VDTransportCompany(companyRaw).name;
+            if (PaymentUtils.getBalance(player) >= price) {
+                PaymentUtils.transactionP2C(player, companyName, price, "\u041f\u0440\u043e\u0435\u0437\u0434");
+                PAID.put(key, now);
+                PTMChat.msgNearest("\u0421\u043f\u0438\u0441\u0430\u043d\u043e \u0437\u0430 \u043f\u0440\u043e\u0435\u0437\u0434: " + price, "green", level, x, y, z);
+                return true;
+            }
+            PTMChat.msgNearest("\u041f\u0440\u043e\u0435\u0437\u0434 \u043d\u0435 \u043e\u043f\u043b\u0430\u0447\u0435\u043d: \u043d\u0435\u0442 \u043a\u0430\u0440\u0442\u044b \u0438 \u043d\u0435\u0434\u043e\u0441\u0442\u0430\u0442\u043e\u0447\u043d\u043e \u0434\u0435\u043d\u0435\u0433 (" + price + ")", "red", level, x, y, z);
+            return false;
+        } catch (Throwable t) {
+            PTMLogger.error(String.valueOf(t));
+            return true;
+        }
     }
 
     private static String yn(boolean v) {
@@ -317,9 +405,18 @@ public final class PtmFixes {
                 }
                 int models = TransportModelData.models(VehicleTypes.fromID(line.type)).size();
                 int active = 0;
+                int noAi = 0;
+                StringBuilder noAiInfo = new StringBuilder();
                 for (VDTrackableVehicle v : vehicles) {
                     if (v.lineID == lineId && v.isTransport()) {
                         active++;
+                        if (!v.ai && !v.virtual) {
+                            noAi++;
+                            if (noAi <= 3) {
+                                noAiInfo.append(" [\u043f\u043b\u0430\u0442\u0444\u043e\u0440\u043c\u0430 ").append(v.nextPlatformID)
+                                    .append(" \u0440\u0443\u0447\u043d\u0438\u043a=").append(v.handBrake ? "\u0434\u0430" : "\u043d\u0435\u0442").append("]");
+                            }
+                        }
                     }
                 }
                 entries.add(new VDOperationalData(companyID, OperationalSeverity.INFO,
@@ -331,6 +428,7 @@ public final class PtmFixes {
                     + (next >= 0 ? ", \u0431\u043b\u0438\u0436\u0430\u0439\u0448\u0435\u0435 " + String.format("%02d:%02d", next / 60, next % 60) : ", \u0431\u043b\u0438\u0436\u0430\u0439\u0448\u0438\u0445 \u043d\u0435\u0442")
                     + ", \u043c\u043e\u0434\u0435\u043b\u0435\u0439 \u0442\u0440\u0430\u043d\u0441\u043f\u043e\u0440\u0442\u0430=" + models
                     + ", \u043c\u0430\u0448\u0438\u043d \u0432 \u0438\u0433\u0440\u0435=" + active
+                    + (noAi > 0 ? ", \u0411\u0415\u0417 \u0418\u0418 (\u0441\u0442\u043e\u044f\u0442)=" + noAi + noAiInfo : "")
                     + ", \u0434\u0435\u043f\u043e=" + (line.depotID == -1 ? "\u043d\u0435\u0442" : String.valueOf(line.depotID))));
 
                 int shown = 0;

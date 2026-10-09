@@ -37,6 +37,7 @@ public class Patcher implements Opcodes {
     static final String GATE_IN = "com/rinventor/ptm2/objects/blockentities/gate/GateIn";
     static final String VEH = "com/rinventor/ptm2/objects/entities/vehicle/Vehicle";
     static final String GATE_EXIT = "com/rinventor/ptm2/objects/blockentities/gate/GateExit";
+    static final String TM = "com/rinventor/ptm2/dimension/physical/TransportManager";
 
     static final Set<String> done = new HashSet<>();
     static int flagReplacements = 0;
@@ -110,7 +111,7 @@ public class Patcher implements Opcodes {
             }
         }
         System.out.println("patched: " + done + ", indefinite-flag reads replaced: " + flagReplacements);
-        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay", "gate-bankcard", "boarding-fare", "gate-exit-radius", "gate-exit-auto", "gate-in-radius"};
+        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay", "gate-bankcard", "boarding-fare", "gate-exit-radius", "gate-exit-auto", "gate-in-radius", "terminal-cap"};
         for (String r : required) {
             if (!done.contains(r)) {
                 System.err.println("ERROR: patch not applied: " + r);
@@ -132,7 +133,7 @@ public class Patcher implements Opcodes {
     }
 
     static byte[] patchClass(String name, byte[] data) {
-        boolean target = name.equals(OPD) || name.equals(ATM) || name.equals(VU) || name.equals(VSH) || name.equals(PTE) || name.equals(TRN) || name.equals(GATE_IN) || name.equals(VEH) || name.equals(GATE_EXIT);
+        boolean target = name.equals(OPD) || name.equals(ATM) || name.equals(VU) || name.equals(VSH) || name.equals(PTE) || name.equals(TRN) || name.equals(GATE_IN) || name.equals(VEH) || name.equals(GATE_EXIT) || name.equals(TM);
         boolean flags = contains(data, "INDEFINITE_BANK_ACCOUNT") || contains(data, "INDEFINITE_TRANSPORT_CARD");
         if (!target && !flags) {
             return data;
@@ -294,7 +295,7 @@ public class Patcher implements Opcodes {
             }
         }
         if (name.equals(GATE_EXIT)) {
-            // Выходной турникет: игрок открывает его, просто подойдя (радиус 1.3 вместо 0.3, без условия «уже открыт»);
+            // Выходной турникет: игрок открывает его, просто подойдя (радиус 0.55 вместо 0.3, без условия «уже открыт»);
             // правый клик тоже работает с большего расстояния.
             for (MethodNode m : cn.methods) {
                 boolean isOpen = m.name.equals("gateOpen");
@@ -306,7 +307,7 @@ public class Patcher implements Opcodes {
                     if (insn instanceof org.objectweb.asm.tree.LdcInsnNode) {
                         org.objectweb.asm.tree.LdcInsnNode ldc = (org.objectweb.asm.tree.LdcInsnNode) insn;
                         if (ldc.cst instanceof Double && ((Double) ldc.cst).doubleValue() == 0.3D) {
-                            ldc.cst = Double.valueOf(1.3D);
+                            ldc.cst = Double.valueOf(0.55D);
                             changed = true;
                             done.add("gate-exit-radius");
                             break;
@@ -348,6 +349,32 @@ public class Patcher implements Opcodes {
                         }
                     }
                 }
+            }
+        }
+        if (name.equals(TM)) {
+            // Ожидание на конечной не дольше 30 секунд: оборачиваем scheduledTerminalWait(Level,int,int)J
+            final String desc = "(Lnet/minecraft/world/level/Level;II)J";
+            MethodNode orig = null;
+            for (MethodNode m : cn.methods) {
+                if (m.name.equals("scheduledTerminalWait") && m.desc.equals(desc)) {
+                    orig = m;
+                }
+            }
+            if (orig != null) {
+                orig.name = "ptmScheduledTerminalWait";
+                MethodNode w = new MethodNode(ACC_PRIVATE | ACC_STATIC, "scheduledTerminalWait", desc, null, null);
+                w.instructions.add(new VarInsnNode(ALOAD, 0));
+                w.instructions.add(new VarInsnNode(ILOAD, 1));
+                w.instructions.add(new VarInsnNode(ILOAD, 2));
+                w.instructions.add(new MethodInsnNode(INVOKESTATIC, TM, "ptmScheduledTerminalWait", desc, false));
+                w.instructions.add(new org.objectweb.asm.tree.LdcInsnNode(Long.valueOf(30000L)));
+                w.instructions.add(new MethodInsnNode(INVOKESTATIC, "java/lang/Math", "min", "(JJ)J", false));
+                w.instructions.add(new InsnNode(LRETURN));
+                w.maxStack = 6;
+                w.maxLocals = 3;
+                cn.methods.add(w);
+                done.add("terminal-cap");
+                changed = true;
             }
         }
         if (name.equals(ATM)) {

@@ -39,6 +39,7 @@ public class Patcher implements Opcodes {
     static final String GATE_EXIT = "com/rinventor/ptm2/objects/blockentities/gate/GateExit";
     static final String TM = "com/rinventor/ptm2/dimension/physical/TransportManager";
     static final String VUT = "com/rinventor/ptm2/dimension/physical/VehicleUtils";
+    static final String TLU = "com/rinventor/ptm2/dimension/virtual/systems/TrafficLanesUpdater";
     static final String TBM = "com/rinventor/ptm2/dimension/physical/TickableBlocksManager";
     static final Set<String> refs = new HashSet<>();
     static final Set<String> fixesMethods = new HashSet<>();
@@ -132,7 +133,7 @@ public class Patcher implements Opcodes {
         if (mismatch) {
             System.exit(1);
         }
-        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay", "gate-bankcard", "boarding-fare", "gate-exit-radius", "gate-exit-auto", "gate-in-radius", "terminal-cap", "arrival-reach", "arrival-inside", "lamp-cap", "red-commit", "patience", "bypass-still", "merge-check", "player-ahead", "merge-width"};
+        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay", "gate-bankcard", "boarding-fare", "gate-exit-radius", "gate-exit-auto", "gate-in-radius", "terminal-cap", "arrival-reach", "arrival-inside", "lamp-cap", "red-commit", "patience", "bypass-still", "merge-check", "player-ahead", "merge-width", "parallel-width"};
         for (String r : required) {
             if (!done.contains(r)) {
                 System.err.println("ERROR: patch not applied: " + r);
@@ -154,7 +155,7 @@ public class Patcher implements Opcodes {
     }
 
     static byte[] patchClass(String name, byte[] data) {
-        boolean target = name.equals(OPD) || name.equals(ATM) || name.equals(VU) || name.equals(VSH) || name.equals(PTE) || name.equals(TRN) || name.equals(GATE_IN) || name.equals(VEH) || name.equals(GATE_EXIT) || name.equals(TM) || name.equals(TBM) || name.equals(VUT);
+        boolean target = name.equals(OPD) || name.equals(ATM) || name.equals(VU) || name.equals(VSH) || name.equals(PTE) || name.equals(TRN) || name.equals(GATE_IN) || name.equals(VEH) || name.equals(GATE_EXIT) || name.equals(TM) || name.equals(TBM) || name.equals(VUT) || name.equals(TLU);
         boolean flags = contains(data, "INDEFINITE_BANK_ACCOUNT") || contains(data, "INDEFINITE_TRANSPORT_CARD");
         if (!target && !flags) {
             return data;
@@ -350,6 +351,24 @@ public class Patcher implements Opcodes {
                 cn.methods.add(w);
                 done.add("patience");
                 changed = true;
+            }
+        }
+        if (name.equals(TLU)) {
+            // Соседние (параллельные) полосы искались на расстоянии 4-7 блоков; у нас полосы шириной 3-5
+            for (MethodNode m : cn.methods) {
+                if (!m.name.equals("getParallelLanes")) {
+                    continue;
+                }
+                for (AbstractInsnNode insn : m.instructions.toArray()) {
+                    if (insn instanceof org.objectweb.asm.tree.LdcInsnNode) {
+                        org.objectweb.asm.tree.LdcInsnNode ld = (org.objectweb.asm.tree.LdcInsnNode) insn;
+                        if (ld.cst instanceof Double && ((Double) ld.cst) == 4.0D) {
+                            ld.cst = Double.valueOf(3.0D);
+                            done.add("parallel-width");
+                            changed = true;
+                        }
+                    }
+                }
             }
         }
         if (name.equals(VUT)) {

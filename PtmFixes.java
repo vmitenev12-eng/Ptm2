@@ -588,6 +588,7 @@ public final class PtmFixes {
         boolean backing;
         double backLeft;
         long holdUntil;
+        boolean lastOrig;
         long exitCheck;
         boolean exitHold;
         long exitHoldSince;
@@ -707,6 +708,7 @@ public final class PtmFixes {
             prune(now);
             Drv d = drv(v);
             d.seen = now;
+            d.lastOrig = orig;
             boolean still = Math.abs(v.speed) < 0.3F;
             if (!still) {
                 d.stillSince = 0L;
@@ -741,6 +743,10 @@ public final class PtmFixes {
                 d.forced = false;
                 d.candidate = false;
                 d.failed = 0;
+                // Физически упёрлись (оригинальный ИИ разрешает ехать, но машина стоит): уступаем, если мы младшие
+                if (d.stillSince > 0L && now - d.stillSince >= STALL_MS && stallYield(v, d, level, now)) {
+                    return false;
+                }
                 // Не въезжаем на перекрёсток, если за ним нет места (но не дольше 12 с)
                 if (now - d.exitCheck > 300L) {
                     d.exitCheck = now;
@@ -1309,20 +1315,61 @@ public final class PtmFixes {
         return best;
     }
 
-    /** Должна ли эта машина уступить (отъехать): блокирует такая же ждущая машина, которая ждёт дольше. */
-    private static boolean shouldYield(Vehicle v, Drv d, Level level) {
+    /** Сколько миллисекунд «разрешено ехать, но стоим» считается физической блокировкой. */
+    static final long STALL_MS = 4000L;
+
+    /** Когда машина начала ждать: по решению ИИ (firstBlocked) или физически (стоит при разрешённом проезде). 0 - не ждёт. */
+    private static long waitStart(Drv d, long now) {
+        if (d.lastOrig) {
+            return d.stillSince > 0L && now - d.stillSince >= STALL_MS ? d.stillSince : 0L;
+        }
+        return d.firstBlocked;
+    }
+
+    private static boolean crossing(Vehicle a, Vehicle b) {
+        return Math.abs(wrap180(PTMEntity.getYaw(a) - PTMEntity.getYaw(b))) > 50.0D;
+    }
+
+    /**
+     * Решение при взаимной блокировке: кто из двух ждущих машин отъезжает назад.
+     * Отъезжает та, что ждёт меньше; если ей отъехать некуда, а другой есть куда - другая.
+     */
+    private static boolean yieldDecision(Vehicle v, long myWait, Level level) {
         Vehicle b = blockerAhead(v);
-        if (b == null || Math.abs(b.speed) >= 0.3F || !spaceBehind(v, level)) {
+        if (b == null || Math.abs(b.speed) >= 0.3F || myWait == 0L || !crossing(v, b)) {
             return false;
         }
         Drv bd = DRV.get(System.identityHashCode(b));
-        if (bd == null || bd.firstBlocked == 0L || d.firstBlocked == 0L) {
+        if (bd == null) {
             return false;
         }
-        if (bd.firstBlocked != d.firstBlocked) {
-            return d.firstBlocked > bd.firstBlocked;
+        long bw = waitStart(bd, System.currentTimeMillis());
+        if (bw == 0L) {
+            return false;
         }
-        return System.identityHashCode(v) > System.identityHashCode(b);
+        boolean iLose = myWait > bw || (myWait == bw && System.identityHashCode(v) > System.identityHashCode(b));
+        boolean canBack = spaceBehind(v, level);
+        if (iLose) {
+            return canBack;
+        }
+        return canBack && !spaceBehind(b, level);
+    }
+
+    /** Разрешено ехать, но физически стоим: возможно, нас держит встречная/поперечная машина. */
+    private static boolean stallYield(Vehicle v, Drv d, Level level, long now) {
+        if (!yieldDecision(v, d.stillSince, level)) {
+            return false;
+        }
+        d.backing = true;
+        d.backLeft = 7.0D;
+        d.failed++;
+        drvLog(d, now, "отъезжает назад, уступая (упёрлись) " + (int) PTMEntity.getX(v) + " " + (int) PTMEntity.getZ(v));
+        return true;
+    }
+
+    /** Должна ли эта машина уступить (отъехать): блокирует такая же ждущая машина, которая ждёт дольше. */
+    private static boolean shouldYield(Vehicle v, Drv d, Level level) {
+        return yieldDecision(v, d.firstBlocked, level);
     }
 
     // ---------------------------------------------------------------- перестроение

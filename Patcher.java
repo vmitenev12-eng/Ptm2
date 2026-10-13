@@ -38,6 +38,7 @@ public class Patcher implements Opcodes {
     static final String VEH = "com/rinventor/ptm2/objects/entities/vehicle/Vehicle";
     static final String GATE_EXIT = "com/rinventor/ptm2/objects/blockentities/gate/GateExit";
     static final String TM = "com/rinventor/ptm2/dimension/physical/TransportManager";
+    static final String VUT = "com/rinventor/ptm2/dimension/physical/VehicleUtils";
     static final String TBM = "com/rinventor/ptm2/dimension/physical/TickableBlocksManager";
     static final Set<String> refs = new HashSet<>();
     static final Set<String> fixesMethods = new HashSet<>();
@@ -131,7 +132,7 @@ public class Patcher implements Opcodes {
         if (mismatch) {
             System.exit(1);
         }
-        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay", "gate-bankcard", "boarding-fare", "gate-exit-radius", "gate-exit-auto", "gate-in-radius", "terminal-cap", "arrival-reach", "arrival-inside", "lamp-cap"};
+        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay", "gate-bankcard", "boarding-fare", "gate-exit-radius", "gate-exit-auto", "gate-in-radius", "terminal-cap", "arrival-reach", "arrival-inside", "lamp-cap", "red-commit", "patience", "bypass-still"};
         for (String r : required) {
             if (!done.contains(r)) {
                 System.err.println("ERROR: patch not applied: " + r);
@@ -153,7 +154,7 @@ public class Patcher implements Opcodes {
     }
 
     static byte[] patchClass(String name, byte[] data) {
-        boolean target = name.equals(OPD) || name.equals(ATM) || name.equals(VU) || name.equals(VSH) || name.equals(PTE) || name.equals(TRN) || name.equals(GATE_IN) || name.equals(VEH) || name.equals(GATE_EXIT) || name.equals(TM) || name.equals(TBM);
+        boolean target = name.equals(OPD) || name.equals(ATM) || name.equals(VU) || name.equals(VSH) || name.equals(PTE) || name.equals(TRN) || name.equals(GATE_IN) || name.equals(VEH) || name.equals(GATE_EXIT) || name.equals(TM) || name.equals(TBM) || name.equals(VUT);
         boolean flags = contains(data, "INDEFINITE_BANK_ACCOUNT") || contains(data, "INDEFINITE_TRANSPORT_CARD");
         if (!target && !flags) {
             return data;
@@ -312,6 +313,62 @@ public class Patcher implements Opcodes {
                 cn.methods.add(w);
                 done.add("boarding-fare");
                 changed = true;
+            }
+        }
+        if (name.equals(VEH)) {
+            // ИИ движения: canMove() -> обёртка с «терпением»; красный после въезда на перекрёсток не повторяется
+            MethodNode origCm = null;
+            for (MethodNode m : cn.methods) {
+                if (m.name.equals("canMove") && m.desc.equals("()Z")) {
+                    origCm = m;
+                }
+            }
+            if (origCm != null) {
+                origCm.name = "ptmCanMoveOrig";
+                for (AbstractInsnNode insn : origCm.instructions.toArray()) {
+                    if (insn instanceof MethodInsnNode) {
+                        MethodInsnNode mi = (MethodInsnNode) insn;
+                        if (mi.getOpcode() == INVOKESTATIC && mi.owner.equals(VUT) && mi.name.equals("forbiddingTrafficLightAhead")) {
+                            origCm.instructions.set(insn, new MethodInsnNode(INVOKESTATIC, FIXES, "trafficRed",
+                                "(L" + VEH + ";)Z", false));
+                            done.add("red-commit");
+                        }
+                    }
+                }
+                MethodNode w = new MethodNode(ACC_PUBLIC, "canMove", "()Z", null, null);
+                w.instructions.add(new VarInsnNode(ALOAD, 0));
+                w.instructions.add(new VarInsnNode(ALOAD, 0));
+                w.instructions.add(new MethodInsnNode(INVOKEVIRTUAL, VEH, "ptmCanMoveOrig", "()Z", false));
+                w.instructions.add(new VarInsnNode(ALOAD, 0));
+                w.instructions.add(new MethodInsnNode(INVOKEVIRTUAL, "net/minecraft/world/entity/Entity", "m_9236_",
+                    "()Lnet/minecraft/world/level/Level;", false));
+                w.instructions.add(new MethodInsnNode(INVOKESTATIC, FIXES, "canMove",
+                    "(L" + VEH + ";ZLnet/minecraft/world/level/Level;)Z", false));
+                w.instructions.add(new InsnNode(IRETURN));
+                w.maxStack = 4;
+                w.maxLocals = 1;
+                cn.methods.add(w);
+                done.add("patience");
+                changed = true;
+            }
+        }
+        if (name.equals(VUT)) {
+            // Объезд: в laneChangeCheck «машина впереди на ручнике» -> PtmFixes.obstacleStill (ручник или долго стоит)
+            for (MethodNode m : cn.methods) {
+                if (!m.name.equals("laneChangeCheck")) {
+                    continue;
+                }
+                for (AbstractInsnNode insn : m.instructions.toArray()) {
+                    if (insn instanceof org.objectweb.asm.tree.FieldInsnNode) {
+                        org.objectweb.asm.tree.FieldInsnNode fi = (org.objectweb.asm.tree.FieldInsnNode) insn;
+                        if (fi.getOpcode() == GETFIELD && fi.owner.equals(VEH) && fi.name.equals("handBrake")) {
+                            m.instructions.set(insn, new MethodInsnNode(INVOKESTATIC, FIXES, "obstacleStill",
+                                "(L" + VEH + ";)Z", false));
+                            done.add("bypass-still");
+                            changed = true;
+                        }
+                    }
+                }
             }
         }
         if (name.equals(GATE_EXIT)) {

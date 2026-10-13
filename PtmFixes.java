@@ -14,6 +14,10 @@ import com.rinventor.ptm2.dimension.virtual.types.VDOperationalData;
 import com.rinventor.ptm2.engine.util.TimeHelper;
 import com.rinventor.ptm2.dimension.physical.TransportModelData;
 import com.rinventor.ptm2.engine.bezier.utility.Pair;
+import com.rinventor.ptm2.core.properties.TrafficLightColors;
+import com.rinventor.ptm2.dimension.physical.VehicleUtils;
+import com.rinventor.ptm2.objects.entities.pedestrian.Pedestrian;
+import com.rinventor.ptm2.objects.entities.vehicle.Transport;
 import java.util.ArrayDeque;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.ArrayList;
@@ -556,5 +560,259 @@ public final class PtmFixes {
             return -1;
         }
         return prop;
+    }
+
+    // ======================================================================
+    //  ИИ движения: красный после поворота, «терпение» при взаимной блокировке,
+    //  объезд долго стоящих машин, диагностика застрявших.
+    // ======================================================================
+
+    /** Состояние ИИ одной машины (ключ: identityHashCode объекта Vehicle). */
+    static final class Drv {
+        volatile long seen;
+        long stillSince;
+        long blockedSince;
+        long forcedAt;
+        boolean forced;
+        boolean candidate;
+        boolean committed;
+        int failed;
+        long lastLog;
+    }
+
+    static final Map<Integer, Drv> DRV = new ConcurrentHashMap<>();
+    static long lastPrune = 0L;
+    static long logWindowStart = 0L;
+    static int logCount = 0;
+    /** Сколько миллисекунд застрявшая без видимой причины машина ждёт, прежде чем ей разрешат ехать. */
+    static final long PATIENCE_MS = 8000L;
+    /** Долго стоящая попутная машина считается препятствием для объезда. */
+    static final long OBSTACLE_STILL_MS = 25000L;
+
+    static Drv drv(Vehicle v) {
+        return DRV.computeIfAbsent(System.identityHashCode(v), k -> new Drv());
+    }
+
+    private static void prune(long now) {
+        if (now - lastPrune < 60000L) {
+            return;
+        }
+        lastPrune = now;
+        DRV.entrySet().removeIf(e -> now - e.getValue().seen > 60000L);
+    }
+
+    private static void drvLog(Drv d, long now, String text) {
+        if (now - d.lastLog < 15000L) {
+            return;
+        }
+        if (now - logWindowStart > 60000L) {
+            logWindowStart = now;
+            logCount = 0;
+        }
+        if (logCount >= 25) {
+            return;
+        }
+        logCount++;
+        d.lastLog = now;
+        PTMLogger.info("PTM2 ИИ: " + text);
+    }
+
+    /**
+     * Замена VehicleUtils.forbiddingTrafficLightAhead в Vehicle.canMove.
+     * Машина, которая уже въехала на перекрёсток на зелёный, больше не смотрит на светофоры:
+     * раньше при повороте она выбирала светофор нового направления (красный для поперечной дороги)
+     * и ждала второй раз прямо посреди перекрёстка.
+     */
+    public static boolean trafficRed(Vehicle v) {
+        boolean red = VehicleUtils.forbiddingTrafficLightAhead(v);
+        try {
+            if (PTMWorld.isClient(v)) {
+                return red;
+            }
+            Drv d = drv(v);
+            boolean inside = VDUtils.inZone(v, VDMemoryIDs.INTERSECTION);
+            if (!inside) {
+                d.committed = false;
+                return red;
+            }
+            if (d.committed) {
+                return false;
+            }
+            if (!red && Math.abs(v.speed) >= 1.0F) {
+                d.committed = true;
+            }
+        } catch (Exception e) {
+            PTMLogger.error(e);
+        }
+        return red;
+    }
+
+    private static double wrap180(double a) {
+        a = (a + 540.0D) % 360.0D;
+        return a - 180.0D;
+    }
+
+    /** Есть ли на пути пешеход/игрок (с запасом по ширине). Тогда ехать нельзя ни при каких условиях. */
+    private static boolean livingAhead(Vehicle v, Level level) {
+        double yaw = Math.toRadians(PTMEntity.getYaw(v));
+        double fx = -Math.sin(yaw);
+        double fz = Math.cos(yaw);
+        double x = PTMEntity.getX(v);
+        double y = PTMEntity.getY(v);
+        double z = PTMEntity.getZ(v);
+        double half = Math.max(0.0F, v.length) / 2.0D;
+        for (double dist = 1.5D; dist <= 9.0D; dist += 1.5D) {
+            double cx = x + fx * (half + dist);
+            double cz = z + fz * (half + dist);
+            if (PTMEntity.exists(Pedestrian.class, 1.4D, level, cx, y, cz)
+                || PTMEntity.exists(Player.class, 1.4D, level, cx, y, cz)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Обёртка Vehicle.canMove(). orig - решение оригинального ИИ.
+     * Если машина стоит без видимой причины (не красный, не пешеход, не очередь в своей полосе),
+     * после PATIENCE_MS ей разрешается ехать; физический запрет столкновения (clearanceBlockerAhead) остаётся.
+     * При нескольких претендентах едет тот, кто ждёт дольше.
+     */
+    public static boolean canMove(Vehicle v, boolean orig, Level level) {
+        try {
+            if (PTMWorld.isClient(v)) {
+                return orig;
+            }
+            long now = System.currentTimeMillis();
+            prune(now);
+            Drv d = drv(v);
+            d.seen = now;
+            boolean still = Math.abs(v.speed) < 0.3F;
+            if (!still) {
+                d.stillSince = 0L;
+            } else if (d.stillSince == 0L) {
+                d.stillSince = now;
+            }
+            if (orig) {
+                d.blockedSince = 0L;
+                d.forced = false;
+                d.candidate = false;
+                d.failed = 0;
+                return true;
+            }
+            if (!v.ai || v.handBrake || v.crashed || v.requiresTracks) {
+                d.blockedSince = 0L;
+                d.forced = false;
+                d.candidate = false;
+                return false;
+            }
+            if (d.forced) {
+                if (still && d.stillSince > 0L && now - d.stillSince > 3000L && now - d.forcedAt > 3000L) {
+                    // Физически не пускают (clearance): отменяем и ждём заново
+                    d.forced = false;
+                    d.failed++;
+                    d.blockedSince = now;
+                    d.candidate = false;
+                    return false;
+                }
+                return true;
+            }
+            if (!still) {
+                return false;
+            }
+            if (d.blockedSince == 0L) {
+                d.blockedSince = now;
+            }
+            long waited = now - d.blockedSince;
+            if (waited < PATIENCE_MS) {
+                return false;
+            }
+            // Автомобиль без пассажирского рейса, безнадёжно застрявший: убираем, если рядом нет игроков
+            if (!(v instanceof Transport) && d.failed >= 3 && d.stillSince > 0L && now - d.stillSince > 120000L) {
+                drvLog(d, now, "убрана застрявшая машина " + (int) PTMEntity.getX(v) + " " + (int) PTMEntity.getZ(v));
+                VehicleUtils.despawn(v, 48);
+                return false;
+            }
+            String reason = hardReason(v, level);
+            if (reason != null) {
+                d.candidate = false;
+                return false;
+            }
+            d.candidate = true;
+            // Приоритет: едет тот, кто ждёт дольше; при равенстве - по номеру
+            for (Vehicle o : PTMEntity.getDifferentVehicles(30.0D, v)) {
+                if (o == v) {
+                    continue;
+                }
+                Drv od = DRV.get(System.identityHashCode(o));
+                if (od != null && od.candidate && od.blockedSince > 0L && now - od.seen < 2000L && !od.forced
+                    && (od.blockedSince < d.blockedSince
+                        || (od.blockedSince == d.blockedSince && System.identityHashCode(o) < System.identityHashCode(v)))) {
+                    drvLog(d, now, "ждёт очереди " + (int) PTMEntity.getX(v) + " " + (int) PTMEntity.getZ(v) + " ждёт " + (waited / 1000L) + " с");
+                    return false;
+                }
+            }
+            d.forced = true;
+            d.forcedAt = now;
+            drvLog(d, now, "разрешён проезд " + (int) PTMEntity.getX(v) + " " + (int) PTMEntity.getZ(v) + " ждал " + (waited / 1000L) + " с, попытка " + (d.failed + 1)
+                + (v instanceof Transport ? " (транспорт)" : ""));
+            return true;
+        } catch (Exception e) {
+            PTMLogger.error(e);
+            return orig;
+        }
+    }
+
+    /** Причина, по которой машине НЕЛЬЗЯ разрешать ехать (null - можно). */
+    private static String hardReason(Vehicle v, Level level) {
+        if (VehicleUtils.forbiddingTrafficLightAhead(v)) {
+            return "светофор";
+        }
+        if (VehicleUtils.loweredEntryBarrierAhead(v) || VehicleUtils.closedRailwayCrossingAhead(v)) {
+            return "шлагбаум";
+        }
+        if (livingAhead(v, level)) {
+            return "пешеход";
+        }
+        double forward = Math.max(v.speed, 4.0F) + Math.max(0.0D, v.length / 1.5D);
+        Vehicle front = VehicleUtils.vehicleInFront(v, forward);
+        if (front != null) {
+            if (v.vehicleType != VehicleTypes.TRAM && front.vehicleType == VehicleTypes.TRAM) {
+                return "трамвай";
+            }
+            double diff = Math.abs(wrap180(PTMEntity.getYaw(v) - PTMEntity.getYaw(front)));
+            if (diff <= 50.0D) {
+                return "очередь";
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Подмена чтения Vehicle.handBrake в VehicleUtils.laneChangeCheck:
+     * машина впереди считается препятствием для объезда, если она на ручнике
+     * или стоит без движения дольше OBSTACLE_STILL_MS (не на красном).
+     */
+    public static boolean obstacleStill(Vehicle a) {
+        if (a.handBrake) {
+            return true;
+        }
+        try {
+            Drv d = DRV.get(System.identityHashCode(a));
+            if (d == null || d.stillSince == 0L) {
+                return false;
+            }
+            long now = System.currentTimeMillis();
+            if (now - d.seen > 3000L || now - d.stillSince < OBSTACLE_STILL_MS) {
+                return false;
+            }
+            if (a.trafficLight != null && (a.trafficLight.state == TrafficLightColors.RED
+                || a.trafficLight.state == TrafficLightColors.YELLOW)) {
+                return false;
+            }
+            return !VDUtils.inZone(a, VDMemoryIDs.INTERSECTION);
+        } catch (Exception e) {
+            return false;
+        }
     }
 }

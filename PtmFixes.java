@@ -54,10 +54,17 @@ public final class PtmFixes {
      * 1) даёт название станциям, у которых его нет;
      * 2) привязывает каждую платформу к станции, в зоне которой она находится.
      */
+    public static final String BUILD = "fixes-2026-10-13-lamp-cap";
+    private static boolean announced = false;
+
     public static void tick(Level level) {
         try {
             if (level == null || PTMWorld.isClient(level)) {
                 return;
+            }
+            if (!announced) {
+                announced = true;
+                PTMLogger.info("PTM2 fixes loaded: " + BUILD);
             }
             linkStationsAndPlatforms(level);
         } catch (Exception e) {

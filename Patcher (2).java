@@ -1,0 +1,558 @@
+import java.io.FileOutputStream;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.util.Enumeration;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipFile;
+import java.util.zip.ZipOutputStream;
+import org.objectweb.asm.ClassReader;
+import org.objectweb.asm.ClassWriter;
+import org.objectweb.asm.Opcodes;
+import org.objectweb.asm.tree.AbstractInsnNode;
+import org.objectweb.asm.tree.ClassNode;
+import org.objectweb.asm.tree.FieldInsnNode;
+import org.objectweb.asm.tree.FieldNode;
+import org.objectweb.asm.tree.InsnList;
+import org.objectweb.asm.tree.InsnNode;
+import org.objectweb.asm.tree.MethodInsnNode;
+import org.objectweb.asm.tree.MethodNode;
+import org.objectweb.asm.tree.VarInsnNode;
+
+/**
+ * Накладывает исправления на готовый jar мода PTM2 (байткод), ничего не пересобирая целиком.
+ * Использование: java Patcher base.jar fixes.jar out.jar
+ */
+public class Patcher implements Opcodes {
+    static final String FIXES = "com/rinventor/ptm2/fixes/PtmFixes";
+    static final String OPD = "com/rinventor/ptm2/dimension/virtual/systems/OperationalDataUpdater";
+    static final String ATM = "com/rinventor/ptm2/objects/blockentities/atm/ATMButtonServerboundPacket";
+    static final String ATM_MENU = "com/rinventor/ptm2/objects/blockentities/atm/ATMMenu";
+    static final String VU = "com/rinventor/ptm2/dimension/virtual/storage/requests/ValueUpdateServerboundPacket";
+    static final String WSD = "com/rinventor/ptm2/core/data/WorldSavedData";
+    static final String VSH = "com/rinventor/ptm2/dimension/virtual/storage/VDStorageHandler";
+    static final String PTE = "com/rinventor/ptm2/engine/base/PTMEntity";
+    static final String TRN = "com/rinventor/ptm2/objects/entities/vehicle/Transport";
+    static final String GATE_IN = "com/rinventor/ptm2/objects/blockentities/gate/GateIn";
+    static final String VEH = "com/rinventor/ptm2/objects/entities/vehicle/Vehicle";
+    static final String GATE_EXIT = "com/rinventor/ptm2/objects/blockentities/gate/GateExit";
+    static final String TM = "com/rinventor/ptm2/dimension/physical/TransportManager";
+    static final String TBM = "com/rinventor/ptm2/dimension/physical/TickableBlocksManager";
+    static final Set<String> refs = new HashSet<>();
+    static final Set<String> fixesMethods = new HashSet<>();
+
+    static final Set<String> done = new HashSet<>();
+    static int flagReplacements = 0;
+
+    public static void main(String[] args) throws Exception {
+        String base = args[0];
+        String fixes = args[1];
+        String out = args[2];
+        Set<String> written = new HashSet<>();
+        try (ZipFile zin = new ZipFile(base);
+             ZipFile fz = new ZipFile(fixes);
+             ZipOutputStream zout = new ZipOutputStream(new FileOutputStream(out))) {
+            // В некоторых архивах имена записей начинаются с "/", из-за чего классы не находятся.
+            // Нормализуем имена (убираем ведущие "/"), манифест пишем первым.
+            java.util.List<ZipEntry> entries = new java.util.ArrayList<>();
+            Enumeration<? extends ZipEntry> en = zin.entries();
+            while (en.hasMoreElements()) {
+                entries.add(en.nextElement());
+            }
+            entries.sort((a, b) -> Boolean.compare(!normalize(a.getName()).equals("META-INF/MANIFEST.MF"),
+                                                   !normalize(b.getName()).equals("META-INF/MANIFEST.MF")));
+            int fixedNames = 0;
+            for (ZipEntry e : entries) {
+                String name = normalize(e.getName());
+                if (!name.equals(e.getName())) {
+                    fixedNames++;
+                }
+                if (name.isEmpty() || written.contains(name)) {
+                    continue;
+                }
+                byte[] data = new byte[0];
+                if (!e.isDirectory()) {
+                    try (InputStream in = zin.getInputStream(e)) {
+                        data = in.readAllBytes();
+                    }
+                    if (name.endsWith(".class")) {
+                        data = patchClass(name.substring(0, name.length() - 6), data);
+                    }
+                }
+                ZipEntry ne = new ZipEntry(name);
+                ne.setTime(e.getTime());
+                zout.putNextEntry(ne);
+                zout.write(data);
+                zout.closeEntry();
+                written.add(name);
+            }
+            System.out.println("entries written: " + written.size() + ", names normalized: " + fixedNames);
+            Enumeration<? extends ZipEntry> fe = fz.entries();
+            int added = 0;
+            while (fe.hasMoreElements()) {
+                ZipEntry e = fe.nextElement();
+                String name = e.getName();
+                if (e.isDirectory() || !name.startsWith("com/rinventor/ptm2/fixes/") || !name.endsWith(".class")) {
+                    continue;
+                }
+                if (written.contains(name)) {
+                    throw new IllegalStateException("duplicate entry " + name);
+                }
+                byte[] data;
+                try (InputStream in = fz.getInputStream(e)) {
+                    data = in.readAllBytes();
+                }
+                if (name.equals(FIXES + ".class")) {
+                    ClassNode fcn = new ClassNode();
+                    new ClassReader(data).accept(fcn, 0);
+                    for (MethodNode fm : fcn.methods) {
+                        fixesMethods.add(fm.name + fm.desc);
+                    }
+                }
+                zout.putNextEntry(new ZipEntry(name));
+                zout.write(data);
+                zout.closeEntry();
+                added++;
+                System.out.println("added class " + name);
+            }
+            if (added == 0) {
+                throw new IllegalStateException("no fix classes found in " + fixes);
+            }
+        }
+        System.out.println("patched: " + done + ", indefinite-flag reads replaced: " + flagReplacements);
+        boolean mismatch = false;
+        for (String r : refs) {
+            if (!fixesMethods.contains(r)) {
+                System.err.println("ERROR: PtmFixes has no method " + r + " (PtmFixes.java in the repo is outdated?)");
+                mismatch = true;
+            }
+        }
+        if (mismatch) {
+            System.exit(1);
+        }
+        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay", "gate-bankcard", "boarding-fare", "gate-exit-radius", "gate-exit-auto", "gate-in-radius", "terminal-cap", "arrival-reach", "arrival-inside", "lamp-cap"};
+        for (String r : required) {
+            if (!done.contains(r)) {
+                System.err.println("ERROR: patch not applied: " + r);
+                System.exit(1);
+            }
+        }
+        if (flagReplacements == 0) {
+            System.err.println("ERROR: indefinite flags were not found");
+            System.exit(1);
+        }
+    }
+
+    static String normalize(String name) {
+        String n = name.replace('\\', '/');
+        while (n.startsWith("/")) {
+            n = n.substring(1);
+        }
+        return n;
+    }
+
+    static byte[] patchClass(String name, byte[] data) {
+        boolean target = name.equals(OPD) || name.equals(ATM) || name.equals(VU) || name.equals(VSH) || name.equals(PTE) || name.equals(TRN) || name.equals(GATE_IN) || name.equals(VEH) || name.equals(GATE_EXIT) || name.equals(TM) || name.equals(TBM);
+        boolean flags = contains(data, "INDEFINITE_BANK_ACCOUNT") || contains(data, "INDEFINITE_TRANSPORT_CARD");
+        if (!target && !flags) {
+            return data;
+        }
+        ClassNode cn = new ClassNode();
+        new ClassReader(data).accept(cn, 0);
+        boolean changed = false;
+
+        if (name.equals(OPD)) {
+            InsnList list = new InsnList();
+            list.add(new VarInsnNode(ALOAD, 0));
+            list.add(new FieldInsnNode(GETFIELD, cn.name, "level", "Lnet/minecraft/world/level/Level;"));
+            list.add(new MethodInsnNode(INVOKESTATIC, FIXES, "tick", "(Lnet/minecraft/world/level/Level;)V", false));
+            if (insertAtStart(cn, "run", "()V", list)) {
+                done.add("hook-tick");
+                changed = true;
+            }
+        }
+        if (name.equals(OPD)) {
+            // Диагностика: перед каждым возвратом из collectEntries(int) вызываем PtmFixes.diag(level, companyID, entries)
+            for (MethodNode m : cn.methods) {
+                if (m.name.equals("collectEntries") && m.desc.equals("(I)Ljava/util/List;")) {
+                    int hooks = 0;
+                    for (AbstractInsnNode insn : m.instructions.toArray()) {
+                        if (insn.getOpcode() == ARETURN) {
+                            InsnList l = new InsnList();
+                            l.add(new VarInsnNode(ALOAD, 0));
+                            l.add(new FieldInsnNode(GETFIELD, cn.name, "level", "Lnet/minecraft/world/level/Level;"));
+                            l.add(new VarInsnNode(ILOAD, 1));
+                            l.add(new VarInsnNode(ALOAD, 2));
+                            l.add(new MethodInsnNode(INVOKESTATIC, FIXES, "diag", "(Lnet/minecraft/world/level/Level;ILjava/util/List;)V", false));
+                            m.instructions.insertBefore(insn, l);
+                            hooks++;
+                        }
+                    }
+                    if (hooks > 0) {
+                        done.add("diag-hook");
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if (name.equals(VSH)) {
+            InsnList l = new InsnList();
+            l.add(new VarInsnNode(ALOAD, 0));
+            l.add(new VarInsnNode(ALOAD, 1));
+            l.add(new VarInsnNode(ALOAD, 2));
+            l.add(new MethodInsnNode(INVOKESTATIC, FIXES, "onRemove",
+                "(Lnet/minecraft/world/level/Level;Ljava/lang/String;Lcom/rinventor/ptm2/core/properties/VDMemoryIDs;)V", false));
+            if (insertAtStart(cn, "remove",
+                "(Lnet/minecraft/world/level/Level;Ljava/lang/String;Lcom/rinventor/ptm2/core/properties/VDMemoryIDs;)V", l)) {
+                done.add("remove-hook");
+                changed = true;
+            }
+        }
+        if (name.equals(PTE)) {
+            InsnList l = new InsnList();
+            l.add(new VarInsnNode(ALOAD, 0));
+            l.add(new VarInsnNode(ALOAD, 1));
+            l.add(new MethodInsnNode(INVOKESTATIC, FIXES, "onDespawn",
+                "(Ljava/lang/String;Lnet/minecraft/world/entity/Entity;)V", false));
+            if (insertAtStart(cn, "syncedDespawn", "(Ljava/lang/String;Lnet/minecraft/world/entity/Entity;)V", l)) {
+                done.add("despawn-hook");
+                changed = true;
+            }
+        }
+        if (name.equals(TRN)) {
+            // Возврат автоматического водителя после ухода игрока: 30 с -> 5 с
+            for (MethodNode m : cn.methods) {
+                if (m.name.equals("updateAutomaticDriverHandoff") && m.desc.equals("()V")) {
+                    for (AbstractInsnNode insn : m.instructions.toArray()) {
+                        if (insn instanceof org.objectweb.asm.tree.LdcInsnNode) {
+                            org.objectweb.asm.tree.LdcInsnNode ldc = (org.objectweb.asm.tree.LdcInsnNode) insn;
+                            if (ldc.cst instanceof Double && ((Double) ldc.cst).doubleValue() == 30.0D) {
+                                ldc.cst = Double.valueOf(5.0D);
+                                done.add("driver-delay");
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (name.equals(GATE_IN)) {
+            // Банковская карта на входном турникете: вместо списания «поездок» (TransportCard.useCard)
+            // списываем цену билета со счёта игрока в пользу компании, как для смартфона.
+            for (MethodNode m : cn.methods) {
+                if (!m.name.equals("m_6227_")) {
+                    continue;
+                }
+                AbstractInsnNode[] all = m.instructions.toArray();
+                for (int i = 0; i < all.length; i++) {
+                    AbstractInsnNode insn = all[i];
+                    if (insn instanceof MethodInsnNode) {
+                        MethodInsnNode mi = (MethodInsnNode) insn;
+                        if (mi.getOpcode() == INVOKESTATIC && mi.name.equals("useCard")
+                            && mi.owner.equals("com/rinventor/ptm2/objects/items/TransportCard")
+                            && i >= 2 && all[i - 1].getOpcode() == ICONST_1 && all[i - 2].getOpcode() == ALOAD) {
+                            InsnList repl = new InsnList();
+                            repl.add(new VarInsnNode(ALOAD, 0));
+                            repl.add(new VarInsnNode(ALOAD, 2));
+                            repl.add(new VarInsnNode(ALOAD, 3));
+                            repl.add(new VarInsnNode(ALOAD, 4));
+                            repl.add(new VarInsnNode(ALOAD, 1));
+                            repl.add(new FieldInsnNode(GETSTATIC, GATE_IN, "COMPANY", "Lnet/minecraft/world/level/block/state/properties/IntegerProperty;"));
+                            repl.add(new MethodInsnNode(INVOKEVIRTUAL, "net/minecraft/world/level/block/state/BlockState", "m_61143_",
+                                "(Lnet/minecraft/world/level/block/state/properties/Property;)Ljava/lang/Comparable;", false));
+                            repl.add(new org.objectweb.asm.tree.TypeInsnNode(CHECKCAST, "java/lang/Integer"));
+                            repl.add(new MethodInsnNode(INVOKEVIRTUAL, "java/lang/Integer", "intValue", "()I", false));
+                            repl.add(new MethodInsnNode(INVOKEVIRTUAL, GATE_IN, "openWithSmartphone",
+                                "(Lnet/minecraft/world/level/Level;Lnet/minecraft/core/BlockPos;Lnet/minecraft/world/entity/player/Player;I)Z", false));
+                            m.instructions.insertBefore(all[i - 2], repl);
+                            m.instructions.remove(all[i - 2]);
+                            m.instructions.remove(all[i - 1]);
+                            m.instructions.remove(insn);
+                            done.add("gate-bankcard");
+                            changed = true;
+                            break; // только первое вхождение: ветка банковской карты
+                        }
+                    }
+                }
+            }
+        }
+        if (name.equals(VEH)) {
+            // Оплата проезда при посадке: оборачиваем Vehicle.startRiding(Entity,int).
+            // Оригинал переименовываем в ptmStartRiding, новый startRiding сначала спрашивает PtmFixes.allowBoard.
+            final String desc = "(Lnet/minecraft/world/entity/Entity;I)V";
+            MethodNode orig = null;
+            for (MethodNode m : cn.methods) {
+                if (m.name.equals("startRiding") && m.desc.equals(desc)) {
+                    orig = m;
+                }
+            }
+            if (orig != null) {
+                orig.name = "ptmStartRiding";
+                MethodNode w = new MethodNode(ACC_PUBLIC, "startRiding", desc, null, null);
+                org.objectweb.asm.tree.LabelNode end = new org.objectweb.asm.tree.LabelNode();
+                w.instructions.add(new VarInsnNode(ALOAD, 0));
+                w.instructions.add(new VarInsnNode(ALOAD, 1));
+                w.instructions.add(new VarInsnNode(ILOAD, 2));
+                w.instructions.add(new VarInsnNode(ALOAD, 1));
+                w.instructions.add(new MethodInsnNode(INVOKEVIRTUAL, "net/minecraft/world/entity/Entity", "m_9236_",
+                    "()Lnet/minecraft/world/level/Level;", false));
+                w.instructions.add(new MethodInsnNode(INVOKESTATIC, FIXES, "allowBoard",
+                    "(L" + VEH + ";Lnet/minecraft/world/entity/Entity;ILnet/minecraft/world/level/Level;)Z", false));
+                w.instructions.add(new org.objectweb.asm.tree.JumpInsnNode(IFEQ, end));
+                w.instructions.add(new VarInsnNode(ALOAD, 0));
+                w.instructions.add(new VarInsnNode(ALOAD, 1));
+                w.instructions.add(new VarInsnNode(ILOAD, 2));
+                w.instructions.add(new MethodInsnNode(INVOKEVIRTUAL, VEH, "ptmStartRiding", desc, false));
+                w.instructions.add(end);
+                w.instructions.add(new org.objectweb.asm.tree.FrameNode(F_SAME, 0, null, 0, null));
+                w.instructions.add(new InsnNode(RETURN));
+                w.maxStack = 5;
+                w.maxLocals = 3;
+                cn.methods.add(w);
+                done.add("boarding-fare");
+                changed = true;
+            }
+        }
+        if (name.equals(GATE_EXIT)) {
+            // Выходной турникет: игрок открывает его, просто подойдя (радиус 0.55 вместо 0.3, без условия «уже открыт»);
+            // правый клик тоже работает с большего расстояния.
+            for (MethodNode m : cn.methods) {
+                boolean isOpen = m.name.equals("gateOpen");
+                boolean isWay = m.name.equals("playerCorrectWay");
+                if (!isOpen && !isWay) {
+                    continue;
+                }
+                for (AbstractInsnNode insn : m.instructions.toArray()) {
+                    if (insn instanceof org.objectweb.asm.tree.LdcInsnNode) {
+                        org.objectweb.asm.tree.LdcInsnNode ldc = (org.objectweb.asm.tree.LdcInsnNode) insn;
+                        if (ldc.cst instanceof Double && ((Double) ldc.cst).doubleValue() == 0.3D) {
+                            ldc.cst = Double.valueOf(0.55D);
+                            changed = true;
+                            done.add("gate-exit-radius");
+                            break;
+                        }
+                    }
+                }
+                if (isOpen) {
+                    AbstractInsnNode[] all = m.instructions.toArray();
+                    for (int i = 0; i < all.length; i++) {
+                        if (all[i] instanceof FieldInsnNode) {
+                            FieldInsnNode f = (FieldInsnNode) all[i];
+                            if (f.getOpcode() == GETSTATIC && f.name.equals("OPEN") && f.owner.equals(GATE_EXIT)
+                                && i >= 1 && i + 3 < all.length
+                                && all[i - 1].getOpcode() == ALOAD
+                                && all[i + 3].getOpcode() == INVOKEVIRTUAL) {
+                                m.instructions.insertBefore(all[i - 1], new InsnNode(ICONST_1));
+                                for (int k = i - 1; k <= i + 3; k++) {
+                                    m.instructions.remove(all[k]);
+                                }
+                                changed = true;
+                                done.add("gate-exit-auto");
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (name.equals(GATE_IN)) {
+            // Входной турникет: проверка присутствия игрока в радиусе 1.2 вместо 0.3
+            for (MethodNode m : cn.methods) {
+                for (AbstractInsnNode insn : m.instructions.toArray()) {
+                    if (insn instanceof org.objectweb.asm.tree.LdcInsnNode) {
+                        org.objectweb.asm.tree.LdcInsnNode ldc = (org.objectweb.asm.tree.LdcInsnNode) insn;
+                        if (ldc.cst instanceof Double && ((Double) ldc.cst).doubleValue() == 0.3D) {
+                            ldc.cst = Double.valueOf(1.2D);
+                            changed = true;
+                            done.add("gate-in-radius");
+                        }
+                    }
+                }
+            }
+        }
+        if (name.equals(TM)) {
+            // Ожидание на конечной не дольше 30 секунд: оборачиваем scheduledTerminalWait(Level,int,int)J
+            final String desc = "(Lnet/minecraft/world/level/Level;II)J";
+            MethodNode orig = null;
+            for (MethodNode m : cn.methods) {
+                if (m.name.equals("scheduledTerminalWait") && m.desc.equals(desc)) {
+                    orig = m;
+                }
+            }
+            if (orig != null) {
+                orig.name = "ptmScheduledTerminalWait";
+                MethodNode w = new MethodNode(ACC_PRIVATE | ACC_STATIC, "scheduledTerminalWait", desc, null, null);
+                w.instructions.add(new VarInsnNode(ALOAD, 0));
+                w.instructions.add(new VarInsnNode(ILOAD, 1));
+                w.instructions.add(new VarInsnNode(ILOAD, 2));
+                w.instructions.add(new MethodInsnNode(INVOKESTATIC, TM, "ptmScheduledTerminalWait", desc, false));
+                w.instructions.add(new org.objectweb.asm.tree.LdcInsnNode(Long.valueOf(30000L)));
+                w.instructions.add(new MethodInsnNode(INVOKESTATIC, "java/lang/Math", "min", "(JJ)J", false));
+                w.instructions.add(new InsnNode(LRETURN));
+                w.maxStack = 6;
+                w.maxLocals = 3;
+                cn.methods.add(w);
+                done.add("terminal-cap");
+                changed = true;
+            }
+        }
+        if (name.equals(TM)) {
+            // Прибытие на остановку: допуск по зоне платформы и по остановке на месте 4+ секунды
+            for (MethodNode m : cn.methods) {
+                if (!m.name.equals("updateVehicleDestination")) {
+                    continue;
+                }
+                AbstractInsnNode[] all = m.instructions.toArray();
+                int inside = 0;
+                for (int i = 0; i < all.length; i++) {
+                    AbstractInsnNode insn = all[i];
+                    if (insn instanceof MethodInsnNode) {
+                        MethodInsnNode mi = (MethodInsnNode) insn;
+                        if (mi.getOpcode() == INVOKEVIRTUAL && mi.name.equals("isInside") && mi.desc.equals("(DD)Z")
+                            && mi.owner.equals("com/rinventor/ptm2/dimension/virtual/types/VDPlatform")) {
+                            m.instructions.set(insn, new MethodInsnNode(INVOKESTATIC, FIXES, "insideTol",
+                                "(Lcom/rinventor/ptm2/dimension/virtual/types/VDPlatform;DD)Z", false));
+                            inside++;
+                        }
+                    }
+                    if (insn instanceof org.objectweb.asm.tree.LdcInsnNode && i + 1 < all.length
+                        && all[i + 1].getOpcode() == GOTO) {
+                        org.objectweb.asm.tree.LdcInsnNode ldc = (org.objectweb.asm.tree.LdcInsnNode) insn;
+                        if (ldc.cst instanceof Double && ((Double) ldc.cst).doubleValue() == 2.0D) {
+                            InsnList repl = new InsnList();
+                            repl.add(new VarInsnNode(ALOAD, 1));
+                            repl.add(new VarInsnNode(ALOAD, 2));
+                            repl.add(new VarInsnNode(DLOAD, 3));
+                            repl.add(new MethodInsnNode(INVOKESTATIC, FIXES, "reachFor",
+                                "(Lcom/rinventor/ptm2/dimension/virtual/types/VDTrackableVehicle;Lcom/rinventor/ptm2/objects/entities/vehicle/Vehicle;D)D", false));
+                            m.instructions.insertBefore(insn, repl);
+                            m.instructions.remove(insn);
+                            done.add("arrival-reach");
+                            changed = true;
+                        }
+                    }
+                }
+                if (inside >= 2) {
+                    done.add("arrival-inside");
+                    changed = true;
+                }
+            }
+        }
+        if (name.equals(TBM)) {
+            // Лампы: поиск группы соседних блоков не ограничен, и на «пустой» записи (блока лампы уже нет)
+            // он заливает весь воздух вокруг, сервер зависает на минуту (ServerHangWatchdog).
+            // Заменяем HashSet.contains на проверку с потолком 2048 блоков.
+            for (MethodNode m : cn.methods) {
+                if (!m.name.startsWith("lambda$switchLampAt")) {
+                    continue;
+                }
+                for (AbstractInsnNode insn : m.instructions.toArray()) {
+                    if (insn instanceof MethodInsnNode) {
+                        MethodInsnNode mi = (MethodInsnNode) insn;
+                        if (mi.getOpcode() == INVOKEVIRTUAL && mi.owner.equals("java/util/HashSet")
+                            && mi.name.equals("contains") && mi.desc.equals("(Ljava/lang/Object;)Z")) {
+                            m.instructions.set(insn, new MethodInsnNode(INVOKESTATIC, FIXES, "visitedOrFull",
+                                "(Ljava/util/HashSet;Ljava/lang/Object;)Z", false));
+                            done.add("lamp-cap");
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        if (name.equals(ATM)) {
+            // Вызываем PtmFixes.atmDeposit(player, level), затем обнуляем сумму: исходный код ничего не делает.
+            InsnList list = new InsnList();
+            list.add(new VarInsnNode(ALOAD, 0));
+            list.add(new VarInsnNode(ALOAD, 0));
+            list.add(new MethodInsnNode(INVOKEVIRTUAL, "net/minecraft/world/entity/player/Player", "m_9236_", "()Lnet/minecraft/world/level/Level;", false));
+            list.add(new MethodInsnNode(INVOKESTATIC, FIXES, "atmDeposit", "(Lnet/minecraft/world/entity/player/Player;Lnet/minecraft/world/level/Level;)V", false));
+            list.add(new InsnNode(DCONST_0));
+            list.add(new VarInsnNode(DSTORE, 1));
+            if (insertAtStart(cn, "handle", "(Lnet/minecraft/world/entity/player/Player;D)V", list)) {
+                done.add("atm-amount");
+                changed = true;
+            }
+        }
+        if (name.equals(VU)) {
+            InsnList list = new InsnList();
+            list.add(new VarInsnNode(ALOAD, 0));
+            list.add(new VarInsnNode(ALOAD, 0));
+            list.add(new FieldInsnNode(GETFIELD, cn.name, "type", "I"));
+            list.add(new VarInsnNode(ALOAD, 0));
+            list.add(new FieldInsnNode(GETFIELD, cn.name, "propertyID", "I"));
+            list.add(new MethodInsnNode(INVOKESTATIC, FIXES, "safeProp", "(II)I", false));
+            list.add(new FieldInsnNode(PUTFIELD, cn.name, "propertyID", "I"));
+            boolean unlocked = false;
+            for (FieldNode f : cn.fields) {
+                if (f.name.equals("propertyID")) {
+                    f.access = f.access & ~ACC_FINAL;
+                    unlocked = true;
+                }
+            }
+            if (unlocked && insertAtStart(cn, "handle", "(Lnet/minecraft/server/level/ServerPlayer;)V", list)) {
+                done.add("value-update-filter");
+                changed = true;
+            }
+        }
+        if (flags) {
+            for (MethodNode m : cn.methods) {
+                AbstractInsnNode[] insns = m.instructions.toArray();
+                for (AbstractInsnNode insn : insns) {
+                    if (insn.getOpcode() == GETFIELD && insn instanceof FieldInsnNode) {
+                        FieldInsnNode f = (FieldInsnNode) insn;
+                        if (f.owner.equals(WSD) && f.desc.equals("Z")
+                            && (f.name.equals("INDEFINITE_BANK_ACCOUNT") || f.name.equals("INDEFINITE_TRANSPORT_CARD"))) {
+                            InsnList repl = new InsnList();
+                            repl.add(new InsnNode(POP));
+                            repl.add(new InsnNode(ICONST_0));
+                            m.instructions.insertBefore(insn, repl);
+                            m.instructions.remove(insn);
+                            flagReplacements++;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        if (!changed) {
+            return data;
+        }
+        for (MethodNode mm : cn.methods) {
+            for (AbstractInsnNode in : mm.instructions.toArray()) {
+                if (in instanceof MethodInsnNode && ((MethodInsnNode) in).owner.equals(FIXES)) {
+                    refs.add(((MethodInsnNode) in).name + ((MethodInsnNode) in).desc);
+                }
+            }
+        }
+        ClassWriter cw = new ClassWriter(ClassWriter.COMPUTE_MAXS);
+        cn.accept(cw);
+        return cw.toByteArray();
+    }
+
+    static boolean insertAtStart(ClassNode cn, String method, String desc, InsnList list) {
+        for (MethodNode m : cn.methods) {
+            if (m.name.equals(method) && m.desc.equals(desc)) {
+                m.instructions.insert(list);
+                return true;
+            }
+        }
+        System.err.println("method not found: " + cn.name + "." + method + desc);
+        return false;
+    }
+
+    static boolean contains(byte[] data, String text) {
+        byte[] needle = text.getBytes(StandardCharsets.US_ASCII);
+        outer:
+        for (int i = 0; i + needle.length <= data.length; i++) {
+            for (int j = 0; j < needle.length; j++) {
+                if (data[i + j] != needle[j]) {
+                    continue outer;
+                }
+            }
+            return true;
+        }
+        return false;
+    }
+}

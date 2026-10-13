@@ -132,7 +132,7 @@ public class Patcher implements Opcodes {
         if (mismatch) {
             System.exit(1);
         }
-        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay", "gate-bankcard", "boarding-fare", "gate-exit-radius", "gate-exit-auto", "gate-in-radius", "terminal-cap", "arrival-reach", "arrival-inside", "lamp-cap", "red-commit", "patience", "bypass-still", "merge-check"};
+        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay", "gate-bankcard", "boarding-fare", "gate-exit-radius", "gate-exit-auto", "gate-in-radius", "terminal-cap", "arrival-reach", "arrival-inside", "lamp-cap", "red-commit", "patience", "bypass-still", "merge-check", "player-ahead", "merge-width"};
         for (String r : required) {
             if (!done.contains(r)) {
                 System.err.println("ERROR: patch not applied: " + r);
@@ -357,6 +357,28 @@ public class Patcher implements Opcodes {
             for (MethodNode m : cn.methods) {
                 if (!m.name.equals("laneChangeCheck")) {
                     continue;
+                }
+                // контекст машины для playerAhead
+                InsnList ctxInit = new InsnList();
+                ctxInit.add(new VarInsnNode(ALOAD, 0));
+                ctxInit.add(new MethodInsnNode(INVOKESTATIC, FIXES, "setCtx", "(L" + VEH + ";)V", false));
+                m.instructions.insert(ctxInit);
+                for (AbstractInsnNode insn : m.instructions.toArray()) {
+                    if (insn instanceof MethodInsnNode) {
+                        MethodInsnNode mi = (MethodInsnNode) insn;
+                        if (mi.getOpcode() == INVOKESTATIC && mi.owner.equals("com/rinventor/ptm2/engine/base/PTMEntity")
+                            && mi.name.equals("exists")) {
+                            m.instructions.set(insn, new MethodInsnNode(INVOKESTATIC, FIXES, "playerAhead", mi.desc, false));
+                            done.add("player-ahead");
+                        }
+                    } else if (insn instanceof org.objectweb.asm.tree.LdcInsnNode) {
+                        org.objectweb.asm.tree.LdcInsnNode ld = (org.objectweb.asm.tree.LdcInsnNode) insn;
+                        // ширина полос 3-5 блоков: поиск целевой полосы начинаем с 3 блоков, а не с 4
+                        if (ld.cst instanceof Double && ((Double) ld.cst) == 4.0D) {
+                            ld.cst = Double.valueOf(3.0D);
+                            done.add("merge-width");
+                        }
+                    }
                 }
                 for (AbstractInsnNode insn : m.instructions.toArray()) {
                     if (insn instanceof org.objectweb.asm.tree.FieldInsnNode) {

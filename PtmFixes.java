@@ -16,6 +16,7 @@ import com.rinventor.ptm2.dimension.physical.TransportModelData;
 import com.rinventor.ptm2.engine.bezier.utility.Pair;
 import com.rinventor.ptm2.core.properties.RoadMarkingTypes;
 import com.rinventor.ptm2.core.properties.TrafficLightColors;
+import com.rinventor.ptm2.dimension.virtual.types.VDIntersection;
 import com.rinventor.ptm2.dimension.virtual.types.VDRoadMarking;
 import com.rinventor.ptm2.dimension.virtual.types.VDTrafficLane;
 import net.minecraft.core.BlockPos;
@@ -587,6 +588,9 @@ public final class PtmFixes {
         boolean backing;
         double backLeft;
         long holdUntil;
+        long exitCheck;
+        boolean exitHold;
+        long exitHoldSince;
     }
 
     static final Map<Integer, Drv> DRV = new ConcurrentHashMap<>();
@@ -737,6 +741,22 @@ public final class PtmFixes {
                 d.forced = false;
                 d.candidate = false;
                 d.failed = 0;
+                // Не въезжаем на перекрёсток, если за ним нет места (но не дольше 12 с)
+                if (now - d.exitCheck > 300L) {
+                    d.exitCheck = now;
+                    d.exitHold = exitBlocked(v, level);
+                }
+                if (d.exitHold) {
+                    if (d.exitHoldSince == 0L) {
+                        d.exitHoldSince = now;
+                        drvLog(d, now, "ждёт места за перекрёстком " + (int) PTMEntity.getX(v) + " " + (int) PTMEntity.getZ(v));
+                    }
+                    if (now - d.exitHoldSince < 12000L) {
+                        return false;
+                    }
+                } else {
+                    d.exitHoldSince = 0L;
+                }
                 return true;
             }
             if (d.forced) {
@@ -746,6 +766,22 @@ public final class PtmFixes {
                     d.forced = false;
                     d.candidate = false;
                     d.blockedSince = now;
+                    return false;
+                }
+                if (!pathFree(v, 9.0D, false, 1.5D)) {
+                    // Чужой кузов на пути: ждём (проигравший отъедет)
+                    if (still && d.stillSince > 0L && now - d.stillSince > 3000L && now - d.forcedAt > 3000L) {
+                        d.forced = false;
+                        d.failed++;
+                        d.candidate = false;
+                        if (shouldYield(v, d, level)) {
+                            d.backing = true;
+                            d.backLeft = 7.0D;
+                            drvLog(d, now, "отъезжает назад, уступая " + (int) PTMEntity.getX(v) + " " + (int) PTMEntity.getZ(v));
+                        } else {
+                            d.blockedSince = now - PATIENCE_MS;
+                        }
+                    }
                     return false;
                 }
                 if (still && d.stillSince > 0L && now - d.stillSince > 3000L && now - d.forcedAt > 3000L) {
@@ -803,6 +839,16 @@ public final class PtmFixes {
                     return false;
                 }
             }
+            if (!pathFree(v, 9.0D, false, 1.5D)) {
+                // Путь занят чужим кузовом: не лезем; уступит младший
+                if (shouldYield(v, d, level)) {
+                    d.failed++;
+                    d.backing = true;
+                    d.backLeft = 7.0D;
+                    drvLog(d, now, "отъезжает назад, уступая " + (int) PTMEntity.getX(v) + " " + (int) PTMEntity.getZ(v));
+                }
+                return false;
+            }
             d.forced = true;
             d.forcedAt = now;
             drvLog(d, now, "разрешён проезд " + (int) PTMEntity.getX(v) + " " + (int) PTMEntity.getZ(v) + " ждал " + (waited / 1000L) + " с, попытка " + (d.failed + 1)
@@ -812,6 +858,283 @@ public final class PtmFixes {
             PTMLogger.error(e);
             return orig;
         }
+    }
+
+    // ---------------------------------------------------------------- геометрия пути и перекрёстков
+
+    /** Кэш зон перекрёстков: [minX, minZ, maxX, maxZ]. */
+    static final class Zones {
+        long t;
+        int[][] boxes = new int[0][];
+    }
+
+    static final Map<Integer, Zones> ZONES = new ConcurrentHashMap<>();
+
+    static boolean inIntersectionAt(Level level, double x, double z) {
+        long now = System.currentTimeMillis();
+        int key = System.identityHashCode(level);
+        Zones zc = ZONES.get(key);
+        if (zc == null || now - zc.t > 5000L) {
+            Zones nz = new Zones();
+            nz.t = now;
+            List<int[]> list = new java.util.ArrayList<>();
+            for (Map.Entry<Integer, String> e : VDStorageHandler.getAll(level, VDMemoryIDs.INTERSECTION).entrySet()) {
+                VDIntersection zi = new VDIntersection(e.getValue());
+                list.add(new int[] {Math.min(zi.sbX, zi.fbX), Math.min(zi.sbZ, zi.fbZ), Math.max(zi.sbX, zi.fbX), Math.max(zi.sbZ, zi.fbZ)});
+            }
+            nz.boxes = list.toArray(new int[0][]);
+            ZONES.put(key, nz);
+            zc = nz;
+        }
+        int bx = (int) Math.floor(x);
+        int bz = (int) Math.floor(z);
+        for (int[] b : zc.boxes) {
+            if (bx >= b[0] && bx <= b[2] && bz >= b[1] && bz <= b[3]) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Точки пути вперёд от текущего положения: n точек с шагом step блоков.
+     * Результат: {dx, dz, fx, fz} для каждой точки (смещение от текущей позиции и направление).
+     */
+    static double[][] pathAhead(Vehicle v, double step, int n) {
+        initRefl();
+        if (!reflOk || v.currentPath == null || v.currentPath.isEmpty()) {
+            return null;
+        }
+        try {
+            Map<Integer, List<?>> cache = new java.util.HashMap<>();
+            int lane = v.pathLaneIndex;
+            int seg = fSeg.getInt(v);
+            double off = fOff.getDouble(v);
+            double[][] out = new double[n][];
+            double p0x = 0.0D;
+            double p0z = 0.0D;
+            boolean have0 = false;
+            double acc = 0.0D;
+            int idx = 0;
+            int guard = 0;
+            double lastFx = 0.0D;
+            double lastFz = 1.0D;
+            while (idx < n && guard++ < 400) {
+                if (lane >= v.currentPath.size()) {
+                    break;
+                }
+                List<?> pts = cache.get(lane);
+                if (pts == null) {
+                    pts = (List<?>) mPts.invoke(v, v.currentPath.get(lane));
+                    cache.put(lane, pts);
+                }
+                if (pts.size() < 2 || seg >= pts.size() - 1) {
+                    lane++;
+                    seg = 0;
+                    off = 0.0D;
+                    continue;
+                }
+                double len = segLen(pts, seg);
+                if (len < 1.0E-6D) {
+                    seg++;
+                    off = 0.0D;
+                    continue;
+                }
+                Object a = pts.get(seg);
+                Object b = pts.get(seg + 1);
+                double fx = (vc(b, 0) - vc(a, 0)) / len;
+                double fz = (vc(b, 2) - vc(a, 2)) / len;
+                double px = vc(a, 0) + fx * off;
+                double pz = vc(a, 2) + fz * off;
+                if (!have0) {
+                    p0x = px;
+                    p0z = pz;
+                    have0 = true;
+                    out[idx++] = new double[] {0.0D, 0.0D, fx, fz};
+                    acc = 0.0D;
+                }
+                lastFx = fx;
+                lastFz = fz;
+                double need = step - acc;
+                double room = len - off;
+                if (need <= room) {
+                    off += need;
+                    acc = 0.0D;
+                    double nx = vc(a, 0) + fx * off;
+                    double nz = vc(a, 2) + fz * off;
+                    if (idx < n) {
+                        out[idx++] = new double[] {nx - p0x, nz - p0z, fx, fz};
+                    }
+                } else {
+                    acc += room;
+                    seg++;
+                    off = 0.0D;
+                }
+            }
+            if (!have0) {
+                return null;
+            }
+            int cnt = idx;
+            double[][] res = new double[cnt][];
+            System.arraycopy(out, 0, res, 0, cnt);
+            return res;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /** Пересекаются ли два прямоугольника (центр, курс, полудлина/полуширина). */
+    static boolean rectOverlap(double x1, double z1, double fx1, double fz1, double hl1, double hw1,
+                               double x2, double z2, double fx2, double fz2, double hl2, double hw2) {
+        double dx = x2 - x1;
+        double dz = z2 - z1;
+        double[][] axes = {{fx1, fz1}, {-fz1, fx1}, {fx2, fz2}, {-fz2, fx2}};
+        for (double[] ax : axes) {
+            double r1 = hl1 * Math.abs(fx1 * ax[0] + fz1 * ax[1]) + hw1 * Math.abs(-fz1 * ax[0] + fx1 * ax[1]);
+            double r2 = hl2 * Math.abs(fx2 * ax[0] + fz2 * ax[1]) + hw2 * Math.abs(-fz2 * ax[0] + fx2 * ax[1]);
+            if (Math.abs(dx * ax[0] + dz * ax[1]) > r1 + r2) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static double[] headingOf(Vehicle o) {
+        double y = Math.toRadians(PTMEntity.getYaw(o));
+        return new double[] {-Math.sin(y), Math.cos(y)};
+    }
+
+    /** Свободен ли путь на aheadDist блоков вперёд (машина с запасом не заденет чужие кузова)? */
+    static boolean pathFree(Vehicle v, double aheadDist, boolean stationaryOnly, double fromDist) {
+        double step = 1.5D;
+        int n = (int) Math.ceil(aheadDist / step) + 1;
+        double[][] pa = pathAhead(v, step, n);
+        if (pa == null) {
+            return true;
+        }
+        double x = PTMEntity.getX(v);
+        double z = PTMEntity.getZ(v);
+        double hl = v.length / 2.0D + 0.2D;
+        double hw = v.width / 2.0D + 0.2D;
+        double[] h0 = headingOf(v);
+        for (Vehicle o : PTMEntity.getDifferentVehicles(2.0D * (aheadDist + 12.0D), v)) {
+            if (stationaryOnly && Math.abs(o.speed) >= 0.5F) {
+                continue;
+            }
+            double[] ho = headingOf(o);
+            double ox = PTMEntity.getX(o);
+            double oz = PTMEntity.getZ(o);
+            double ohl = o.length / 2.0D;
+            double ohw = o.width / 2.0D;
+            // Уже пересекаемся сейчас (стоим впритык) - такую машину не учитываем
+            if (rectOverlap(x, z, h0[0], h0[1], hl, hw, ox, oz, ho[0], ho[1], ohl, ohw)) {
+                continue;
+            }
+            for (int i = 1; i < pa.length; i++) {
+                if (i * step < fromDist) {
+                    continue;
+                }
+                if (rectOverlap(x + pa[i][0], z + pa[i][1], pa[i][2], pa[i][3], hl, hw, ox, oz, ho[0], ho[1], ohl, ohw)) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Нельзя въезжать на перекрёсток, если за ним нет места для машины («не блокировать перекрёсток»):
+     * путь входит в зону перекрёстка в ближайшие ~10 блоков, а после выезда из зоны на длину кузова стоит другая машина.
+     */
+    static boolean exitBlocked(Vehicle v, Level level) {
+        if (inIntersectionAt(level, PTMEntity.getX(v), PTMEntity.getZ(v))) {
+            return false;
+        }
+        double step = 1.5D;
+        double[][] pa = pathAhead(v, step, 32);
+        if (pa == null) {
+            return false;
+        }
+        double x = PTMEntity.getX(v);
+        double z = PTMEntity.getZ(v);
+        int firstIn = -1;
+        int firstOutAfter = -1;
+        for (int i = 0; i < pa.length; i++) {
+            boolean in = inIntersectionAt(level, x + pa[i][0], z + pa[i][1]);
+            if (firstIn < 0) {
+                if (in) {
+                    firstIn = i;
+                    if (firstIn > 7) {
+                        return false;
+                    }
+                }
+            } else if (!in) {
+                firstOutAfter = i;
+                break;
+            }
+        }
+        if (firstIn < 0 || firstOutAfter < 0) {
+            return false;
+        }
+        double need = v.length + 3.0D;
+        double hl = v.length / 2.0D;
+        double hw = v.width / 2.0D;
+        for (Vehicle o : PTMEntity.getDifferentVehicles(80.0D, v)) {
+            if (Math.abs(o.speed) >= 0.5F) {
+                continue;
+            }
+            double[] ho = headingOf(o);
+            double ox = PTMEntity.getX(o);
+            double oz = PTMEntity.getZ(o);
+            if (inIntersectionAt(level, ox, oz)) {
+                continue;
+            }
+            for (int i = firstOutAfter; i < pa.length && (i - firstOutAfter) * step <= need; i++) {
+                if (rectOverlap(x + pa[i][0], z + pa[i][1], pa[i][2], pa[i][3], hl, hw, ox, oz, ho[0], ho[1], o.length / 2.0D, o.width / 2.0D)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /** Контекст для перестроения (машина, для которой сейчас вызван laneChangeCheck). */
+    private static final ThreadLocal<Vehicle> CTX = new ThreadLocal<>();
+
+    public static void setCtx(Vehicle v) {
+        CTX.set(v);
+    }
+
+    /**
+     * Замена PTMEntity.exists(Player...) в laneChangeCheck: игрок на дороге впереди (3-16 блоков),
+     * а не только ровно в 15 блоках. Объезжаем, когда машина уже почти стоит.
+     */
+    public static boolean playerAhead(Class<? extends net.minecraft.world.entity.Entity> c, double r, net.minecraft.world.level.LevelAccessor level,
+                                      double x, double y, double z) {
+        boolean orig = PTMEntity.exists(c, r, level, x, y, z);
+        if (orig) {
+            return true;
+        }
+        try {
+            Vehicle v = CTX.get();
+            if (v == null || Math.abs(v.speed) > 2.5F) {
+                return false;
+            }
+            double yaw = Math.toRadians(PTMEntity.getYaw(v));
+            double fx = -Math.sin(yaw);
+            double fz = Math.cos(yaw);
+            double vx = PTMEntity.getX(v);
+            double vy = PTMEntity.getY(v);
+            double vz = PTMEntity.getZ(v);
+            for (double t = 3.0D; t <= 16.0D; t += 1.5D) {
+                if (PTMEntity.exists(c, 2.4D, level, vx + fx * t, vy, vz + fz * t)) {
+                    return true;
+                }
+            }
+        } catch (Exception e) {
+            PTMLogger.error(e);
+        }
+        return false;
     }
 
     // ---------------------------------------------------------------- отъезд назад

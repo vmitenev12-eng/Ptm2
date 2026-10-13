@@ -38,6 +38,9 @@ public class Patcher implements Opcodes {
     static final String VEH = "com/rinventor/ptm2/objects/entities/vehicle/Vehicle";
     static final String GATE_EXIT = "com/rinventor/ptm2/objects/blockentities/gate/GateExit";
     static final String TM = "com/rinventor/ptm2/dimension/physical/TransportManager";
+    static final String TBM = "com/rinventor/ptm2/dimension/physical/TickableBlocksManager";
+    static final Set<String> refs = new HashSet<>();
+    static final Set<String> fixesMethods = new HashSet<>();
 
     static final Set<String> done = new HashSet<>();
     static int flagReplacements = 0;
@@ -100,6 +103,13 @@ public class Patcher implements Opcodes {
                 try (InputStream in = fz.getInputStream(e)) {
                     data = in.readAllBytes();
                 }
+                if (name.equals(FIXES + ".class")) {
+                    ClassNode fcn = new ClassNode();
+                    new ClassReader(data).accept(fcn, 0);
+                    for (MethodNode fm : fcn.methods) {
+                        fixesMethods.add(fm.name + fm.desc);
+                    }
+                }
                 zout.putNextEntry(new ZipEntry(name));
                 zout.write(data);
                 zout.closeEntry();
@@ -111,7 +121,17 @@ public class Patcher implements Opcodes {
             }
         }
         System.out.println("patched: " + done + ", indefinite-flag reads replaced: " + flagReplacements);
-        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay", "gate-bankcard", "boarding-fare", "gate-exit-radius", "gate-exit-auto", "gate-in-radius", "terminal-cap", "arrival-reach", "arrival-inside"};
+        boolean mismatch = false;
+        for (String r : refs) {
+            if (!fixesMethods.contains(r)) {
+                System.err.println("ERROR: PtmFixes has no method " + r + " (PtmFixes.java in the repo is outdated?)");
+                mismatch = true;
+            }
+        }
+        if (mismatch) {
+            System.exit(1);
+        }
+        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay", "gate-bankcard", "boarding-fare", "gate-exit-radius", "gate-exit-auto", "gate-in-radius", "terminal-cap", "arrival-reach", "arrival-inside", "lamp-cap"};
         for (String r : required) {
             if (!done.contains(r)) {
                 System.err.println("ERROR: patch not applied: " + r);
@@ -133,7 +153,7 @@ public class Patcher implements Opcodes {
     }
 
     static byte[] patchClass(String name, byte[] data) {
-        boolean target = name.equals(OPD) || name.equals(ATM) || name.equals(VU) || name.equals(VSH) || name.equals(PTE) || name.equals(TRN) || name.equals(GATE_IN) || name.equals(VEH) || name.equals(GATE_EXIT) || name.equals(TM);
+        boolean target = name.equals(OPD) || name.equals(ATM) || name.equals(VU) || name.equals(VSH) || name.equals(PTE) || name.equals(TRN) || name.equals(GATE_IN) || name.equals(VEH) || name.equals(GATE_EXIT) || name.equals(TM) || name.equals(TBM);
         boolean flags = contains(data, "INDEFINITE_BANK_ACCOUNT") || contains(data, "INDEFINITE_TRANSPORT_CARD");
         if (!target && !flags) {
             return data;
@@ -419,6 +439,28 @@ public class Patcher implements Opcodes {
                 }
             }
         }
+        if (name.equals(TBM)) {
+            // Лампы: поиск группы соседних блоков не ограничен, и на «пустой» записи (блока лампы уже нет)
+            // он заливает весь воздух вокруг, сервер зависает на минуту (ServerHangWatchdog).
+            // Заменяем HashSet.contains на проверку с потолком 2048 блоков.
+            for (MethodNode m : cn.methods) {
+                if (!m.name.startsWith("lambda$switchLampAt")) {
+                    continue;
+                }
+                for (AbstractInsnNode insn : m.instructions.toArray()) {
+                    if (insn instanceof MethodInsnNode) {
+                        MethodInsnNode mi = (MethodInsnNode) insn;
+                        if (mi.getOpcode() == INVOKEVIRTUAL && mi.owner.equals("java/util/HashSet")
+                            && mi.name.equals("contains") && mi.desc.equals("(Ljava/lang/Object;)Z")) {
+                            m.instructions.set(insn, new MethodInsnNode(INVOKESTATIC, FIXES, "visitedOrFull",
+                                "(Ljava/util/HashSet;Ljava/lang/Object;)Z", false));
+                            done.add("lamp-cap");
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
         if (name.equals(ATM)) {
             // Вызываем PtmFixes.atmDeposit(player, level), затем обнуляем сумму: исходный код ничего не делает.
             InsnList list = new InsnList();
@@ -476,6 +518,13 @@ public class Patcher implements Opcodes {
         }
         if (!changed) {
             return data;
+        }
+        for (MethodNode mm : cn.methods) {
+            for (AbstractInsnNode in : mm.instructions.toArray()) {
+                if (in instanceof MethodInsnNode && ((MethodInsnNode) in).owner.equals(FIXES)) {
+                    refs.add(((MethodInsnNode) in).name + ((MethodInsnNode) in).desc);
+                }
+            }
         }
         ClassWriter cw = new ClassWriter(ClassWriter.COMPUTE_MAXS);
         cn.accept(cw);

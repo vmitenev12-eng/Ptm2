@@ -345,6 +345,68 @@ public final class PtmFixes {
         }
     }
 
+
+    private static final ConcurrentHashMap<Integer, Long> SLOW = new ConcurrentHashMap<>();
+
+    /**
+     * Допуск при проверке «автобус внутри зоны платформы»: считаем внутри и точку в пределах 4 блоков от зоны.
+     * Вызывается вместо VDPlatform.isInside внутри TransportManager.updateVehicleDestination.
+     */
+    public static boolean insideTol(VDPlatform p, double x, double z) {
+        try {
+            if (p.isInside(x, z)) {
+                return true;
+            }
+            double minX = Math.min(p.sbX, p.fbX);
+            double maxX = Math.max(p.sbX, p.fbX) + 1.0D;
+            double minZ = Math.min(p.sbZ, p.fbZ);
+            double maxZ = Math.max(p.sbZ, p.fbZ) + 1.0D;
+            double dx = Math.max(Math.max(minX - x, 0.0D), x - maxX);
+            double dz = Math.max(Math.max(minZ - z, 0.0D), z - maxZ);
+            return dx * dx + dz * dz <= 16.0D;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /**
+     * Радиус «прибытия» к точке остановки вместо константы 2.0: если автобус стоит (скорость около нуля)
+     * дольше 4 секунд в пределах 14 блоков от точки остановки, считаем, что он прибыл (открываем двери, ждём, едем дальше).
+     */
+    public static double reachFor(VDTrackableVehicle v, Vehicle ve, double distance) {
+        try {
+            if (ve == null) {
+                return 2.0D;
+            }
+            int key = System.identityHashCode(ve);
+            long now = System.currentTimeMillis();
+            if (distance < 14.0D && Math.abs(ve.speed) < 0.5F) {
+                Long first = SLOW.get(key);
+                if (first == null) {
+                    if (SLOW.size() > 500) {
+                        SLOW.clear();
+                    }
+                    SLOW.put(key, now);
+                } else if (now - first >= 4000L) {
+                    return 14.0D;
+                }
+            } else {
+                SLOW.remove(key);
+            }
+        } catch (Throwable t) {
+            // не ломаем игру
+        }
+        return 2.0D;
+    }
+
+    /**
+     * Замена HashSet.contains в поиске группы ламп (TickableBlocksManager.switchLampAt):
+     * когда набор достиг 2048 блоков, считаем все остальные уже посещёнными, и обход заканчивается.
+     */
+    public static boolean visitedOrFull(java.util.HashSet<?> set, Object o) {
+        return set.size() >= 2048 || set.contains(o);
+    }
+
     private static String yn(boolean v) {
         return v ? "\u0434\u0430" : "\u041d\u0415\u0422";
     }

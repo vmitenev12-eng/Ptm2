@@ -132,7 +132,7 @@ public class Patcher implements Opcodes {
         if (mismatch) {
             System.exit(1);
         }
-        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay", "gate-bankcard", "boarding-fare", "gate-exit-radius", "gate-exit-auto", "gate-in-radius", "terminal-cap", "arrival-reach", "arrival-inside", "lamp-cap", "red-commit", "patience", "bypass-still"};
+        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay", "gate-bankcard", "boarding-fare", "gate-exit-radius", "gate-exit-auto", "gate-in-radius", "terminal-cap", "arrival-reach", "arrival-inside", "lamp-cap", "red-commit", "patience", "bypass-still", "merge-check"};
         for (String r : required) {
             if (!done.contains(r)) {
                 System.err.println("ERROR: patch not applied: " + r);
@@ -369,6 +369,36 @@ public class Patcher implements Opcodes {
                         }
                     }
                 }
+            }
+        }
+        if (name.equals(VUT)) {
+            // Перестроение: mergeLaneHasObstacle -> дополнительная проверка разметки и машин в целевой полосе
+            MethodNode origMl = null;
+            for (MethodNode m : cn.methods) {
+                if (m.name.equals("mergeLaneHasObstacle")
+                    && m.desc.equals("(L" + VEH + ";L" + "com/rinventor/ptm2/dimension/virtual/types/VDTrafficLane;)Z")) {
+                    origMl = m;
+                }
+            }
+            if (origMl != null) {
+                origMl.name = "ptmMergeOrig";
+                MethodNode w = new MethodNode(ACC_PUBLIC | ACC_STATIC, "mergeLaneHasObstacle", origMl.desc, null, null);
+                w.instructions.add(new VarInsnNode(ALOAD, 0));
+                w.instructions.add(new VarInsnNode(ALOAD, 1));
+                w.instructions.add(new VarInsnNode(ALOAD, 0));
+                w.instructions.add(new VarInsnNode(ALOAD, 1));
+                w.instructions.add(new MethodInsnNode(INVOKESTATIC, VUT, "ptmMergeOrig", origMl.desc, false));
+                w.instructions.add(new VarInsnNode(ALOAD, 0));
+                w.instructions.add(new MethodInsnNode(INVOKEVIRTUAL, "net/minecraft/world/entity/Entity", "m_9236_",
+                    "()Lnet/minecraft/world/level/Level;", false));
+                w.instructions.add(new MethodInsnNode(INVOKESTATIC, FIXES, "mergeBlocked",
+                    "(L" + VEH + ";Lcom/rinventor/ptm2/dimension/virtual/types/VDTrafficLane;ZLnet/minecraft/world/level/Level;)Z", false));
+                w.instructions.add(new InsnNode(IRETURN));
+                w.maxStack = 5;
+                w.maxLocals = 2;
+                cn.methods.add(w);
+                done.add("merge-check");
+                changed = true;
             }
         }
         if (name.equals(GATE_EXIT)) {

@@ -14,7 +14,11 @@ import com.rinventor.ptm2.dimension.virtual.types.VDOperationalData;
 import com.rinventor.ptm2.engine.util.TimeHelper;
 import com.rinventor.ptm2.dimension.physical.TransportModelData;
 import com.rinventor.ptm2.engine.bezier.utility.Pair;
+import com.rinventor.ptm2.core.properties.RoadMarkingTypes;
 import com.rinventor.ptm2.core.properties.TrafficLightColors;
+import com.rinventor.ptm2.dimension.virtual.types.VDRoadMarking;
+import com.rinventor.ptm2.dimension.virtual.types.VDTrafficLane;
+import net.minecraft.core.BlockPos;
 import com.rinventor.ptm2.dimension.physical.VehicleUtils;
 import com.rinventor.ptm2.objects.entities.pedestrian.Pedestrian;
 import com.rinventor.ptm2.objects.entities.vehicle.Transport;
@@ -576,8 +580,13 @@ public final class PtmFixes {
         boolean forced;
         boolean candidate;
         boolean committed;
+        double zoneEntry = Double.NaN;
         int failed;
         long lastLog;
+        long firstBlocked;
+        boolean backing;
+        double backLeft;
+        long holdUntil;
     }
 
     static final Map<Integer, Drv> DRV = new ConcurrentHashMap<>();
@@ -587,7 +596,7 @@ public final class PtmFixes {
     /** Сколько миллисекунд застрявшая без видимой причины машина ждёт, прежде чем ей разрешат ехать. */
     static final long PATIENCE_MS = 8000L;
     /** Долго стоящая попутная машина считается препятствием для объезда. */
-    static final long OBSTACLE_STILL_MS = 25000L;
+    static final long OBSTACLE_STILL_MS = 12000L;
 
     static Drv drv(Vehicle v) {
         return DRV.computeIfAbsent(System.identityHashCode(v), k -> new Drv());
@@ -633,13 +642,19 @@ public final class PtmFixes {
             boolean inside = VDUtils.inZone(v, VDMemoryIDs.INTERSECTION);
             if (!inside) {
                 d.committed = false;
+                d.zoneEntry = Double.NaN;
                 return red;
             }
             if (d.committed) {
                 return false;
             }
-            if (!red && Math.abs(v.speed) >= 1.0F) {
+            if (Double.isNaN(d.zoneEntry)) {
+                d.zoneEntry = v.pathProgress;
+            }
+            // «Прошла стоп-линию» = проехала не менее 1.5 блока внутри зоны перекрёстка при зелёном
+            if (!red && Math.abs(v.speed) >= 1.0F && v.pathProgress - d.zoneEntry >= 1.5D) {
                 d.committed = true;
+                return false;
             }
         } catch (Exception e) {
             PTMLogger.error(e);
@@ -674,9 +689,10 @@ public final class PtmFixes {
 
     /**
      * Обёртка Vehicle.canMove(). orig - решение оригинального ИИ.
-     * Если машина стоит без видимой причины (не красный, не пешеход, не очередь в своей полосе),
-     * после PATIENCE_MS ей разрешается ехать; физический запрет столкновения (clearanceBlockerAhead) остаётся.
-     * При нескольких претендентах едет тот, кто ждёт дольше.
+     * 1) Если машина стоит без видимой причины (не красный, не пешеход, не очередь в своей полосе),
+     *    после PATIENCE_MS ей разрешается ехать; физический запрет столкновения (clearanceBlockerAhead) остаётся.
+     *    При нескольких претендентах едет тот, кто ждёт дольше.
+     * 2) Если проезд разрешён, но машины физически упёрлись друг в друга, та, что ждала меньше, отъезжает назад.
      */
     public static boolean canMove(Vehicle v, boolean orig, Level level) {
         try {
@@ -693,26 +709,57 @@ public final class PtmFixes {
             } else if (d.stillSince == 0L) {
                 d.stillSince = now;
             }
+            if (!v.ai || v.handBrake || v.crashed || v.requiresTracks) {
+                d.blockedSince = 0L;
+                d.firstBlocked = 0L;
+                d.forced = false;
+                d.backing = false;
+                d.candidate = false;
+                return orig;
+            }
+            // Отъезд назад (уступаем более «старому» ожидающему)
+            if (d.backing) {
+                if (d.backLeft <= 0.0D || !still || !spaceBehind(v, level) || !stepBack(v, 0.15D)) {
+                    d.backing = false;
+                    d.holdUntil = now + 6000L;
+                    d.blockedSince = now;
+                    return false;
+                }
+                d.backLeft -= 0.15D;
+                return false;
+            }
+            if (now < d.holdUntil) {
+                return false;
+            }
             if (orig) {
                 d.blockedSince = 0L;
+                d.firstBlocked = 0L;
                 d.forced = false;
                 d.candidate = false;
                 d.failed = 0;
                 return true;
             }
-            if (!v.ai || v.handBrake || v.crashed || v.requiresTracks) {
-                d.blockedSince = 0L;
-                d.forced = false;
-                d.candidate = false;
-                return false;
-            }
             if (d.forced) {
+                // Разрешение действует, только пока нет красного, шлагбаума или пешехода
+                String hr = hardReason(v, level);
+                if (hr != null) {
+                    d.forced = false;
+                    d.candidate = false;
+                    d.blockedSince = now;
+                    return false;
+                }
                 if (still && d.stillSince > 0L && now - d.stillSince > 3000L && now - d.forcedAt > 3000L) {
-                    // Физически не пускают (clearance): отменяем и ждём заново
+                    // Физически не пускают: либо уступаем и отъезжаем, либо повторяем попытку
                     d.forced = false;
                     d.failed++;
-                    d.blockedSince = now;
                     d.candidate = false;
+                    if (shouldYield(v, d, level)) {
+                        d.backing = true;
+                        d.backLeft = 7.0D;
+                        drvLog(d, now, "отъезжает назад, уступая " + (int) PTMEntity.getX(v) + " " + (int) PTMEntity.getZ(v));
+                    } else {
+                        d.blockedSince = now - PATIENCE_MS;
+                    }
                     return false;
                 }
                 return true;
@@ -722,6 +769,9 @@ public final class PtmFixes {
             }
             if (d.blockedSince == 0L) {
                 d.blockedSince = now;
+            }
+            if (d.firstBlocked == 0L) {
+                d.firstBlocked = now;
             }
             long waited = now - d.blockedSince;
             if (waited < PATIENCE_MS) {
@@ -736,6 +786,7 @@ public final class PtmFixes {
             String reason = hardReason(v, level);
             if (reason != null) {
                 d.candidate = false;
+                d.firstBlocked = 0L;
                 return false;
             }
             d.candidate = true;
@@ -763,9 +814,326 @@ public final class PtmFixes {
         }
     }
 
+    // ---------------------------------------------------------------- отъезд назад
+
+    private static boolean reflInit = false;
+    private static boolean reflOk = false;
+    private static java.lang.reflect.Field fSeg;
+    private static java.lang.reflect.Field fOff;
+    private static java.lang.reflect.Method mPts;
+    private static java.lang.reflect.Method mMove;
+    private static java.lang.reflect.Field[] vecF;
+    private static java.lang.reflect.Constructor<?> bpCtor;
+
+    private static void initRefl() {
+        if (reflInit) {
+            return;
+        }
+        reflInit = true;
+        try {
+            Class<?> c = Vehicle.class;
+            fSeg = c.getDeclaredField("pathSegmentIndex");
+            fSeg.setAccessible(true);
+            fOff = c.getDeclaredField("pathSegmentOffset");
+            fOff.setAccessible(true);
+            mPts = c.getDeclaredMethod("getLanePoints", VDTrafficLane.class);
+            mPts.setAccessible(true);
+            mMove = c.getDeclaredMethod("moveAlongPath", double.class, double.class);
+            mMove.setAccessible(true);
+            bpCtor = BlockPos.class.getConstructor(int.class, int.class, int.class);
+            reflOk = true;
+        } catch (Throwable t) {
+            PTMLogger.warn("PTM2 fixes: рефлексия недоступна, отъезд назад и проверка разметки отключены: " + t);
+        }
+    }
+
+    private static double vc(Object vec, int i) throws IllegalAccessException {
+        if (vecF == null) {
+            java.lang.reflect.Field[] f = new java.lang.reflect.Field[3];
+            String[][] names = {{"f_82479_", "x"}, {"f_82480_", "y"}, {"f_82481_", "z"}};
+            for (int k = 0; k < 3; k++) {
+                for (String n : names[k]) {
+                    try {
+                        f[k] = vec.getClass().getField(n);
+                        break;
+                    } catch (NoSuchFieldException ignored) {
+                        // пробуем следующее имя
+                    }
+                }
+                if (f[k] == null) {
+                    throw new IllegalAccessException("Vec3 field " + k);
+                }
+            }
+            vecF = f;
+        }
+        return vecF[i].getDouble(vec);
+    }
+
+    private static double segLen(List<?> pts, int i) throws IllegalAccessException {
+        Object a = pts.get(i);
+        Object b = pts.get(i + 1);
+        double dx = vc(a, 0) - vc(b, 0);
+        double dy = vc(a, 1) - vc(b, 1);
+        double dz = vc(a, 2) - vc(b, 2);
+        return Math.sqrt(dx * dx + dy * dy + dz * dz);
+    }
+
+    /** Сдвигает машину назад по её пути на d блоков. false - дальше назад ехать некуда. */
+    static boolean stepBack(Vehicle v, double d) {
+        initRefl();
+        if (!reflOk) {
+            return false;
+        }
+        try {
+            if (v.currentPath == null || v.currentPath.isEmpty() || v.pathLaneIndex >= v.currentPath.size()) {
+                return false;
+            }
+            if (v.pathProgress < d + 1.0D) {
+                return false;
+            }
+            int lane = v.pathLaneIndex;
+            int seg = fSeg.getInt(v);
+            double off = fOff.getDouble(v);
+            double prog = v.pathProgress;
+            double rem = d;
+            int guard = 0;
+            while (rem > 1.0E-9D && guard++ < 64) {
+                if (off > 1.0E-6D) {
+                    double step = Math.min(rem, off);
+                    off -= step;
+                    rem -= step;
+                    prog -= step;
+                } else if (seg > 0) {
+                    seg--;
+                    List<?> pts = (List<?>) mPts.invoke(v, v.currentPath.get(lane));
+                    off = segLen(pts, seg);
+                } else if (lane > 0) {
+                    lane--;
+                    List<?> pts = (List<?>) mPts.invoke(v, v.currentPath.get(lane));
+                    seg = pts.size() - 2;
+                    if (seg < 0) {
+                        return false;
+                    }
+                    off = segLen(pts, seg);
+                } else {
+                    break;
+                }
+            }
+            if (rem > d * 0.5D) {
+                return false;
+            }
+            v.pathLaneIndex = lane;
+            fSeg.setInt(v, seg);
+            fOff.setDouble(v, off);
+            v.pathProgress = prog;
+            mMove.invoke(v, 0.0D, (double) PTMEntity.getYaw(v));
+            return true;
+        } catch (Throwable t) {
+            PTMLogger.warn("PTM2 fixes: ошибка заднего хода: " + t);
+            return false;
+        }
+    }
+
+    /** Позади свободно (нет машин и людей)? */
+    private static boolean spaceBehind(Vehicle v, Level level) {
+        double yaw = Math.toRadians(PTMEntity.getYaw(v));
+        double fx = -Math.sin(yaw);
+        double fz = Math.cos(yaw);
+        double x = PTMEntity.getX(v);
+        double y = PTMEntity.getY(v);
+        double z = PTMEntity.getZ(v);
+        for (Vehicle o : PTMEntity.getDifferentVehicles(24.0D, v)) {
+            double dx = PTMEntity.getX(o) - x;
+            double dz = PTMEntity.getZ(o) - z;
+            double along = dx * fx + dz * fz;
+            double lat = Math.abs(-dx * fz + dz * fx);
+            if (along < 0.0D && along > -(v.length / 2.0D + o.length / 2.0D + 2.0D)
+                && lat < v.width / 2.0D + o.width / 2.0D + 0.8D) {
+                return false;
+            }
+        }
+        double half = v.length / 2.0D;
+        for (double dist = 1.5D; dist <= 4.5D; dist += 1.5D) {
+            double cx = x - fx * (half + dist);
+            double cz = z - fz * (half + dist);
+            if (PTMEntity.exists(Pedestrian.class, 1.4D, level, cx, y, cz) || PTMEntity.exists(Player.class, 1.4D, level, cx, y, cz)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** Ближайшая спереди машина, с которой мы упёрлись (стоит и сама ждёт). */
+    private static Vehicle blockerAhead(Vehicle v) {
+        double yaw = Math.toRadians(PTMEntity.getYaw(v));
+        double fx = -Math.sin(yaw);
+        double fz = Math.cos(yaw);
+        double x = PTMEntity.getX(v);
+        double z = PTMEntity.getZ(v);
+        Vehicle best = null;
+        double bestAlong = 1.0E9D;
+        for (Vehicle o : PTMEntity.getDifferentVehicles(28.0D, v)) {
+            double dx = PTMEntity.getX(o) - x;
+            double dz = PTMEntity.getZ(o) - z;
+            double along = dx * fx + dz * fz;
+            double lat = Math.abs(-dx * fz + dz * fx);
+            if (along > 0.0D && along < v.length / 2.0D + o.length / 2.0D + 7.0D
+                && lat < v.width / 2.0D + o.width / 2.0D + 2.0D && along < bestAlong) {
+                best = o;
+                bestAlong = along;
+            }
+        }
+        return best;
+    }
+
+    /** Должна ли эта машина уступить (отъехать): блокирует такая же ждущая машина, которая ждёт дольше. */
+    private static boolean shouldYield(Vehicle v, Drv d, Level level) {
+        Vehicle b = blockerAhead(v);
+        if (b == null || Math.abs(b.speed) >= 0.3F || !spaceBehind(v, level)) {
+            return false;
+        }
+        Drv bd = DRV.get(System.identityHashCode(b));
+        if (bd == null || bd.firstBlocked == 0L || d.firstBlocked == 0L) {
+            return false;
+        }
+        if (bd.firstBlocked != d.firstBlocked) {
+            return d.firstBlocked > bd.firstBlocked;
+        }
+        return System.identityHashCode(v) > System.identityHashCode(b);
+    }
+
+    // ---------------------------------------------------------------- перестроение
+
+    /**
+     * Одинарная линия (LINE) считается сплошной, если подряд занимает больше LINE_SOLID_RUN блоков
+     * (на перегоне она «3 через 3», у перекрёстка растягивается в сплошную).
+     */
+    static final int LINE_SOLID_RUN = 5;
+
+    private static boolean forbiddenMarking(RoadMarkingTypes t) {
+        return t == RoadMarkingTypes.DOUBLE_LINE || t == RoadMarkingTypes.PLATFORM_EDGE
+            || t == RoadMarkingTypes.RESTRICTED || t == RoadMarkingTypes.ZIG_ZAG;
+    }
+
+    /** Тип разметки в блоке (проверяем слой пола и соседние по высоте) или null. */
+    private static RoadMarkingTypes markingAt(Level level, int x, int y, int z) throws ReflectiveOperationException {
+        for (int dy = -1; dy <= 1; dy++) {
+            String data = VDStorageHandler.get(level, (BlockPos) bpCtor.newInstance(x, y + dy, z), VDMemoryIDs.ROAD_MARKING);
+            if (data != null && !data.isEmpty()) {
+                VDRoadMarking m = new VDRoadMarking(data);
+                if (m.type != null) {
+                    return m.type;
+                }
+            }
+        }
+        return null;
+    }
+
+    /** Сколько блоков одинарной линии подряд проходит через (x,z) вдоль курса (fx,fz)? */
+    private static int lineRun(Level level, int x, int y, int z, double fx, double fz) throws ReflectiveOperationException {
+        java.util.HashSet<Long> seen = new java.util.HashSet<>();
+        seen.add(((long) x << 32) ^ (z & 0xFFFFFFFFL));
+        for (int dir = -1; dir <= 1; dir += 2) {
+            for (double t = 0.5D; t <= 8.0D; t += 0.5D) {
+                int bx = (int) Math.floor(x + 0.5D + fx * t * dir);
+                int bz = (int) Math.floor(z + 0.5D + fz * t * dir);
+                long key = ((long) bx << 32) ^ (bz & 0xFFFFFFFFL);
+                if (seen.contains(key)) {
+                    continue;
+                }
+                if (markingAt(level, bx, y, bz) == RoadMarkingTypes.LINE) {
+                    seen.add(key);
+                } else {
+                    break;
+                }
+            }
+        }
+        return seen.size();
+    }
+
+    /**
+     * Расширение VehicleUtils.mergeLaneHasObstacle: перестроение запрещено, если на пути стоит
+     * сплошная/двойная и подобная разметка или в соседней полосе (спереди или сзади) есть машина.
+     */
+    public static boolean mergeBlocked(Vehicle v, VDTrafficLane lane, boolean orig, Level level) {
+        if (orig) {
+            return true;
+        }
+        try {
+            if (lane == null || lane.getStart() == null || lane.getEnd() == null) {
+                return orig;
+            }
+            initRefl();
+            if (!reflOk) {
+                return orig;
+            }
+            Object st = lane.getStart();
+            Object en = lane.getEnd();
+            double sx = vc(st, 0);
+            double sy = vc(st, 1);
+            double sz = vc(st, 2);
+            double ex = vc(en, 0);
+            double ez = vc(en, 2);
+            double len = Math.sqrt((ex - sx) * (ex - sx) + (ez - sz) * (ez - sz));
+            if (len < 0.01D) {
+                return orig;
+            }
+            double ux = (ex - sx) / len;
+            double uz = (ez - sz) / len;
+            // 1) разметка на пути перестроения
+            double hyaw = Math.toRadians(PTMEntity.getYaw(v));
+            double hfx = -Math.sin(hyaw);
+            double hfz = Math.cos(hyaw);
+            int by = (int) Math.floor(sy);
+            java.util.HashSet<Long> checked = new java.util.HashSet<>();
+            for (double t = 0.0D; t <= len; t += 0.5D) {
+                int bx = (int) Math.floor(sx + ux * t);
+                int bz = (int) Math.floor(sz + uz * t);
+                if (!checked.add(((long) bx << 32) ^ (bz & 0xFFFFFFFFL))) {
+                    continue;
+                }
+                RoadMarkingTypes mt = markingAt(level, bx, by, bz);
+                if (mt == null) {
+                    continue;
+                }
+                if (forbiddenMarking(mt)) {
+                    return true;
+                }
+                if (mt == RoadMarkingTypes.LINE && lineRun(level, bx, by, bz, hfx, hfz) > LINE_SOLID_RUN) {
+                    return true;
+                }
+            }
+            // 2) машины в целевой полосе: ось полосы проходит через конец траектории перестроения
+            //    параллельно текущему курсу; смотрим 12 блоков назад и 14 вперёд от этой точки
+            double yaw = Math.toRadians(PTMEntity.getYaw(v));
+            double fx = -Math.sin(yaw);
+            double fz = Math.cos(yaw);
+            List<Vehicle> others = PTMEntity.getDifferentVehicles(40.0D, v);
+            for (double t = -12.0D; t <= 14.0D; t += 1.5D) {
+                double px = ex + fx * t;
+                double pz = ez + fz * t;
+                for (Vehicle o : others) {
+                    double oy = Math.toRadians(PTMEntity.getYaw(o));
+                    double ofx = -Math.sin(oy);
+                    double ofz = Math.cos(oy);
+                    double dx = px - PTMEntity.getX(o);
+                    double dz = pz - PTMEntity.getZ(o);
+                    double along = Math.abs(dx * ofx + dz * ofz);
+                    double lat = Math.abs(-dx * ofz + dz * ofx);
+                    if (along < o.length / 2.0D + 1.5D && lat < o.width / 2.0D + v.width / 2.0D) {
+                        return true;
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            PTMLogger.warn("PTM2 fixes: ошибка проверки перестроения: " + t);
+        }
+        return orig;
+    }
+
     /** Причина, по которой машине НЕЛЬЗЯ разрешать ехать (null - можно). */
     private static String hardReason(Vehicle v, Level level) {
-        if (VehicleUtils.forbiddingTrafficLightAhead(v)) {
+        if (trafficRed(v)) {
             return "светофор";
         }
         if (VehicleUtils.loweredEntryBarrierAhead(v) || VehicleUtils.closedRailwayCrossingAhead(v)) {

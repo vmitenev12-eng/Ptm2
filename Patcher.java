@@ -111,7 +111,7 @@ public class Patcher implements Opcodes {
             }
         }
         System.out.println("patched: " + done + ", indefinite-flag reads replaced: " + flagReplacements);
-        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay", "gate-bankcard", "boarding-fare", "gate-exit-radius", "gate-exit-auto", "gate-in-radius", "terminal-cap"};
+        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay", "gate-bankcard", "boarding-fare", "gate-exit-radius", "gate-exit-auto", "gate-in-radius", "terminal-cap", "arrival-reach", "arrival-inside"};
         for (String r : required) {
             if (!done.contains(r)) {
                 System.err.println("ERROR: patch not applied: " + r);
@@ -375,6 +375,48 @@ public class Patcher implements Opcodes {
                 cn.methods.add(w);
                 done.add("terminal-cap");
                 changed = true;
+            }
+        }
+        if (name.equals(TM)) {
+            // Прибытие на остановку: допуск по зоне платформы и по остановке на месте 4+ секунды
+            for (MethodNode m : cn.methods) {
+                if (!m.name.equals("updateVehicleDestination")) {
+                    continue;
+                }
+                AbstractInsnNode[] all = m.instructions.toArray();
+                int inside = 0;
+                for (int i = 0; i < all.length; i++) {
+                    AbstractInsnNode insn = all[i];
+                    if (insn instanceof MethodInsnNode) {
+                        MethodInsnNode mi = (MethodInsnNode) insn;
+                        if (mi.getOpcode() == INVOKEVIRTUAL && mi.name.equals("isInside") && mi.desc.equals("(DD)Z")
+                            && mi.owner.equals("com/rinventor/ptm2/dimension/virtual/types/VDPlatform")) {
+                            m.instructions.set(insn, new MethodInsnNode(INVOKESTATIC, FIXES, "insideTol",
+                                "(Lcom/rinventor/ptm2/dimension/virtual/types/VDPlatform;DD)Z", false));
+                            inside++;
+                        }
+                    }
+                    if (insn instanceof org.objectweb.asm.tree.LdcInsnNode && i + 1 < all.length
+                        && all[i + 1].getOpcode() == GOTO) {
+                        org.objectweb.asm.tree.LdcInsnNode ldc = (org.objectweb.asm.tree.LdcInsnNode) insn;
+                        if (ldc.cst instanceof Double && ((Double) ldc.cst).doubleValue() == 2.0D) {
+                            InsnList repl = new InsnList();
+                            repl.add(new VarInsnNode(ALOAD, 1));
+                            repl.add(new VarInsnNode(ALOAD, 2));
+                            repl.add(new VarInsnNode(DLOAD, 3));
+                            repl.add(new MethodInsnNode(INVOKESTATIC, FIXES, "reachFor",
+                                "(Lcom/rinventor/ptm2/dimension/virtual/types/VDTrackableVehicle;Lcom/rinventor/ptm2/objects/entities/vehicle/Vehicle;D)D", false));
+                            m.instructions.insertBefore(insn, repl);
+                            m.instructions.remove(insn);
+                            done.add("arrival-reach");
+                            changed = true;
+                        }
+                    }
+                }
+                if (inside >= 2) {
+                    done.add("arrival-inside");
+                    changed = true;
+                }
             }
         }
         if (name.equals(ATM)) {

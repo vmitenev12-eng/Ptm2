@@ -134,7 +134,7 @@ public class Patcher implements Opcodes {
         if (mismatch) {
             System.exit(1);
         }
-        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay", "gate-bankcard", "boarding-fare", "gate-exit-radius", "gate-exit-auto", "gate-in-radius", "terminal-cap", "arrival-reach", "arrival-inside", "lamp-cap", "red-commit", "patience", "bypass-still", "merge-check", "player-ahead", "merge-width", "parallel-width", "auto-links", "link-revision", "bus-priority"};
+        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay", "gate-bankcard", "boarding-fare", "gate-exit-radius", "gate-exit-auto", "gate-in-radius", "terminal-cap", "arrival-reach", "arrival-inside", "lamp-cap", "red-commit", "patience", "bypass-still", "merge-check", "player-ahead", "merge-width", "parallel-width", "auto-links", "link-revision", "bus-priority", "validator", "wheel-filter"};
         for (String r : required) {
             if (!done.contains(r)) {
                 System.err.println("ERROR: patch not applied: " + r);
@@ -315,6 +315,64 @@ public class Patcher implements Opcodes {
                 cn.methods.add(w);
                 done.add("boarding-fare");
                 changed = true;
+            }
+        }
+        if (name.equals(VEH)) {
+            // Валидаторы: перехват правого клика по валидатору (кнопка мыши заменяется на -1, если клик обработан)
+            MethodNode origIb = null;
+            for (MethodNode m : cn.methods) {
+                if (m.name.equals("interactionBy") && m.desc.equals("(Lnet/minecraft/world/entity/player/Player;DDDIZZ)V")) {
+                    origIb = m;
+                }
+            }
+            if (origIb != null) {
+                origIb.name = "ptmInteractOrig";
+                MethodNode w = new MethodNode(ACC_PUBLIC, "interactionBy", origIb.desc, null, null);
+                w.instructions.add(new VarInsnNode(ALOAD, 0));
+                w.instructions.add(new VarInsnNode(ALOAD, 1));
+                w.instructions.add(new VarInsnNode(DLOAD, 2));
+                w.instructions.add(new VarInsnNode(DLOAD, 4));
+                w.instructions.add(new VarInsnNode(DLOAD, 6));
+                w.instructions.add(new VarInsnNode(ALOAD, 0));
+                w.instructions.add(new VarInsnNode(ALOAD, 1));
+                w.instructions.add(new VarInsnNode(ILOAD, 8));
+                w.instructions.add(new MethodInsnNode(INVOKESTATIC, FIXES, "validatorClick",
+                    "(L" + VEH + ";Lnet/minecraft/world/entity/player/Player;I)I", false));
+                w.instructions.add(new VarInsnNode(ILOAD, 9));
+                w.instructions.add(new VarInsnNode(ILOAD, 10));
+                w.instructions.add(new MethodInsnNode(INVOKEVIRTUAL, VEH, "ptmInteractOrig", origIb.desc, false));
+                w.instructions.add(new InsnNode(RETURN));
+                w.maxStack = 14;
+                w.maxLocals = 11;
+                cn.methods.add(w);
+                done.add("validator");
+                changed = true;
+            }
+            // Фильтр скачков высоты колёс: контекст машины и замена updateLocation колеса в updateSection
+            for (MethodNode m : cn.methods) {
+                if (!m.name.equals("updateSection")) {
+                    continue;
+                }
+                boolean any = false;
+                for (AbstractInsnNode insn : m.instructions.toArray()) {
+                    if (insn instanceof MethodInsnNode) {
+                        MethodInsnNode mi = (MethodInsnNode) insn;
+                        if (mi.getOpcode() == INVOKEVIRTUAL && mi.owner.equals("com/rinventor/ptm2/engine/vehicle/WheelLocation")
+                            && mi.name.equals("updateLocation") && mi.desc.equals("(Lnet/minecraft/world/level/Level;DDDD)V")) {
+                            m.instructions.set(insn, new MethodInsnNode(INVOKESTATIC, FIXES, "wheelUpdate",
+                                "(Lcom/rinventor/ptm2/engine/vehicle/WheelLocation;Lnet/minecraft/world/level/Level;DDDD)V", false));
+                            any = true;
+                        }
+                    }
+                }
+                if (any) {
+                    InsnList init = new InsnList();
+                    init.add(new VarInsnNode(ALOAD, 0));
+                    init.add(new MethodInsnNode(INVOKESTATIC, FIXES, "setCtx", "(L" + VEH + ";)V", false));
+                    m.instructions.insert(init);
+                    done.add("wheel-filter");
+                    changed = true;
+                }
             }
         }
         if (name.equals(VEH)) {

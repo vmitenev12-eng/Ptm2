@@ -294,6 +294,9 @@ public final class PtmFixes {
     private static final long TRANSFER_WINDOW_MS = 5L * 60L * 1000L;
 
     private static int readLineId(Object transport) {
+        if (transport instanceof Transport) {
+            return ((Transport) transport).getLineID();
+        }
         try {
             java.lang.reflect.Field f = transport.getClass().getDeclaredField("lineID");
             f.setAccessible(true);
@@ -1778,6 +1781,10 @@ public final class PtmFixes {
             double sz = vc(st, 2);
             double ex = vc(en, 0);
             double ez = vc(en, 2);
+            // Не перестраиваемся на полосу, лежащую заметно выше или ниже (эстакада и дорога под ней)
+            if (Math.abs(vc(en, 1) - PTMEntity.getY(v)) > 2.0D) {
+                return true;
+            }
             double len = Math.sqrt((ex - sx) * (ex - sx) + (ez - sz) * (ez - sz));
             if (len < 0.01D) {
                 return orig;
@@ -2003,6 +2010,10 @@ public final class PtmFixes {
                         if (lat < 2.0D || lat > 8.0D) {
                             continue;
                         }
+                        // Не связываем полосы на разной высоте (эстакада и дорога под ней)
+                        if (Math.abs(qy - py) > 1.0D || Math.abs(aey - ay) > 3.0D) {
+                            continue;
+                        }
                         if (inIntersectionAt(level, px, pz) || inIntersectionAt(level, qx, qz)
                             || inIntersectionAt(level, (px + qx) / 2.0D, (pz + qz) / 2.0D)) {
                             continue;
@@ -2111,6 +2122,8 @@ public final class PtmFixes {
     static final Map<Integer, Wst> WST = new ConcurrentHashMap<>();
     /** Допустимое отклонение высоты колеса от привычной (блоков), больше - считаем помехой. */
     static final double WHEEL_JUMP = 0.8D;
+    /** Фильтр выключен: на практике он не помогал, а колёса и без него ведут себя штатно. */
+    static final boolean WHEEL_FILTER = false;
     static long wheelLogAt = 0L;
 
     /**
@@ -2121,6 +2134,9 @@ public final class PtmFixes {
      */
     public static void wheelUpdate(WheelLocation axis, Level level, double x, double y, double z, double yaw) {
         axis.updateLocation(level, x, y, z, yaw);
+        if (!WHEEL_FILTER) {
+            return;
+        }
         try {
             Vehicle v = CTX.get();
             if (v == null || v.currentPath == null || v.currentPath.isEmpty() || v.requiresTracks) {

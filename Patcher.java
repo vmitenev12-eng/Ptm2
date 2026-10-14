@@ -40,6 +40,7 @@ public class Patcher implements Opcodes {
     static final String TM = "com/rinventor/ptm2/dimension/physical/TransportManager";
     static final String VUT = "com/rinventor/ptm2/dimension/physical/VehicleUtils";
     static final String TLU = "com/rinventor/ptm2/dimension/virtual/systems/TrafficLanesUpdater";
+    static final String RPATH = "com/rinventor/ptm2/dimension/virtual/util/RoadPath";
     static final String TBM = "com/rinventor/ptm2/dimension/physical/TickableBlocksManager";
     static final Set<String> refs = new HashSet<>();
     static final Set<String> fixesMethods = new HashSet<>();
@@ -133,7 +134,7 @@ public class Patcher implements Opcodes {
         if (mismatch) {
             System.exit(1);
         }
-        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay", "gate-bankcard", "boarding-fare", "gate-exit-radius", "gate-exit-auto", "gate-in-radius", "terminal-cap", "arrival-reach", "arrival-inside", "lamp-cap", "red-commit", "patience", "bypass-still", "merge-check", "player-ahead", "merge-width", "parallel-width"};
+        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay", "gate-bankcard", "boarding-fare", "gate-exit-radius", "gate-exit-auto", "gate-in-radius", "terminal-cap", "arrival-reach", "arrival-inside", "lamp-cap", "red-commit", "patience", "bypass-still", "merge-check", "player-ahead", "merge-width", "parallel-width", "auto-links", "link-revision", "bus-priority"};
         for (String r : required) {
             if (!done.contains(r)) {
                 System.err.println("ERROR: patch not applied: " + r);
@@ -155,7 +156,7 @@ public class Patcher implements Opcodes {
     }
 
     static byte[] patchClass(String name, byte[] data) {
-        boolean target = name.equals(OPD) || name.equals(ATM) || name.equals(VU) || name.equals(VSH) || name.equals(PTE) || name.equals(TRN) || name.equals(GATE_IN) || name.equals(VEH) || name.equals(GATE_EXIT) || name.equals(TM) || name.equals(TBM) || name.equals(VUT) || name.equals(TLU);
+        boolean target = name.equals(OPD) || name.equals(ATM) || name.equals(VU) || name.equals(VSH) || name.equals(PTE) || name.equals(TRN) || name.equals(GATE_IN) || name.equals(VEH) || name.equals(GATE_EXIT) || name.equals(TM) || name.equals(TBM) || name.equals(VUT) || name.equals(TLU) || name.equals(RPATH);
         boolean flags = contains(data, "INDEFINITE_BANK_ACCOUNT") || contains(data, "INDEFINITE_TRANSPORT_CARD");
         if (!target && !flags) {
             return data;
@@ -353,6 +354,62 @@ public class Patcher implements Opcodes {
                 changed = true;
             }
         }
+        if (name.equals(RPATH)) {
+            // Автосвязки перестроения в графе маршрутов + ревизия графа
+            for (MethodNode m : cn.methods) {
+                if (m.name.equals("createGraphLanes")) {
+                    for (AbstractInsnNode insn : m.instructions.toArray()) {
+                        if (insn instanceof MethodInsnNode && insn.getOpcode() == INVOKEVIRTUAL) {
+                            MethodInsnNode mi = (MethodInsnNode) insn;
+                            if (mi.owner.equals("java/util/concurrent/ConcurrentHashMap") && mi.name.equals("values")) {
+                                AbstractInsnNode prev = insn.getPrevious();
+                                while (prev != null && prev.getOpcode() < 0) {
+                                    prev = prev.getPrevious();
+                                }
+                                AbstractInsnNode prev2 = prev == null ? null : prev.getPrevious();
+                                while (prev2 != null && prev2.getOpcode() < 0) {
+                                    prev2 = prev2.getPrevious();
+                                }
+                                if (prev2 instanceof FieldInsnNode && ((FieldInsnNode) prev2).name.equals("TRAFFIC_LANE")) {
+                                    InsnList repl = new InsnList();
+                                    repl.add(new VarInsnNode(ALOAD, 0));
+                                    repl.add(new FieldInsnNode(GETFIELD, RPATH, "level", "Lnet/minecraft/world/level/Level;"));
+                                    repl.add(new MethodInsnNode(INVOKESTATIC, FIXES, "lanesWithLinks",
+                                        "(Ljava/util/concurrent/ConcurrentHashMap;Lnet/minecraft/world/level/Level;)Ljava/util/Collection;", false));
+                                    m.instructions.insert(insn, repl);
+                                    m.instructions.remove(insn);
+                                    done.add("auto-links");
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            MethodNode origRev = null;
+            for (MethodNode m : cn.methods) {
+                if (m.name.equals("graphRevision") && m.desc.equals("(Z)J")) {
+                    origRev = m;
+                }
+            }
+            if (origRev != null) {
+                origRev.name = "ptmGraphRevOrig";
+                origRev.access = (origRev.access & ~ACC_PRIVATE) & ~ACC_PROTECTED;
+                MethodNode w = new MethodNode(ACC_PRIVATE, "graphRevision", "(Z)J", null, null);
+                w.instructions.add(new VarInsnNode(ALOAD, 0));
+                w.instructions.add(new VarInsnNode(ILOAD, 1));
+                w.instructions.add(new MethodInsnNode(INVOKEVIRTUAL, RPATH, "ptmGraphRevOrig", "(Z)J", false));
+                w.instructions.add(new VarInsnNode(ALOAD, 0));
+                w.instructions.add(new FieldInsnNode(GETFIELD, RPATH, "level", "Lnet/minecraft/world/level/Level;"));
+                w.instructions.add(new MethodInsnNode(INVOKESTATIC, FIXES, "linkRevision", "(JLnet/minecraft/world/level/Level;)J", false));
+                w.instructions.add(new InsnNode(LRETURN));
+                w.maxStack = 5;
+                w.maxLocals = 2;
+                cn.methods.add(w);
+                done.add("link-revision");
+                changed = true;
+            }
+        }
         if (name.equals(TLU)) {
             // Соседние (параллельные) полосы искались на расстоянии 4-7 блоков; у нас полосы шириной 3-5
             for (MethodNode m : cn.methods) {
@@ -410,6 +467,33 @@ public class Patcher implements Opcodes {
                         }
                     }
                 }
+            }
+        }
+        if (name.equals(VUT)) {
+            // Приоритет автобуса, выезжающего с остановки: расширенная проверка
+            MethodNode origGw = null;
+            for (MethodNode m : cn.methods) {
+                if (m.name.equals("giveWayToBus") && m.desc.equals("(L" + VEH + ";)Z")) {
+                    origGw = m;
+                }
+            }
+            if (origGw != null) {
+                origGw.name = "ptmGiveWayOrig";
+                MethodNode w = new MethodNode(ACC_PUBLIC | ACC_STATIC, "giveWayToBus", origGw.desc, null, null);
+                w.instructions.add(new VarInsnNode(ALOAD, 0));
+                w.instructions.add(new VarInsnNode(ALOAD, 0));
+                w.instructions.add(new MethodInsnNode(INVOKESTATIC, VUT, "ptmGiveWayOrig", origGw.desc, false));
+                w.instructions.add(new VarInsnNode(ALOAD, 0));
+                w.instructions.add(new MethodInsnNode(INVOKEVIRTUAL, "net/minecraft/world/entity/Entity", "m_9236_",
+                    "()Lnet/minecraft/world/level/Level;", false));
+                w.instructions.add(new MethodInsnNode(INVOKESTATIC, FIXES, "giveWay",
+                    "(L" + VEH + ";ZLnet/minecraft/world/level/Level;)Z", false));
+                w.instructions.add(new InsnNode(IRETURN));
+                w.maxStack = 4;
+                w.maxLocals = 1;
+                cn.methods.add(w);
+                done.add("bus-priority");
+                changed = true;
             }
         }
         if (name.equals(VUT)) {

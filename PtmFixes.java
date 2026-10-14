@@ -14,7 +14,12 @@ import com.rinventor.ptm2.dimension.virtual.types.VDOperationalData;
 import com.rinventor.ptm2.engine.util.TimeHelper;
 import com.rinventor.ptm2.dimension.physical.TransportModelData;
 import com.rinventor.ptm2.engine.bezier.utility.Pair;
+import com.rinventor.ptm2.PTM;
+import com.rinventor.ptm2.core.data.WorldSavedData;
 import com.rinventor.ptm2.core.properties.RoadMarkingTypes;
+import com.rinventor.ptm2.dimension.virtual.storage.VDStorage;
+import com.rinventor.ptm2.engine.computing.Rotation8;
+import com.rinventor.ptm2.objects.entities.vehicle.bus.Bus;
 import com.rinventor.ptm2.core.properties.TrafficLightColors;
 import com.rinventor.ptm2.dimension.virtual.types.VDIntersection;
 import com.rinventor.ptm2.dimension.virtual.types.VDRoadMarking;
@@ -709,6 +714,14 @@ public final class PtmFixes {
             Drv d = drv(v);
             d.seen = now;
             d.lastOrig = orig;
+            // Запланированное перестроение (автосвязка между полосами): остальные должны уступать
+            if (v.currentPath != null && !v.currentPath.isEmpty() && !v.changingLanes) {
+                var nl = VehicleUtils.nextLanes(v);
+                VDTrafficLane curLane = nl == null ? null : nl.getFirst();
+                if (curLane != null && curLane.merging) {
+                    v.changingLanes = true;
+                }
+            }
             boolean still = Math.abs(v.speed) < 0.3F;
             if (!still) {
                 d.stillSince = 0L;
@@ -839,8 +852,8 @@ public final class PtmFixes {
                 }
                 Drv od = DRV.get(System.identityHashCode(o));
                 if (od != null && od.candidate && od.blockedSince > 0L && now - od.seen < 2000L && !od.forced
-                    && (od.blockedSince < d.blockedSince
-                        || (od.blockedSince == d.blockedSince && System.identityHashCode(o) < System.identityHashCode(v)))) {
+                    && (od.blockedSince - bias(o) < d.blockedSince - bias(v)
+                        || (od.blockedSince - bias(o) == d.blockedSince - bias(v) && System.identityHashCode(o) < System.identityHashCode(v)))) {
                     drvLog(d, now, "ждёт очереди " + (int) PTMEntity.getX(v) + " " + (int) PTMEntity.getZ(v) + " ждёт " + (waited / 1000L) + " с");
                     return false;
                 }
@@ -1326,6 +1339,15 @@ public final class PtmFixes {
         return d.firstBlocked;
     }
 
+    /** Автобус/троллейбус на остановке (выезжает с неё) имеет приоритет при разъезде. */
+    private static long bias(Vehicle x) {
+        try {
+            return x instanceof Transport && VDUtils.inZone(x, VDMemoryIDs.STATION) ? 10000L : 0L;
+        } catch (Exception e) {
+            return 0L;
+        }
+    }
+
     private static boolean crossing(Vehicle a, Vehicle b) {
         return Math.abs(wrap180(PTMEntity.getYaw(a) - PTMEntity.getYaw(b))) > 50.0D;
     }
@@ -1347,7 +1369,9 @@ public final class PtmFixes {
         if (bw == 0L) {
             return false;
         }
-        boolean iLose = myWait > bw || (myWait == bw && System.identityHashCode(v) > System.identityHashCode(b));
+        long me = myWait - bias(v);
+        long he = bw - bias(b);
+        boolean iLose = me > he || (me == he && System.identityHashCode(v) > System.identityHashCode(b));
         boolean canBack = spaceBehind(v, level);
         if (iLose) {
             return canBack;
@@ -1552,5 +1576,215 @@ public final class PtmFixes {
         } catch (Exception e) {
             return false;
         }
+    }
+
+    // ======================================================================
+    //  Автосвязки перестроения между параллельными полосами (вместо ручных меток)
+    // ======================================================================
+
+    static final boolean AUTO_LINKS = true;
+    /** Длина вдоль дороги, на которой машина переходит в соседнюю полосу. */
+    static final double LINK_LEN = 12.0D;
+    /** Шаг между связками вдоль полосы. */
+    static final double LINK_STEP = 18.0D;
+
+    private static Object vec3(Object like, double x, double y, double z) throws ReflectiveOperationException {
+        return like.getClass().getConstructor(double.class, double.class, double.class).newInstance(x, y, z);
+    }
+
+    /** Есть ли на отрезке P-Q запрещающая разметка (двойная и т.п., одинарная длиннее LINE_SOLID_RUN блоков). */
+    private static boolean linkBlocked(Level level, double px, double py, double pz, double qx, double qz, double ux, double uz)
+        throws ReflectiveOperationException {
+        double len = Math.sqrt((qx - px) * (qx - px) + (qz - pz) * (qz - pz));
+        int by = (int) Math.floor(py);
+        java.util.HashSet<Long> checked = new java.util.HashSet<>();
+        for (double t = 0.0D; t <= len; t += 0.5D) {
+            int bx = (int) Math.floor(px + (qx - px) * t / len);
+            int bz = (int) Math.floor(pz + (qz - pz) * t / len);
+            if (!checked.add(((long) bx << 32) ^ (bz & 0xFFFFFFFFL))) {
+                continue;
+            }
+            RoadMarkingTypes mt = markingAt(level, bx, by, bz);
+            if (mt == null) {
+                continue;
+            }
+            if (forbiddenMarking(mt)) {
+                return true;
+            }
+            if (mt == RoadMarkingTypes.LINE && lineRun(level, bx, by, bz, ux, uz) > LINE_SOLID_RUN) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Подмена списка дорожек для графа маршрутов (RoadPath.createGraphLanes):
+     * к настоящим полосам добавляются «перестроения» между соседними параллельными полосами одного потока.
+     * Маршрут (автобуса, машины) сам выбирает перестроение, когда оно нужно, например перед поворотом.
+     * Не создаются связки внутри перекрёстков и через запрещающую разметку.
+     */
+    public static java.util.Collection<String> lanesWithLinks(java.util.concurrent.ConcurrentHashMap<?, ?> map, Level level) {
+        List<String> out = new java.util.ArrayList<>();
+        for (Object o : map.values()) {
+            out.add((String) o);
+        }
+        if (!AUTO_LINKS) {
+            return out;
+        }
+        try {
+            initRefl();
+            if (!reflOk) {
+                return out;
+            }
+            Map<VDTrafficLane, List<VDTrafficLane>> par = ((VDStorage) PTM.VD_STORAGE.get(level)).PARALLEL_TRAFFIC_LANES;
+            if (par == null || par.isEmpty()) {
+                return out;
+            }
+            int made = 0;
+            for (Map.Entry<VDTrafficLane, List<VDTrafficLane>> e : new java.util.ArrayList<>(par.entrySet())) {
+                VDTrafficLane a = e.getKey();
+                if (a == null || e.getValue() == null || a.merging || a.isCurve() || a.invalid()) {
+                    continue;
+                }
+                double ax = vc(a.getStart(), 0);
+                double ay = vc(a.getStart(), 1);
+                double az = vc(a.getStart(), 2);
+                double aex = vc(a.getEnd(), 0);
+                double aey = vc(a.getEnd(), 1);
+                double aez = vc(a.getEnd(), 2);
+                double la = Math.sqrt((aex - ax) * (aex - ax) + (aez - az) * (aez - az));
+                if (la < LINK_LEN + 6.0D) {
+                    continue;
+                }
+                double ux = (aex - ax) / la;
+                double uz = (aez - az) / la;
+                for (VDTrafficLane b : new java.util.ArrayList<>(e.getValue())) {
+                    if (b == null || b.merging || b.isCurve() || b.invalid() || b.transport != a.transport) {
+                        continue;
+                    }
+                    double bsx = vc(b.getStart(), 0);
+                    double bsy = vc(b.getStart(), 1);
+                    double bsz = vc(b.getStart(), 2);
+                    double bex = vc(b.getEnd(), 0);
+                    double bey = vc(b.getEnd(), 1);
+                    double bez = vc(b.getEnd(), 2);
+                    double bdx = bex - bsx;
+                    double bdz = bez - bsz;
+                    double lb2 = bdx * bdx + bdz * bdz;
+                    double lb = Math.sqrt(lb2);
+                    if (lb2 < 1.0E-6D) {
+                        continue;
+                    }
+                    for (double sPos = 4.0D; sPos + LINK_LEN <= la - 1.0D && made < 8000; sPos += LINK_STEP) {
+                        double px = ax + ux * sPos;
+                        double pz = az + uz * sPos;
+                        double py = ay + (aey - ay) * sPos / la;
+                        double rx = ax + ux * (sPos + LINK_LEN);
+                        double rz = az + uz * (sPos + LINK_LEN);
+                        double t = ((rx - bsx) * bdx + (rz - bsz) * bdz) / lb2;
+                        if (t * lb < 3.0D || (1.0D - t) * lb < 3.0D) {
+                            continue;
+                        }
+                        double qx = bsx + bdx * t;
+                        double qz = bsz + bdz * t;
+                        double qy = bsy + (bey - bsy) * t;
+                        double lat = Math.sqrt((qx - rx) * (qx - rx) + (qz - rz) * (qz - rz));
+                        if (lat < 2.0D || lat > 8.0D) {
+                            continue;
+                        }
+                        if (inIntersectionAt(level, px, pz) || inIntersectionAt(level, qx, qz)
+                            || inIntersectionAt(level, (px + qx) / 2.0D, (pz + qz) / 2.0D)) {
+                            continue;
+                        }
+                        if (linkBlocked(level, px, py, pz, qx, qz, ux, uz)) {
+                            continue;
+                        }
+                        VDTrafficLane link = new VDTrafficLane(a.toString());
+                        link.start = (net.minecraft.world.phys.Vec3) vec3(a.getStart(), px, py, pz);
+                        link.end = (net.minecraft.world.phys.Vec3) vec3(a.getStart(), qx, qy, qz);
+                        link.elements = new java.util.ArrayList<>();
+                        link.merging = true;
+                        link.rot8 = a.rot8;
+                        link.rotation = (float) link.getRotation();
+                        out.add(link.toString());
+                        made++;
+                    }
+                }
+            }
+            if (made > 0) {
+                PTMLogger.info("PTM2 ИИ: добавлено автосвязок перестроения для маршрутов: " + made);
+            }
+        } catch (Throwable t) {
+            PTMLogger.warn("PTM2 fixes: ошибка построения автосвязок: " + t);
+        }
+        return out;
+    }
+
+    /** Ревизия графа маршрутов должна меняться, когда пересчитались параллельные полосы. */
+    public static long linkRevision(long orig, Level level) {
+        try {
+            Map<VDTrafficLane, List<VDTrafficLane>> par = ((VDStorage) PTM.VD_STORAGE.get(level)).PARALLEL_TRAFFIC_LANES;
+            return orig * 31L + (par == null ? 0 : par.size());
+        } catch (Throwable t) {
+            return orig;
+        }
+    }
+
+    // ======================================================================
+    //  Приоритет автобуса/троллейбуса, выезжающего с остановки
+    // ======================================================================
+
+    /**
+     * Расширение VehicleUtils.giveWayToBus: уступаем не только автобусу с включённым поворотником,
+     * но и любому автобусу/троллейбусу, который трогается или медленно едет по зоне остановки справа впереди.
+     */
+    public static boolean giveWay(Vehicle v, boolean orig, Level level) {
+        if (orig) {
+            return true;
+        }
+        try {
+            if (v instanceof Transport || PTMWorld.isClient(v)) {
+                return false;
+            }
+            double check = Math.max(14.0D, v.speed + 14.0D);
+            double yaw = Math.toRadians(PTMEntity.getYaw(v));
+            double fx = -Math.sin(yaw);
+            double fz = Math.cos(yaw);
+            double rx = -fz;
+            double rz = fx;
+            boolean leftTraffic = ((WorldSavedData) PTM.DATA.get(level)).LEFT_TRAFFIC;
+            double x = PTMEntity.getX(v);
+            double z = PTMEntity.getZ(v);
+            for (Vehicle bus : PTMEntity.getDifferentVehicles(2.0D * (check + 4.0D), v)) {
+                boolean busType = bus instanceof Bus || bus.vehicleType == VehicleTypes.BUS || bus.vehicleType == VehicleTypes.TROLLEYBUS;
+                if (!busType || !VDUtils.inZone(bus, VDMemoryIDs.STATION)) {
+                    continue;
+                }
+                boolean signaling = bus.getIndicators() == (leftTraffic ? 1 : -1);
+                boolean pulling = !bus.handBrake && bus.speed >= 0.3F && bus.speed < 6.0F;
+                if (!signaling && !pulling) {
+                    continue;
+                }
+                double dx = PTMEntity.getX(bus) - x;
+                double dz = PTMEntity.getZ(bus) - z;
+                double fwd = dx * fx + dz * fz;
+                double side = dx * rx + dz * rz;
+                if (leftTraffic) {
+                    side = -side;
+                }
+                if (fwd < -2.0D || fwd > check || side < -1.0D || side > 8.0D) {
+                    continue;
+                }
+                int diff = Rotation8.difference(Rotation8.get(PTMEntity.getYaw(v)), Rotation8.get(PTMEntity.getYaw(bus)));
+                if (diff <= 2) {
+                    v.allowingLaneChanger = true;
+                    return true;
+                }
+            }
+        } catch (Exception e) {
+            PTMLogger.error(e);
+        }
+        return false;
     }
 }

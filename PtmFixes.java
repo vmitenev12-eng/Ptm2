@@ -375,6 +375,49 @@ public final class PtmFixes {
     //  Валидаторы и «зайцы»
     // ======================================================================
 
+    /**
+     * Берёт игрока на контроль оплаты (если линия платная и проезд ещё не оплачен). Возвращает true, если игрок
+     * числится неоплатившим. Используется и при посадке на место, и когда игрок зашёл в салон пешком.
+     */
+    static boolean registerFare(Vehicle main, Player player, Level level, boolean notify) {
+        VDTransportLine line = lineOf(main, level);
+        if (line == null || line.free) {
+            return false;
+        }
+        String name = PTMEntity.getName(player);
+        String key = name + "@" + System.identityHashCode(main);
+        long now = System.currentTimeMillis();
+        Long last = PAID.get(key);
+        if (last != null && now - last < TRANSFER_WINDOW_MS) {
+            PENDING.remove(name);
+            return false;
+        }
+        String companyName = companyOf(line, level);
+        if (companyName == null) {
+            return false;
+        }
+        Pending existing = PENDING.get(name);
+        if (existing != null && existing.busKey == System.identityHashCode(main)) {
+            return true;
+        }
+        Pending p = new Pending();
+        p.busKey = System.identityHashCode(main);
+        p.x = PTMEntity.getX(player);
+        p.y = PTMEntity.getY(player);
+        p.z = PTMEntity.getZ(player);
+        p.yaw = (float) PTMEntity.getYaw(player);
+        p.price = ((WorldSavedData) PTM.DATA.get(level)).PRC_TICKET;
+        p.company = companyName;
+        p.since = now;
+        PENDING.put(name, p);
+        PTMLogger.info("PTM2 \u043e\u043f\u043b\u0430\u0442\u0430: " + name + " \u0431\u0435\u0437 \u043e\u043f\u043b\u0430\u0442\u044b \u0432 \u0430\u0432\u0442\u043e\u0431\u0443\u0441\u0435");
+        if (notify) {
+            PTMChat.msgNearest("\u041e\u043f\u043b\u0430\u0442\u0438\u0442\u0435 \u043f\u0440\u043e\u0435\u0437\u0434 \u0432\u0430\u043b\u0438\u0434\u0430\u0442\u043e\u0440\u043e\u043c: \u0431\u0438\u043b\u0435\u0442, \u043a\u0430\u0440\u0442\u0430 \u0438\u043b\u0438 \u0442\u0435\u043b\u0435\u0444\u043e\u043d. \u041f\u0435\u0440\u0435\u0434 \u043e\u0442\u043f\u0440\u0430\u0432\u043b\u0435\u043d\u0438\u0435\u043c \u0441\u043f\u0438\u0448\u0435\u0442\u0441\u044f \u0430\u0432\u0442\u043e\u043c\u0430\u0442\u0438\u0447\u0435\u0441\u043a\u0438", "yellow", level,
+                p.x, p.y, p.z);
+        }
+        return true;
+    }
+
     /** true: списывать сразу при посадке на место; false: оплата валидатором, автоматически перед отправлением. */
     static final boolean AUTO_PAY_AT_SEAT = false;
     /** Скорость автобуса, с которой считаем, что он отправился. */
@@ -631,15 +674,19 @@ public final class PtmFixes {
                     PENDING.remove(e.getKey());
                     continue;
                 }
-                Vehicle sec = null;
-                for (int i = 0; i < v.totalSections; i++) {
-                    Vehicle cand = v.getSection(i);
-                    if (cand != null && VehicleUtils.isPlayerInVehiclesRotatedAABB(player, cand)) {
-                        sec = cand;
-                        break;
+                Vehicle sec = sectionOfPlayer(v, player);
+                boolean riding = sec != null;
+                if (sec == null) {
+                    for (int i = 0; i < v.totalSections; i++) {
+                        Vehicle cand = v.getSection(i);
+                        if (cand != null && VehicleUtils.isPlayerInVehiclesRotatedAABB(player, cand)) {
+                            sec = cand;
+                            break;
+                        }
                     }
                 }
                 if (sec == null) {
+                    PTMLogger.info("PTM2 \u043e\u043f\u043b\u0430\u0442\u0430: " + e.getKey() + " \u0443\u0436\u0435 \u043d\u0435 \u0432 \u0430\u0432\u0442\u043e\u0431\u0443\u0441\u0435, \u043a\u043e\u043d\u0442\u0440\u043e\u043b\u044c \u0441\u043d\u044f\u0442");
                     PENDING.remove(e.getKey());
                     continue;
                 }
@@ -649,7 +696,8 @@ public final class PtmFixes {
                     continue;
                 }
                 PENDING.remove(e.getKey());
-                eject(player, sec, p, level);
+                PTMLogger.info("PTM2 \u043e\u043f\u043b\u0430\u0442\u0430: " + e.getKey() + " \u043d\u0435 \u043e\u043f\u043b\u0430\u0442\u0438\u043b, \u0432\u044b\u0441\u0430\u0436\u0438\u0432\u0430\u0435\u043c");
+                eject(player, sec, p, level, riding);
             } catch (Throwable t) {
                 PENDING.remove(e.getKey());
                 PTMLogger.warn("PTM2 fixes: ошибка высадки безбилетника: " + t);
@@ -657,10 +705,30 @@ public final class PtmFixes {
         }
     }
 
+    /** Секция автобуса, в которой игрок сидит (по getVehicle), или null. */
+    private static Vehicle sectionOfPlayer(Vehicle root, Player player) {
+        try {
+            Object ve = srg(player, "m_20202_");
+            if (ve instanceof Vehicle) {
+                Vehicle sv = (Vehicle) ve;
+                Vehicle m = sv.getMainVehicle(sv);
+                if ((m == null ? sv : m) == root) {
+                    return sv;
+                }
+            }
+        } catch (Throwable t) {
+            // нет - попробуем по габаритам
+        }
+        return null;
+    }
+
     /** Высадить игрока из автобуса и вернуть на остановку, где он сел. */
-    private static void eject(Player player, Vehicle sec, Pending p, Level level) throws ReflectiveOperationException {
-        int seatIdx = sec.passengerSeatIndex(player);
-        srg(player, "m_8127_");
+    private static void eject(Player player, Vehicle sec, Pending p, Level level, boolean riding) throws ReflectiveOperationException {
+        EXEMPT.put(PTMEntity.getName(player), System.currentTimeMillis() + 4000L);
+        int seatIdx = riding ? sec.passengerSeatIndex(player) : -1;
+        if (riding) {
+            srg(player, "m_8127_");
+        }
         if (seatIdx >= 0 && seatIdx < sec.getSeats().size()) {
             sec.getSeats().get(seatIdx).setOccupied(false);
             sec.removePassengerFromMap(player);
@@ -2172,6 +2240,165 @@ public final class PtmFixes {
             }
         } catch (Throwable t) {
             // не ломаем отрисовку
+        }
+    }
+
+    // ======================================================================
+    //  Корпус автобуса: войти и выйти можно только на остановке с открытыми дверями
+    // ======================================================================
+
+    /** Включить ли «стены» автобуса. */
+    static final boolean HULL_ENABLED = true;
+
+    /** Игроки, которых только что высадили намеренно: имя -> до какого времени не трогаем. */
+    static final ConcurrentHashMap<String, Long> EXEMPT = new ConcurrentHashMap<>();
+
+    static final class Rec {
+        boolean inside;
+        int sec;
+        double lx;
+        double lz;
+        double dy;
+        double wx;
+        double wy;
+        double wz;
+        long msgAt;
+    }
+
+    static final Map<String, Rec> RECS = new ConcurrentHashMap<>();
+
+    private static boolean doorsOpenAndStopped(Vehicle root) {
+        boolean doors = root.doorButtonsEnabled ? root.doorsAllowed : root.doorsOpen;
+        return doors && Math.abs(root.speed) < 0.5F;
+    }
+
+    private static void teleportPlayer(Player player, double x, double y, double z) throws ReflectiveOperationException {
+        Object conn = player.getClass().getField("f_8906_").get(player);
+        conn.getClass().getMethod("m_9780_", double.class, double.class, double.class, float.class, float.class, java.util.Set.class)
+            .invoke(conn, x, y, z, (float) PTMEntity.getYaw(player), ((Number) srg(player, "m_146909_")).floatValue(), java.util.Collections.emptySet());
+    }
+
+    /**
+     * Вызывается каждый тик у главной секции транспорта. Игрок не может пересечь корпус, пока двери закрыты
+     * или транспорт едет: его возвращают туда, где он был. Игроки, зашедшие пешком при открытых дверях,
+     * берутся на контроль оплаты.
+     */
+    public static void vehicleTick(Vehicle v) {
+        if (!HULL_ENABLED) {
+            return;
+        }
+        try {
+            if (!(v instanceof Transport) || v.sectionID != 0 || PTMWorld.isClient(v)) {
+                return;
+            }
+            Level level = (Level) srg(v, "m_9236_");
+            List<Player> players = PTMWorld.getPlayers(level);
+            if (players == null || players.isEmpty()) {
+                return;
+            }
+            long now = System.currentTimeMillis();
+            boolean allowed = doorsOpenAndStopped(v);
+            double vx = PTMEntity.getX(v);
+            double vz = PTMEntity.getZ(v);
+            double reach = (v.length * Math.max(1, v.totalSections)) / 2.0D + 12.0D;
+            int busKey = System.identityHashCode(v);
+            for (Player p : players) {
+                String name = PTMEntity.getName(p);
+                String rk = name + "#" + busKey;
+                double dx = PTMEntity.getX(p) - vx;
+                double dz = PTMEntity.getZ(p) - vz;
+                if (dx * dx + dz * dz > reach * reach) {
+                    RECS.remove(rk);
+                    continue;
+                }
+                // Зритель или игрок, едущий на другом транспорте, корпус не трогает
+                try {
+                    if ((Boolean) srg(p, "m_5833_")) {
+                        continue;
+                    }
+                    if (srg(p, "m_20202_") != null && sectionOfPlayer(v, p) == null) {
+                        continue;
+                    }
+                } catch (Throwable t) {
+                    // не критично
+                }
+                Long ex = EXEMPT.get(name);
+                if (ex != null) {
+                    if (now < ex) {
+                        RECS.remove(rk);
+                        continue;
+                    }
+                    EXEMPT.remove(name);
+                }
+                int insideIdx = -1;
+                Vehicle insideSec = null;
+                for (int i = 0; i < v.totalSections; i++) {
+                    Vehicle sec = v.getSection(i);
+                    if (sec != null && VehicleUtils.isPlayerInVehiclesRotatedAABB(p, sec)) {
+                        insideIdx = i;
+                        insideSec = sec;
+                        break;
+                    }
+                }
+                boolean now0 = insideSec != null;
+                Rec r = RECS.get(rk);
+                if (r == null) {
+                    r = new Rec();
+                    r.inside = now0;
+                    RECS.put(rk, r);
+                    track(r, p, insideSec, insideIdx);
+                    if (now0) {
+                        registerFare(v, p, level, false);
+                    }
+                    continue;
+                }
+                if (r.inside == now0) {
+                    track(r, p, insideSec, insideIdx);
+                    continue;
+                }
+                if (allowed) {
+                    r.inside = now0;
+                    track(r, p, insideSec, insideIdx);
+                    if (now0) {
+                        registerFare(v, p, level, true);
+                    }
+                    continue;
+                }
+                // Пересечение корпуса при закрытых дверях или на ходу: возвращаем на прежнее место
+                if (r.inside) {
+                    Vehicle sec = v.getSection(r.sec);
+                    if (sec != null) {
+                        double rot = Math.toRadians(PTMEntity.getYaw(sec));
+                        double wx = PTMEntity.getX(sec) + r.lx * Math.cos(rot) - r.lz * Math.sin(rot);
+                        double wz = PTMEntity.getZ(sec) + r.lx * Math.sin(rot) + r.lz * Math.cos(rot);
+                        teleportPlayer(p, wx, PTMEntity.getY(sec) + r.dy, wz);
+                    }
+                } else {
+                    teleportPlayer(p, r.wx, r.wy, r.wz);
+                }
+                if (now - r.msgAt > 2500L) {
+                    r.msgAt = now;
+                    PTMChat.msgNearest("\u0414\u0432\u0435\u0440\u0438 \u0437\u0430\u043a\u0440\u044b\u0442\u044b", "red", level, PTMEntity.getX(p), PTMEntity.getY(p), PTMEntity.getZ(p));
+                }
+            }
+        } catch (Throwable t) {
+            // не ломаем тик транспорта
+        }
+    }
+
+    private static void track(Rec r, Player p, Vehicle sec, int idx) {
+        if (sec != null) {
+            double dx = PTMEntity.getX(p) - PTMEntity.getX(sec);
+            double dz = PTMEntity.getZ(p) - PTMEntity.getZ(sec);
+            double rot = Math.toRadians(PTMEntity.getYaw(sec));
+            r.sec = idx;
+            r.lx = dx * Math.cos(rot) + dz * Math.sin(rot);
+            r.lz = -dx * Math.sin(rot) + dz * Math.cos(rot);
+            r.dy = PTMEntity.getY(p) - PTMEntity.getY(sec);
+        } else {
+            r.wx = PTMEntity.getX(p);
+            r.wy = PTMEntity.getY(p);
+            r.wz = PTMEntity.getZ(p);
         }
     }
 }

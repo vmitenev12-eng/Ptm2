@@ -134,7 +134,7 @@ public class Patcher implements Opcodes {
         if (mismatch) {
             System.exit(1);
         }
-        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay", "gate-bankcard", "boarding-fare", "gate-exit-radius", "gate-exit-auto", "gate-in-radius", "terminal-cap", "arrival-reach", "arrival-inside", "lamp-cap", "red-commit", "patience", "bypass-still", "merge-check", "player-ahead", "merge-width", "parallel-width", "auto-links", "link-revision", "bus-priority", "validator", "wheel-filter"};
+        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay", "gate-bankcard", "boarding-fare", "gate-exit-radius", "gate-exit-auto", "gate-in-radius", "terminal-cap", "arrival-reach", "arrival-inside", "lamp-cap", "red-commit", "patience", "bypass-still", "merge-check", "player-ahead", "merge-width", "parallel-width", "auto-links", "link-revision", "bus-priority", "validator", "wheel-filter", "hull"};
         for (String r : required) {
             if (!done.contains(r)) {
                 System.err.println("ERROR: patch not applied: " + r);
@@ -318,6 +318,17 @@ public class Patcher implements Opcodes {
             }
         }
         if (name.equals(VEH)) {
+            // Корпус автобуса и контроль оплаты: вызов в начале тика Vehicle
+            for (MethodNode m : cn.methods) {
+                if (m.name.equals("m_8119_") && m.desc.equals("()V")) {
+                    InsnList tickInit = new InsnList();
+                    tickInit.add(new VarInsnNode(ALOAD, 0));
+                    tickInit.add(new MethodInsnNode(INVOKESTATIC, FIXES, "vehicleTick", "(L" + VEH + ";)V", false));
+                    m.instructions.insert(tickInit);
+                    done.add("hull");
+                    changed = true;
+                }
+            }
             // Валидаторы: перехват правого клика по валидатору (кнопка мыши заменяется на -1, если клик обработан)
             MethodNode origIb = null;
             for (MethodNode m : cn.methods) {

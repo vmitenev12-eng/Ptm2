@@ -333,6 +333,12 @@ public final class PtmFixes {
                 return true;
             }
             Player player = (Player) entity;
+            // Сесть можно только на остановке с открытыми дверями
+            if (HULL_ENABLED && !doorsOpenAndStopped(main)) {
+                PTMChat.msgNearest("\u0414\u0432\u0435\u0440\u0438 \u0437\u0430\u043a\u0440\u044b\u0442\u044b", "red", level,
+                    PTMEntity.getX(player), PTMEntity.getY(player), PTMEntity.getZ(player));
+                return false;
+            }
             String name = PTMEntity.getName(player);
             String key = name + "@" + System.identityHashCode(main);
             long now = System.currentTimeMillis();
@@ -341,9 +347,6 @@ public final class PtmFixes {
                 PENDING.remove(name);
                 return true;
             }
-            double x = PTMEntity.getX(player);
-            double y = PTMEntity.getY(player);
-            double z = PTMEntity.getZ(player);
             String companyName = companyOf(line, level);
             if (companyName == null) {
                 return true;
@@ -353,17 +356,7 @@ public final class PtmFixes {
                 PENDING.remove(name);
                 return true;
             }
-            Pending p = new Pending();
-            p.busKey = System.identityHashCode(main);
-            p.x = x;
-            p.y = y;
-            p.z = z;
-            p.yaw = (float) PTMEntity.getYaw(player);
-            p.price = price;
-            p.company = companyName;
-            p.since = now;
-            PENDING.put(name, p);
-            PTMChat.msgNearest("\u041e\u043f\u043b\u0430\u0442\u0438\u0442\u0435 \u043f\u0440\u043e\u0435\u0437\u0434 \u0432\u0430\u043b\u0438\u0434\u0430\u0442\u043e\u0440\u043e\u043c: \u0431\u0438\u043b\u0435\u0442, \u043a\u0430\u0440\u0442\u0430 \u0438\u043b\u0438 \u0442\u0435\u043b\u0435\u0444\u043e\u043d. \u041f\u0435\u0440\u0435\u0434 \u043e\u0442\u043f\u0440\u0430\u0432\u043b\u0435\u043d\u0438\u0435\u043c \u0441\u043f\u0438\u0448\u0435\u0442\u0441\u044f \u0430\u0432\u0442\u043e\u043c\u0430\u0442\u0438\u0447\u0435\u0441\u043a\u0438", "yellow", level, x, y, z);
+            registerFare(main, player, level, true);
             return true;
         } catch (Throwable t) {
             PTMLogger.error(String.valueOf(t));
@@ -459,7 +452,16 @@ public final class PtmFixes {
 
     /** Вызов метода Minecraft по его runtime-имени (SRG): в PtmFixes прямые вызовы MC-методов недоступны. */
     private static Object srg(Object o, String name, Object... args) throws ReflectiveOperationException {
-        for (java.lang.reflect.Method m : o.getClass().getMethods()) {
+        // На классах мода (Vehicle) getMethods() тянет клиентские типы (GuiGraphics) и на сервере падает,
+        // поэтому ищем метод в ближайшем предке из net.minecraft.
+        Class<?> c = o.getClass();
+        while (c != null && !c.getName().startsWith("net.minecraft.")) {
+            c = c.getSuperclass();
+        }
+        if (c == null) {
+            c = o.getClass();
+        }
+        for (java.lang.reflect.Method m : c.getMethods()) {
             if (m.getName().equals(name) && m.getParameterCount() == args.length) {
                 return m.invoke(o, args);
             }
@@ -1308,8 +1310,8 @@ public final class PtmFixes {
         try {
             Map<Integer, List<?>> cache = new java.util.HashMap<>();
             int lane = v.pathLaneIndex;
-            int seg = fSeg.getInt(v);
-            double off = fOff.getDouble(v);
+            int seg = (int) hSegGet.invoke(v);
+            double off = (double) hOffGet.invoke(v);
             double[][] out = new double[n][];
             double p0x = 0.0D;
             double p0z = 0.0D;
@@ -1325,7 +1327,7 @@ public final class PtmFixes {
                 }
                 List<?> pts = cache.get(lane);
                 if (pts == null) {
-                    pts = (List<?>) mPts.invoke(v, v.currentPath.get(lane));
+                    pts = (List<?>) hPts.invoke(v, v.currentPath.get(lane));
                     cache.put(lane, pts);
                 }
                 if (pts.size() < 2 || seg >= pts.size() - 1) {
@@ -1541,10 +1543,12 @@ public final class PtmFixes {
 
     private static boolean reflInit = false;
     private static boolean reflOk = false;
-    private static java.lang.reflect.Field fSeg;
-    private static java.lang.reflect.Field fOff;
-    private static java.lang.reflect.Method mPts;
-    private static java.lang.reflect.Method mMove;
+    private static java.lang.invoke.MethodHandle hSegGet;
+    private static java.lang.invoke.MethodHandle hSegSet;
+    private static java.lang.invoke.MethodHandle hOffGet;
+    private static java.lang.invoke.MethodHandle hOffSet;
+    private static java.lang.invoke.MethodHandle hPts;
+    private static java.lang.invoke.MethodHandle hMove;
     private static java.lang.reflect.Field[] vecF;
     private static java.lang.reflect.Constructor<?> bpCtor;
 
@@ -1554,15 +1558,17 @@ public final class PtmFixes {
         }
         reflInit = true;
         try {
-            Class<?> c = Vehicle.class;
-            fSeg = c.getDeclaredField("pathSegmentIndex");
-            fSeg.setAccessible(true);
-            fOff = c.getDeclaredField("pathSegmentOffset");
-            fOff.setAccessible(true);
-            mPts = c.getDeclaredMethod("getLanePoints", VDTrafficLane.class);
-            mPts.setAccessible(true);
-            mMove = c.getDeclaredMethod("moveAlongPath", double.class, double.class);
-            mMove.setAccessible(true);
+            // MethodHandles связывают только нужный член; getDeclaredMethod на Vehicle тянет клиентские типы
+            java.lang.invoke.MethodHandles.Lookup lk = java.lang.invoke.MethodHandles.privateLookupIn(Vehicle.class,
+                java.lang.invoke.MethodHandles.lookup());
+            hSegGet = lk.findGetter(Vehicle.class, "pathSegmentIndex", int.class);
+            hSegSet = lk.findSetter(Vehicle.class, "pathSegmentIndex", int.class);
+            hOffGet = lk.findGetter(Vehicle.class, "pathSegmentOffset", double.class);
+            hOffSet = lk.findSetter(Vehicle.class, "pathSegmentOffset", double.class);
+            hPts = lk.findVirtual(Vehicle.class, "getLanePoints",
+                java.lang.invoke.MethodType.methodType(List.class, VDTrafficLane.class));
+            hMove = lk.findVirtual(Vehicle.class, "moveAlongPath",
+                java.lang.invoke.MethodType.methodType(void.class, double.class, double.class));
             bpCtor = BlockPos.class.getConstructor(int.class, int.class, int.class);
             reflOk = true;
         } catch (Throwable t) {
@@ -1615,8 +1621,8 @@ public final class PtmFixes {
                 return false;
             }
             int lane = v.pathLaneIndex;
-            int seg = fSeg.getInt(v);
-            double off = fOff.getDouble(v);
+            int seg = (int) hSegGet.invoke(v);
+            double off = (double) hOffGet.invoke(v);
             double prog = v.pathProgress;
             double rem = d;
             int guard = 0;
@@ -1628,11 +1634,11 @@ public final class PtmFixes {
                     prog -= step;
                 } else if (seg > 0) {
                     seg--;
-                    List<?> pts = (List<?>) mPts.invoke(v, v.currentPath.get(lane));
+                    List<?> pts = (List<?>) hPts.invoke(v, v.currentPath.get(lane));
                     off = segLen(pts, seg);
                 } else if (lane > 0) {
                     lane--;
-                    List<?> pts = (List<?>) mPts.invoke(v, v.currentPath.get(lane));
+                    List<?> pts = (List<?>) hPts.invoke(v, v.currentPath.get(lane));
                     seg = pts.size() - 2;
                     if (seg < 0) {
                         return false;
@@ -1646,10 +1652,10 @@ public final class PtmFixes {
                 return false;
             }
             v.pathLaneIndex = lane;
-            fSeg.setInt(v, seg);
-            fOff.setDouble(v, off);
+            hSegSet.invoke(v, seg);
+            hOffSet.invoke(v, off);
             v.pathProgress = prog;
-            mMove.invoke(v, 0.0D, (double) PTMEntity.getYaw(v));
+            hMove.invoke(v, 0.0D, (double) PTMEntity.getYaw(v));
             return true;
         } catch (Throwable t) {
             PTMLogger.warn("PTM2 fixes: ошибка заднего хода: " + t);

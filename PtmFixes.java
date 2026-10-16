@@ -1,6 +1,12 @@
 package com.rinventor.ptm2.fixes;
 
 import com.rinventor.ptm2.PTM;
+import com.rinventor.ptm2.dimension.virtual.types.VDDepot;
+import com.rinventor.ptm2.dimension.virtual.types.VDPlatform;
+import com.rinventor.ptm2.dimension.virtual.types.VDRoute;
+import com.rinventor.ptm2.dimension.virtual.types.VDTrackableVehicle;
+import com.rinventor.ptm2.engine.bezier.utility.Pair;
+import com.rinventor.ptm2.engine.computing.DirectionalPos;
 import com.rinventor.ptm2.core.init.ModItems;
 import com.rinventor.ptm2.core.init.ModSounds;
 import com.rinventor.ptm2.engine.vehicle.ValidatorLocation;
@@ -726,24 +732,8 @@ public final class PtmFixes {
 
     /** Высадить игрока из автобуса и вернуть на остановку, где он сел. */
     private static void eject(Player player, Vehicle sec, Pending p, Level level, boolean riding) throws ReflectiveOperationException {
-        EXEMPT.put(PTMEntity.getName(player), System.currentTimeMillis() + 4000L);
-        int seatIdx = riding ? sec.passengerSeatIndex(player) : -1;
-        if (riding) {
-            srg(player, "m_8127_");
-        }
-        if (seatIdx >= 0 && seatIdx < sec.getSeats().size()) {
-            sec.getSeats().get(seatIdx).setOccupied(false);
-            sec.removePassengerFromMap(player);
-            try {
-                int id = (Integer) srg(sec, "m_19879_");
-                new VehicleSeatClientboundPacket(id, seatIdx, false).sendToAllClients();
-            } catch (Throwable t) {
-                // метка занятости места на клиентах не критична
-            }
-        }
-        Object conn = player.getClass().getField("f_8906_").get(player);
-        conn.getClass().getMethod("m_9780_", double.class, double.class, double.class, float.class, float.class, java.util.Set.class)
-            .invoke(conn, p.x, p.y, p.z, p.yaw, 0.0F, java.util.Collections.emptySet());
+        Vehicle root = sec.getMainVehicle(sec);
+        ejectToPlatform(player, root == null ? sec : root, sec, riding, level);
         PTMChat.msgNearest("\u0412\u044b \u043d\u0435 \u043e\u043f\u043b\u0430\u0442\u0438\u043b\u0438 \u043f\u0440\u043e\u0435\u0437\u0434, \u0430\u0432\u0442\u043e\u0431\u0443\u0441 \u0443\u0435\u0445\u0430\u043b \u0431\u0435\u0437 \u0432\u0430\u0441", "red", level, p.x, p.y, p.z);
     }
 
@@ -976,6 +966,8 @@ public final class PtmFixes {
         long holdUntil;
         boolean lastOrig;
         long fareCheck;
+        long depotSince;
+        long termCheck;
         long exitCheck;
         boolean exitHold;
         long exitHoldSince;
@@ -1097,6 +1089,10 @@ public final class PtmFixes {
             d.seen = now;
             d.lastOrig = orig;
             fareTick(v, level, now, d);
+            if (v instanceof Transport && v.ai && !v.requiresTracks && inAnyDepot(level, PTMEntity.getX(v), PTMEntity.getZ(v))) {
+                return depotMove(v, d, level, now);
+            }
+            d.depotSince = 0L;
             // Запланированное перестроение (автосвязка между полосами): остальные должны уступать
             if (v.currentPath != null && !v.currentPath.isEmpty() && !v.changingLanes) {
                 var nl = VehicleUtils.nextLanes(v);
@@ -2096,8 +2092,8 @@ public final class PtmFixes {
                             continue;
                         }
                         VDTrafficLane link = new VDTrafficLane(a.toString());
-                        link.start = (net.minecraft.world.phys.Vec3) vec3(a.getStart(), px, py, pz);
-                        link.end = (net.minecraft.world.phys.Vec3) vec3(a.getStart(), qx, qy, qz);
+                        VDTrafficLane.class.getField("start").set(link, vec3(a.getStart(), px, py, pz));
+                        VDTrafficLane.class.getField("end").set(link, vec3(a.getStart(), qx, qy, qz));
                         link.elements = new java.util.ArrayList<>();
                         link.merging = true;
                         link.rot8 = a.rot8;
@@ -2303,6 +2299,7 @@ public final class PtmFixes {
                 return;
             }
             long now = System.currentTimeMillis();
+            terminalUnload(v, level, players, now, drv(v));
             boolean allowed = doorsOpenAndStopped(v);
             double vx = PTMEntity.getX(v);
             double vz = PTMEntity.getZ(v);
@@ -2405,6 +2402,497 @@ public final class PtmFixes {
             r.wx = PTMEntity.getX(p);
             r.wy = PTMEntity.getY(p);
             r.wz = PTMEntity.getZ(p);
+        }
+    }
+
+    // ======================================================================
+    //  Депо: появление и возврат транспорта, режим «призрака» внутри зоны, очередь на выезд
+    // ======================================================================
+
+    static final class Depot {
+        int idx;
+        int id;
+        VDDepot d;
+        int minX;
+        int minZ;
+        int maxX;
+        int maxZ;
+        boolean child;
+        java.util.List<Depot> kids = new java.util.ArrayList<>();
+
+        boolean contains(double x, double z) {
+            int bx = (int) Math.floor(x);
+            int bz = (int) Math.floor(z);
+            return bx >= minX && bx <= maxX && bz >= minZ && bz <= maxZ;
+        }
+    }
+
+    static final class Depots {
+        long t;
+        java.util.List<Depot> list = new java.util.ArrayList<>();
+    }
+
+    static final Map<Integer, Depots> DEPOTS = new ConcurrentHashMap<>();
+
+    /** Депо в порядке возрастания номера: именно в таком порядке их показывает выпадающий список линии. */
+    static java.util.List<Depot> depots(Level level) {
+        long now = System.currentTimeMillis();
+        int key = System.identityHashCode(level);
+        Depots c = DEPOTS.get(key);
+        if (c != null && now - c.t < 3000L) {
+            return c.list;
+        }
+        Depots n = new Depots();
+        n.t = now;
+        java.util.TreeMap<Integer, String> sorted = new java.util.TreeMap<>();
+        for (Map.Entry<Integer, String> e : VDStorageHandler.getAll(level, VDMemoryIDs.DEPOT).entrySet()) {
+            sorted.put(e.getKey(), e.getValue());
+        }
+        Map<Integer, Depot> byId = new java.util.HashMap<>();
+        int i = 0;
+        for (Map.Entry<Integer, String> e : sorted.entrySet()) {
+            Depot dp = new Depot();
+            dp.idx = i++;
+            dp.id = e.getKey();
+            dp.d = new VDDepot(e.getValue());
+            dp.minX = Math.min(dp.d.sbX, dp.d.fbX);
+            dp.maxX = Math.max(dp.d.sbX, dp.d.fbX);
+            dp.minZ = Math.min(dp.d.sbZ, dp.d.fbZ);
+            dp.maxZ = Math.max(dp.d.sbZ, dp.d.fbZ);
+            n.list.add(dp);
+            byId.put(dp.id, dp);
+        }
+        for (Depot m : n.list) {
+            if (m.d.childrenIDs != null) {
+                for (Integer kid : m.d.childrenIDs) {
+                    Depot k = byId.get(kid);
+                    if (k != null) {
+                        k.child = true;
+                        m.kids.add(k);
+                    }
+                }
+            }
+        }
+        DEPOTS.put(key, n);
+        return n.list;
+    }
+
+    static boolean inAnyDepot(Level level, double x, double z) {
+        for (Depot d : depots(level)) {
+            if (d.contains(x, z)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Для выпадающего списка депо в экране линии: стабильный порядок по номеру. */
+    public static java.util.Set<Map.Entry<Integer, String>> sortedEntries(java.util.concurrent.ConcurrentHashMap<Integer, String> map) {
+        java.util.TreeMap<Integer, String> t = new java.util.TreeMap<>();
+        for (Map.Entry<Integer, String> e : map.entrySet()) {
+            t.put(e.getKey(), e.getValue());
+        }
+        return new java.util.LinkedHashSet<>(t.entrySet());
+    }
+
+    static final class Slot {
+        long t;
+        double sx;
+        double sy;
+        double sz;
+        double yaw;
+        double ex;
+        double ey;
+        double ez;
+    }
+
+    static final class LaneRec {
+        double sx;
+        double sy;
+        double sz;
+        double ex;
+        double ey;
+        double ez;
+    }
+
+    static final Map<Integer, Slot> SLOTS = new ConcurrentHashMap<>();
+
+    private static long pkey(double x, double z) {
+        return (Math.round(x * 4.0D) << 32) ^ (Math.round(z * 4.0D) & 0xFFFFFFFFL);
+    }
+
+    /**
+     * Место линии в депо: пара «выезд (дорожка начинается на парковке) и въезд (дорожка заканчивается на парковке)».
+     * Если выбрана дочерняя зона, берётся её пара. Если выбрано главное депо, каждой линии достаётся своя
+     * свободная пара (по порядку номеров линий), пары внутри дочерних зон не трогаем.
+     */
+    static Slot slotFor(Level level, int lineID, VDTransportLine line) {
+        if (line == null || line.depotID < 0) {
+            return null;
+        }
+        long now = System.currentTimeMillis();
+        Slot cached = SLOTS.get(lineID * 1000 + line.depotID);
+        if (cached != null && now - cached.t < 8000L) {
+            return cached.sx == Double.MAX_VALUE ? null : cached;
+        }
+        Slot result = computeSlot(level, lineID, line);
+        Slot store = result;
+        if (store == null) {
+            store = new Slot();
+            store.sx = Double.MAX_VALUE;
+        }
+        store.t = now;
+        SLOTS.put(lineID * 1000 + line.depotID, store);
+        return result;
+    }
+
+    private static Slot computeSlot(Level level, int lineID, VDTransportLine line) {
+        try {
+            initRefl();
+            if (!reflOk) {
+                return null;
+            }
+            java.util.List<Depot> ds = depots(level);
+            if (line.depotID >= ds.size()) {
+                return null;
+            }
+            Depot dep = ds.get(line.depotID);
+            if (dep.d.closed) {
+                return null;
+            }
+            java.util.List<LaneRec> lanes = new java.util.ArrayList<>();
+            java.util.Set<Long> starts = new java.util.HashSet<>();
+            java.util.Set<Long> ends = new java.util.HashSet<>();
+            for (Map.Entry<Integer, String> e : VDStorageHandler.getAll(level, VDMemoryIDs.TRAFFIC_LANE).entrySet()) {
+                VDTrafficLane l = new VDTrafficLane(e.getValue());
+                if (!l.transport || l.getStart() == null || l.getEnd() == null) {
+                    continue;
+                }
+                LaneRec r = new LaneRec();
+                r.sx = vc(l.getStart(), 0);
+                r.sy = vc(l.getStart(), 1);
+                r.sz = vc(l.getStart(), 2);
+                r.ex = vc(l.getEnd(), 0);
+                r.ey = vc(l.getEnd(), 1);
+                r.ez = vc(l.getEnd(), 2);
+                lanes.add(r);
+                starts.add(pkey(r.sx, r.sz));
+                ends.add(pkey(r.ex, r.ez));
+            }
+            java.util.List<LaneRec> exits = new java.util.ArrayList<>();
+            java.util.List<LaneRec> entries = new java.util.ArrayList<>();
+            for (LaneRec r : lanes) {
+                boolean exitInside = dep.contains(r.sx, r.sz) && !ends.contains(pkey(r.sx, r.sz));
+                boolean entryInside = dep.contains(r.ex, r.ez) && !starts.contains(pkey(r.ex, r.ez));
+                if (exitInside && inKids(dep, r.sx, r.sz)) {
+                    exitInside = false;
+                }
+                if (entryInside && inKids(dep, r.ex, r.ez)) {
+                    entryInside = false;
+                }
+                if (exitInside) {
+                    exits.add(r);
+                }
+                if (entryInside) {
+                    entries.add(r);
+                }
+            }
+            if (exits.isEmpty()) {
+                return null;
+            }
+            java.util.Comparator<LaneRec> bySpot = (a, b) -> a.sx != b.sx ? Double.compare(a.sx, b.sx) : Double.compare(a.sz, b.sz);
+            exits.sort(bySpot);
+            // пара: к каждому выезду ближайший свободный въезд
+            java.util.List<LaneRec[]> pairs = new java.util.ArrayList<>();
+            java.util.List<LaneRec> free = new java.util.ArrayList<>(entries);
+            for (LaneRec x : exits) {
+                LaneRec best = null;
+                double bd = 1.0E18D;
+                for (LaneRec en : free) {
+                    double dd = (en.ex - x.sx) * (en.ex - x.sx) + (en.ez - x.sz) * (en.ez - x.sz);
+                    if (dd < bd) {
+                        bd = dd;
+                        best = en;
+                    }
+                }
+                if (best != null) {
+                    free.remove(best);
+                }
+                pairs.add(new LaneRec[] {x, best});
+            }
+            // номер линии среди линий этого депо
+            java.util.TreeSet<Integer> sameDepot = new java.util.TreeSet<>();
+            for (Map.Entry<Integer, String> e : VDStorageHandler.getAll(level, VDMemoryIDs.TRANSPORT_LINE).entrySet()) {
+                if (new VDTransportLine(e.getValue()).depotID == line.depotID) {
+                    sameDepot.add(e.getKey());
+                }
+            }
+            int rank = new java.util.ArrayList<>(sameDepot).indexOf(lineID);
+            if (rank < 0) {
+                rank = 0;
+            }
+            LaneRec[] pair = pairs.get(rank % pairs.size());
+            Slot s = new Slot();
+            s.sx = pair[0].sx;
+            s.sy = pair[0].sy;
+            s.sz = pair[0].sz;
+            s.yaw = Math.toDegrees(Math.atan2(-(pair[0].ex - pair[0].sx), pair[0].ez - pair[0].sz));
+            LaneRec in = pair[1];
+            s.ex = in == null ? s.sx : in.ex;
+            s.ey = in == null ? s.sy : in.ey;
+            s.ez = in == null ? s.sz : in.ez;
+            return s;
+        } catch (Throwable t) {
+            PTMLogger.warn("PTM2 fixes: \u043e\u0448\u0438\u0431\u043a\u0430 \u0432\u044b\u0431\u043e\u0440\u0430 \u043c\u0435\u0441\u0442\u0430 \u0432 \u0434\u0435\u043f\u043e: " + t);
+            return null;
+        }
+    }
+
+    private static boolean inKids(Depot dep, double x, double z) {
+        for (Depot k : dep.kids) {
+            if (k.contains(x, z)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static final ThreadLocal<VDRoute> CTX_ROUTE = new ThreadLocal<>();
+    private static final ThreadLocal<VDTransportLine> CTX_LINE = new ThreadLocal<>();
+
+    public static void noteRoute(VDRoute r) {
+        CTX_ROUTE.set(r);
+    }
+
+    public static void noteLine(VDTransportLine l) {
+        CTX_LINE.set(l);
+    }
+
+    private static void setFinal(Object o, String field, Object value) throws ReflectiveOperationException {
+        java.lang.reflect.Field f = o.getClass().getDeclaredField(field);
+        f.setAccessible(true);
+        if (value instanceof Double) {
+            f.setDouble(o, (Double) value);
+        } else if (value instanceof Float) {
+            f.setFloat(o, (Float) value);
+        }
+    }
+
+    /**
+     * Вызывается сразу после создания точки появления транспорта в центре первой платформы маршрута.
+     * Если у линии выбрано депо, транспорт появляется на выезде своей пары в депо.
+     */
+    public static void spawnAdjust(DirectionalPos dp, Level level) {
+        try {
+            VDRoute route = CTX_ROUTE.get();
+            VDTransportLine line = CTX_LINE.get();
+            if (route == null || line == null) {
+                return;
+            }
+            Slot s = slotFor(level, route.lineID, line);
+            if (s == null) {
+                return;
+            }
+            setFinal(dp, "x", s.sx);
+            setFinal(dp, "y", s.sy);
+            setFinal(dp, "z", s.sz);
+            setFinal(dp, "direction", (float) s.yaw);
+            PTMLogger.info("PTM2 \u0434\u0435\u043f\u043e: \u043b\u0438\u043d\u0438\u044f " + route.lineID + " \u0432\u044b\u0435\u0437\u0436\u0430\u0435\u0442 \u0438\u0437 \u0434\u0435\u043f\u043e \u043d\u0430 " + (int) s.sx + " " + (int) s.sz);
+        } catch (Throwable t) {
+            PTMLogger.warn("PTM2 fixes: \u043e\u0448\u0438\u0431\u043a\u0430 \u0442\u043e\u0447\u043a\u0438 \u0432\u044b\u0435\u0437\u0434\u0430 \u0438\u0437 \u0434\u0435\u043f\u043e: " + t);
+        }
+    }
+
+    /** Замена getDriveAwayDestination: после последнего рейса транспорт едет в своё место в депо. */
+    public static Object driveAway(Level level, VDTrackableVehicle vehicle, Object orig) {
+        try {
+            if (vehicle == null || vehicle.lineID < 0) {
+                return orig;
+            }
+            String raw = VDStorageHandler.get(level, vehicle.lineID, VDMemoryIDs.TRANSPORT_LINE);
+            if (raw == null || raw.isEmpty()) {
+                return orig;
+            }
+            VDTransportLine line = new VDTransportLine(raw);
+            Slot s = slotFor(level, vehicle.lineID, line);
+            if (s == null) {
+                return orig;
+            }
+            PTMLogger.info("PTM2 \u0434\u0435\u043f\u043e: \u043b\u0438\u043d\u0438\u044f " + vehicle.lineID + " \u0435\u0434\u0435\u0442 \u0432 \u0434\u0435\u043f\u043e \u043d\u0430 " + (int) s.ex + " " + (int) s.ez);
+            return vec3(orig, s.ex, 0.0D, s.ez);
+        } catch (Throwable t) {
+            return orig;
+        }
+    }
+
+    /** На последней остановке маршрута все пассажиры выходят и никто не садится. */
+    public static Pair<Integer, Integer> passengers(Level level, int current, int max, int routeID, int platformID, Pair<Integer, Integer> orig) {
+        try {
+            if (routeID != -1 && platformID != -1) {
+                int last = lastStop(level, routeID);
+                if (last == platformID) {
+                    return Pair.<Integer, Integer>of(current, 0);
+                }
+            }
+        } catch (Throwable t) {
+            // не критично
+        }
+        return orig;
+    }
+
+    static int lastStop(Level level, int routeID) {
+        String raw = VDStorageHandler.get(level, routeID, VDMemoryIDs.ROUTE);
+        if (raw == null || raw.isEmpty()) {
+            return -1;
+        }
+        java.util.List<Integer> stops = com.rinventor.ptm2.engine.computing.Converter.toIntList(new VDRoute(raw).stops);
+        return stops.isEmpty() ? -1 : stops.get(stops.size() - 1);
+    }
+
+    /** Внутри депо транспорт не считает другой транспорт препятствием. */
+    public static Vehicle clearance(Vehicle v, double distance, Vehicle orig, Level level) {
+        if (orig != null && v instanceof Transport && inAnyDepot(level, PTMEntity.getX(v), PTMEntity.getZ(v))) {
+            return null;
+        }
+        return orig;
+    }
+
+    /** Внутри депо касания транспорта не считаются аварией. */
+    public static boolean noCrash(Vehicle v, boolean orig, Level level) {
+        if (orig && v instanceof Transport && inAnyDepot(level, PTMEntity.getX(v), PTMEntity.getZ(v))) {
+            return false;
+        }
+        return orig;
+    }
+
+    /**
+     * Движение внутри депо: помехи от других машин не учитываются, но выезжающие выезжают по очереди
+     * (кто раньше появился в депо, тот раньше едет). Въезжающие едут свободно.
+     */
+    private static boolean depotMove(Vehicle v, Drv d, Level level, long now) {
+        if (d.depotSince == 0L) {
+            d.depotSince = now;
+        }
+        if (livingAhead(v, level)) {
+            return false;
+        }
+        boolean leaving = ((Transport) v).getRouteID() != -1;
+        if (leaving) {
+            for (Vehicle o : PTMEntity.getDifferentVehicles(200.0D, v)) {
+                if (!(o instanceof Transport) || ((Transport) o).getRouteID() == -1) {
+                    continue;
+                }
+                Drv od = DRV.get(System.identityHashCode(o));
+                if (od != null && od.depotSince > 0L && now - od.seen < 2000L && od.depotSince < d.depotSince
+                    && now - od.depotSince < 60000L && inAnyDepot(level, PTMEntity.getX(o), PTMEntity.getZ(o))) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    // ======================================================================
+    //  Высадка на ближайшую платформу (безбилетники и конечная остановка)
+    // ======================================================================
+
+    /** Точка на ближайшей платформе (тротуар остановки) относительно точки (x, z): {x, z} или null. */
+    static double[] nearestPlatformSpot(Level level, double x, double z) {
+        double best = 60.0D * 60.0D;
+        double[] res = null;
+        for (Map.Entry<Integer, String> e : VDStorageHandler.getAll(level, VDMemoryIDs.PLATFORM).entrySet()) {
+            VDPlatform p = new VDPlatform(e.getValue());
+            double cx = p.getCenterX() + 0.5D;
+            double cz = p.getCenterZ() + 0.5D;
+            double dd = (cx - x) * (cx - x) + (cz - z) * (cz - z);
+            if (p.isInside(x, z)) {
+                dd = 0.0D;
+            }
+            if (dd < best) {
+                best = dd;
+                res = new double[] {cx, cz};
+            }
+        }
+        return res;
+    }
+
+    /** Убрать игрока из автобуса и поставить на ближайшую платформу. */
+    static void ejectToPlatform(Player player, Vehicle root, Vehicle sec, boolean riding, Level level) throws ReflectiveOperationException {
+        EXEMPT.put(PTMEntity.getName(player), System.currentTimeMillis() + 4000L);
+        int seatIdx = riding ? sec.passengerSeatIndex(player) : -1;
+        if (riding) {
+            srg(player, "m_8127_");
+        }
+        if (seatIdx >= 0 && seatIdx < sec.getSeats().size()) {
+            sec.getSeats().get(seatIdx).setOccupied(false);
+            sec.removePassengerFromMap(player);
+            try {
+                int id = (Integer) srg(sec, "m_19879_");
+                new VehicleSeatClientboundPacket(id, seatIdx, false).sendToAllClients();
+            } catch (Throwable t) {
+                // метка занятости не критична
+            }
+        }
+        double bx = PTMEntity.getX(root);
+        double bz = PTMEntity.getZ(root);
+        double[] spot = nearestPlatformSpot(level, bx, bz);
+        double ty = PTMEntity.getY(root) + 1.0D;
+        double tx = spot != null ? spot[0] : bx;
+        double tz = spot != null ? spot[1] : bz;
+        if (spot == null) {
+            // платформы нет: хотя бы за пределы корпуса, вбок от автобуса
+            double yaw = Math.toRadians(PTMEntity.getYaw(root));
+            tx = bx + Math.cos(yaw) * (root.width / 2.0D + 2.5D);
+            tz = bz + Math.sin(yaw) * (root.width / 2.0D + 2.5D);
+        }
+        teleportPlayer(player, tx, ty, tz);
+    }
+
+    /** На конечной остановке (или при завершённом рейсе) высаживаем всех игроков на платформу. */
+    static void terminalUnload(Vehicle v, Level level, List<Player> players, long now, Drv d) {
+        try {
+            if (now - d.termCheck < 1000L || !v.ai || v.mainUUID == null) {
+                return;
+            }
+            d.termCheck = now;
+            if (!doorsOpenAndStopped(v)) {
+                return;
+            }
+            String raw = VDStorageHandler.get(level, v.mainUUID.toString(), VDMemoryIDs.TRACKABLE_VEHICLE);
+            if (raw == null || raw.isEmpty()) {
+                return;
+            }
+            VDTrackableVehicle tv = new VDTrackableVehicle(raw);
+            boolean terminal;
+            if (tv.routeID == -1) {
+                terminal = true;
+            } else {
+                terminal = tv.nextPlatformID != -1 && tv.nextPlatformID == lastStop(level, tv.routeID);
+            }
+            if (!terminal) {
+                return;
+            }
+            for (Player p : players) {
+                Vehicle sec = sectionOfPlayer(v, p);
+                boolean riding = sec != null;
+                if (sec == null) {
+                    for (int i = 0; i < v.totalSections; i++) {
+                        Vehicle cand = v.getSection(i);
+                        if (cand != null && VehicleUtils.isPlayerInVehiclesRotatedAABB(p, cand)) {
+                            sec = cand;
+                            break;
+                        }
+                    }
+                }
+                if (sec != null) {
+                    PENDING.remove(PTMEntity.getName(p));
+                    ejectToPlatform(p, v, sec, riding, level);
+                    PTMChat.msgNearest("\u041a\u043e\u043d\u0435\u0447\u043d\u0430\u044f \u043e\u0441\u0442\u0430\u043d\u043e\u0432\u043a\u0430, \u0432\u044b\u0445\u043e\u0434\u0438\u0442\u0435", "yellow", level,
+                        PTMEntity.getX(p), PTMEntity.getY(p), PTMEntity.getZ(p));
+                }
+            }
+        } catch (Throwable t) {
+            PTMLogger.warn("PTM2 fixes: \u043e\u0448\u0438\u0431\u043a\u0430 \u0432\u044b\u0441\u0430\u0434\u043a\u0438 \u043d\u0430 \u043a\u043e\u043d\u0435\u0447\u043d\u043e\u0439: " + t);
         }
     }
 }

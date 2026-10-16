@@ -18,6 +18,7 @@ import org.objectweb.asm.tree.InsnList;
 import org.objectweb.asm.tree.InsnNode;
 import org.objectweb.asm.tree.MethodInsnNode;
 import org.objectweb.asm.tree.MethodNode;
+import org.objectweb.asm.tree.TypeInsnNode;
 import org.objectweb.asm.tree.VarInsnNode;
 
 /**
@@ -41,6 +42,7 @@ public class Patcher implements Opcodes {
     static final String VUT = "com/rinventor/ptm2/dimension/physical/VehicleUtils";
     static final String TLU = "com/rinventor/ptm2/dimension/virtual/systems/TrafficLanesUpdater";
     static final String RPATH = "com/rinventor/ptm2/dimension/virtual/util/RoadPath";
+    static final String LES = "com/rinventor/ptm2/dimension/digital/screens/LineEditScreen";
     static final String TBM = "com/rinventor/ptm2/dimension/physical/TickableBlocksManager";
     static final Set<String> refs = new HashSet<>();
     static final Set<String> fixesMethods = new HashSet<>();
@@ -134,7 +136,7 @@ public class Patcher implements Opcodes {
         if (mismatch) {
             System.exit(1);
         }
-        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay", "gate-bankcard", "boarding-fare", "gate-exit-radius", "gate-exit-auto", "gate-in-radius", "terminal-cap", "arrival-reach", "arrival-inside", "lamp-cap", "red-commit", "patience", "bypass-still", "merge-check", "player-ahead", "merge-width", "parallel-width", "auto-links", "link-revision", "bus-priority", "validator", "wheel-filter", "hull"};
+        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay", "gate-bankcard", "boarding-fare", "gate-exit-radius", "gate-exit-auto", "gate-in-radius", "terminal-cap", "arrival-reach", "arrival-inside", "lamp-cap", "red-commit", "patience", "bypass-still", "merge-check", "player-ahead", "merge-width", "parallel-width", "auto-links", "link-revision", "bus-priority", "validator", "wheel-filter", "hull", "depot-ui", "depot-order", "depot-spawn", "depot-return", "terminal-pax", "depot-clear", "depot-crash"};
         for (String r : required) {
             if (!done.contains(r)) {
                 System.err.println("ERROR: patch not applied: " + r);
@@ -156,7 +158,7 @@ public class Patcher implements Opcodes {
     }
 
     static byte[] patchClass(String name, byte[] data) {
-        boolean target = name.equals(OPD) || name.equals(ATM) || name.equals(VU) || name.equals(VSH) || name.equals(PTE) || name.equals(TRN) || name.equals(GATE_IN) || name.equals(VEH) || name.equals(GATE_EXIT) || name.equals(TM) || name.equals(TBM) || name.equals(VUT) || name.equals(TLU) || name.equals(RPATH);
+        boolean target = name.equals(OPD) || name.equals(ATM) || name.equals(VU) || name.equals(VSH) || name.equals(PTE) || name.equals(TRN) || name.equals(GATE_IN) || name.equals(VEH) || name.equals(GATE_EXIT) || name.equals(TM) || name.equals(TBM) || name.equals(VUT) || name.equals(TLU) || name.equals(RPATH) || name.equals(LES);
         boolean flags = contains(data, "INDEFINITE_BANK_ACCOUNT") || contains(data, "INDEFINITE_TRANSPORT_CARD");
         if (!target && !flags) {
             return data;
@@ -420,6 +422,180 @@ public class Patcher implements Opcodes {
                 w.maxLocals = 1;
                 cn.methods.add(w);
                 done.add("patience");
+                changed = true;
+            }
+        }
+        if (name.equals(LES)) {
+            // Экран линии: выбор депо работает (сброс «в разработке» отключён), список депо в стабильном порядке по номеру
+            boolean firstSel = true;
+            for (MethodNode m : cn.methods) {
+                for (AbstractInsnNode insn : m.instructions.toArray()) {
+                    if (!(insn instanceof MethodInsnNode)) {
+                        continue;
+                    }
+                    MethodInsnNode mi = (MethodInsnNode) insn;
+                    if (m.name.equals("m_88315_") && firstSel && mi.getOpcode() == INVOKEVIRTUAL
+                        && mi.owner.equals("com/rinventor/ptm2/engine/component/ComboBox") && mi.name.equals("getSelectedIndex")) {
+                        firstSel = false;
+                        InsnList repl = new InsnList();
+                        repl.add(new InsnNode(POP));
+                        repl.add(new InsnNode(ICONST_M1));
+                        m.instructions.insert(insn, repl);
+                        m.instructions.remove(insn);
+                        done.add("depot-ui");
+                        changed = true;
+                    } else if (mi.getOpcode() == INVOKEVIRTUAL && mi.owner.equals("java/util/concurrent/ConcurrentHashMap")
+                        && mi.name.equals("entrySet")) {
+                        AbstractInsnNode prev = insn.getPrevious();
+                        while (prev != null && prev.getOpcode() < 0) {
+                            prev = prev.getPrevious();
+                        }
+                        AbstractInsnNode prev2 = prev == null ? null : prev.getPrevious();
+                        while (prev2 != null && prev2.getOpcode() < 0) {
+                            prev2 = prev2.getPrevious();
+                        }
+                        if (prev2 instanceof FieldInsnNode && ((FieldInsnNode) prev2).name.equals("DEPOT")) {
+                            m.instructions.set(insn, new MethodInsnNode(INVOKESTATIC, FIXES, "sortedEntries",
+                                "(Ljava/util/concurrent/ConcurrentHashMap;)Ljava/util/Set;", false));
+                            done.add("depot-order");
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        if (name.equals(TM)) {
+            // Депо: точка появления, возврат в депо, пассажиры на конечной остановке
+            for (MethodNode m : cn.methods) {
+                if (m.name.equals("trackRoutesAndSchedules")) {
+                    for (AbstractInsnNode insn : m.instructions.toArray()) {
+                        if (insn instanceof MethodInsnNode) {
+                            MethodInsnNode mi = (MethodInsnNode) insn;
+                            if (mi.getOpcode() == INVOKESTATIC && mi.name.equals("getRoute") && mi.owner.equals(TM)) {
+                                InsnList l = new InsnList();
+                                l.add(new InsnNode(DUP));
+                                l.add(new MethodInsnNode(INVOKESTATIC, FIXES, "noteRoute",
+                                    "(Lcom/rinventor/ptm2/dimension/virtual/types/VDRoute;)V", false));
+                                m.instructions.insert(insn, l);
+                                done.add("depot-ctx");
+                            } else if (mi.getOpcode() == INVOKESTATIC && mi.name.equals("getLine") && mi.owner.equals(TM)) {
+                                InsnList l = new InsnList();
+                                l.add(new InsnNode(DUP));
+                                l.add(new MethodInsnNode(INVOKESTATIC, FIXES, "noteLine",
+                                    "(Lcom/rinventor/ptm2/dimension/virtual/types/VDTransportLine;)V", false));
+                                m.instructions.insert(insn, l);
+                            } else if (mi.getOpcode() == INVOKESPECIAL && mi.owner.equals("com/rinventor/ptm2/engine/computing/DirectionalPos")
+                                && mi.name.equals("<init>") && mi.desc.equals("(DDDF)V")) {
+                                InsnList l = new InsnList();
+                                l.add(new InsnNode(DUP));
+                                l.add(new VarInsnNode(ALOAD, 0));
+                                l.add(new MethodInsnNode(INVOKESTATIC, FIXES, "spawnAdjust",
+                                    "(Lcom/rinventor/ptm2/engine/computing/DirectionalPos;Lnet/minecraft/world/level/Level;)V", false));
+                                m.instructions.insert(insn, l);
+                                done.add("depot-spawn");
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+            MethodNode origDa = null;
+            MethodNode origPc = null;
+            for (MethodNode m : cn.methods) {
+                if (m.name.equals("getDriveAwayDestination")) {
+                    origDa = m;
+                } else if (m.name.equals("passengersChange") && m.desc.startsWith("(Lnet/minecraft/world/level/Level;IIII)")) {
+                    origPc = m;
+                }
+            }
+            if (origDa != null) {
+                String d = origDa.desc;
+                origDa.name = "ptmDriveAwayOrig";
+                MethodNode w = new MethodNode(origDa.access, "getDriveAwayDestination", d, null, null);
+                w.instructions.add(new VarInsnNode(ALOAD, 0));
+                w.instructions.add(new VarInsnNode(ALOAD, 1));
+                w.instructions.add(new VarInsnNode(ALOAD, 0));
+                w.instructions.add(new VarInsnNode(ALOAD, 1));
+                w.instructions.add(new MethodInsnNode(INVOKESTATIC, TM, "ptmDriveAwayOrig", d, false));
+                w.instructions.add(new MethodInsnNode(INVOKESTATIC, FIXES, "driveAway",
+                    "(Lnet/minecraft/world/level/Level;Lcom/rinventor/ptm2/dimension/virtual/types/VDTrackableVehicle;Ljava/lang/Object;)Ljava/lang/Object;", false));
+                w.instructions.add(new TypeInsnNode(CHECKCAST, "net/minecraft/world/phys/Vec3"));
+                w.instructions.add(new InsnNode(ARETURN));
+                w.maxStack = 6;
+                w.maxLocals = 2;
+                cn.methods.add(w);
+                done.add("depot-return");
+                changed = true;
+            }
+            if (origPc != null) {
+                String d = origPc.desc;
+                String ret = d.substring(d.indexOf(')') + 1);
+                origPc.name = "ptmPaxOrig";
+                MethodNode w = new MethodNode(origPc.access, "passengersChange", d, null, null);
+                for (int i = 0; i < 5; i++) {
+                    w.instructions.add(new VarInsnNode(i == 0 ? ALOAD : ILOAD, i));
+                }
+                for (int i = 0; i < 5; i++) {
+                    w.instructions.add(new VarInsnNode(i == 0 ? ALOAD : ILOAD, i));
+                }
+                w.instructions.add(new MethodInsnNode(INVOKESTATIC, TM, "ptmPaxOrig", d, false));
+                w.instructions.add(new MethodInsnNode(INVOKESTATIC, FIXES, "passengers",
+                    "(Lnet/minecraft/world/level/Level;IIII" + ret + ")" + ret, false));
+                w.instructions.add(new InsnNode(ARETURN));
+                w.maxStack = 12;
+                w.maxLocals = 5;
+                cn.methods.add(w);
+                done.add("terminal-pax");
+                changed = true;
+            }
+        }
+        if (name.equals(VUT)) {
+            // Внутри депо транспорт не упирается в другой и не «разбивается» (clearance и аварии)
+            MethodNode origCl = null;
+            MethodNode origCr = null;
+            for (MethodNode m : cn.methods) {
+                if (m.name.equals("clearanceBlockerAhead") && m.desc.equals("(L" + VEH + ";D)L" + VEH + ";")) {
+                    origCl = m;
+                } else if (m.name.equals("crashedIntoAnotherVehicle") && m.desc.equals("(L" + VEH + ";)Z")) {
+                    origCr = m;
+                }
+            }
+            if (origCl != null) {
+                origCl.name = "ptmClearOrig";
+                MethodNode w = new MethodNode(ACC_PUBLIC | ACC_STATIC, "clearanceBlockerAhead", origCl.desc, null, null);
+                w.instructions.add(new VarInsnNode(ALOAD, 0));
+                w.instructions.add(new VarInsnNode(DLOAD, 1));
+                w.instructions.add(new VarInsnNode(ALOAD, 0));
+                w.instructions.add(new VarInsnNode(DLOAD, 1));
+                w.instructions.add(new MethodInsnNode(INVOKESTATIC, VUT, "ptmClearOrig", origCl.desc, false));
+                w.instructions.add(new VarInsnNode(ALOAD, 0));
+                w.instructions.add(new MethodInsnNode(INVOKEVIRTUAL, "net/minecraft/world/entity/Entity", "m_9236_",
+                    "()Lnet/minecraft/world/level/Level;", false));
+                w.instructions.add(new MethodInsnNode(INVOKESTATIC, FIXES, "clearance",
+                    "(L" + VEH + ";DL" + VEH + ";Lnet/minecraft/world/level/Level;)L" + VEH + ";", false));
+                w.instructions.add(new InsnNode(ARETURN));
+                w.maxStack = 8;
+                w.maxLocals = 3;
+                cn.methods.add(w);
+                done.add("depot-clear");
+                changed = true;
+            }
+            if (origCr != null) {
+                origCr.name = "ptmCrashOrig";
+                MethodNode w = new MethodNode(ACC_PUBLIC | ACC_STATIC, "crashedIntoAnotherVehicle", origCr.desc, null, null);
+                w.instructions.add(new VarInsnNode(ALOAD, 0));
+                w.instructions.add(new VarInsnNode(ALOAD, 0));
+                w.instructions.add(new MethodInsnNode(INVOKESTATIC, VUT, "ptmCrashOrig", origCr.desc, false));
+                w.instructions.add(new VarInsnNode(ALOAD, 0));
+                w.instructions.add(new MethodInsnNode(INVOKEVIRTUAL, "net/minecraft/world/entity/Entity", "m_9236_",
+                    "()Lnet/minecraft/world/level/Level;", false));
+                w.instructions.add(new MethodInsnNode(INVOKESTATIC, FIXES, "noCrash",
+                    "(L" + VEH + ";ZLnet/minecraft/world/level/Level;)Z", false));
+                w.instructions.add(new InsnNode(IRETURN));
+                w.maxStack = 5;
+                w.maxLocals = 1;
+                cn.methods.add(w);
+                done.add("depot-crash");
                 changed = true;
             }
         }

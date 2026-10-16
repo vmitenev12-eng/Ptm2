@@ -2846,6 +2846,12 @@ public final class PtmFixes {
             tz = bz + Math.sin(yaw) * (root.width / 2.0D + 2.5D);
         }
         teleportPlayer(player, tx, ty, tz);
+        resyncGravity(player);
+        try {
+            sec.resetFloorRidingPlayers();
+        } catch (Throwable t) {
+            // не критично
+        }
     }
 
     /** На конечной остановке (или при завершённом рейсе) высаживаем всех игроков на платформу. */
@@ -2893,6 +2899,47 @@ public final class PtmFixes {
             }
         } catch (Throwable t) {
             PTMLogger.warn("PTM2 fixes: \u043e\u0448\u0438\u0431\u043a\u0430 \u0432\u044b\u0441\u0430\u0434\u043a\u0438 \u043d\u0430 \u043a\u043e\u043d\u0435\u0447\u043d\u043e\u0439: " + t);
+        }
+    }
+
+    // ======================================================================
+    //  «Полулетающий» игрок: клиент оставляет игроку отключённую гравитацию (флаг ходьбы по полу автобуса)
+    // ======================================================================
+
+    /** Принудительно переслать клиенту «гравитация включена»: true и сразу false в одном тике (пакет уйдёт со значением false). */
+    static void resyncGravity(Player p) {
+        try {
+            srg(p, "m_20242_", Boolean.TRUE);
+            srg(p, "m_20242_", Boolean.FALSE);
+            srg(p, "m_6853_", Boolean.TRUE);
+        } catch (Throwable t) {
+            // не критично
+        }
+    }
+
+    /** Вызывается в начале Vehicle.removeOrGoVirtual: всем игрокам рядом сбрасываем флаг гравитации. */
+    public static void vehicleGone(Vehicle v) {
+        try {
+            if (!(v instanceof Transport) || PTMWorld.isClient(v)) {
+                return;
+            }
+            Level level = (Level) srg(v, "m_9236_");
+            List<Player> players = PTMWorld.getPlayers(level);
+            if (players == null) {
+                return;
+            }
+            double vx = PTMEntity.getX(v);
+            double vz = PTMEntity.getZ(v);
+            double r = Math.max(8.0D, v.length) + 4.0D;
+            for (Player p : players) {
+                double dx = PTMEntity.getX(p) - vx;
+                double dz = PTMEntity.getZ(p) - vz;
+                if (dx * dx + dz * dz < r * r) {
+                    resyncGravity(p);
+                }
+            }
+        } catch (Throwable t) {
+            // не мешаем удалению
         }
     }
 }

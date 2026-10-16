@@ -136,7 +136,7 @@ public class Patcher implements Opcodes {
         if (mismatch) {
             System.exit(1);
         }
-        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay", "gate-bankcard", "boarding-fare", "gate-exit-radius", "gate-exit-auto", "gate-in-radius", "terminal-cap", "arrival-reach", "arrival-inside", "lamp-cap", "red-commit", "patience", "bypass-still", "merge-check", "player-ahead", "merge-width", "parallel-width", "auto-links", "link-revision", "bus-priority", "validator", "wheel-filter", "hull", "depot-ui", "depot-order", "depot-spawn", "depot-return", "terminal-pax", "depot-clear", "depot-crash"};
+        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay", "gate-bankcard", "boarding-fare", "gate-exit-radius", "gate-exit-auto", "gate-in-radius", "terminal-cap", "arrival-reach", "arrival-inside", "lamp-cap", "red-commit", "patience", "bypass-still", "merge-check", "player-ahead", "merge-width", "parallel-width", "auto-links", "link-revision", "bus-priority", "validator", "wheel-filter", "hull", "depot-ui", "depot-order", "depot-spawn", "depot-return", "terminal-pax", "depot-clear", "depot-crash", "gravity-reset"};
         for (String r : required) {
             if (!done.contains(r)) {
                 System.err.println("ERROR: patch not applied: " + r);
@@ -320,6 +320,17 @@ public class Patcher implements Opcodes {
             }
         }
         if (name.equals(VEH)) {
+            // Автобус исчезает: игрокам рядом сбрасываем флаг «ходьба по полу» (иначе гравитация остаётся выключенной)
+            for (MethodNode m : cn.methods) {
+                if (m.name.equals("removeOrGoVirtual") && m.desc.equals("()V")) {
+                    InsnList goneInit = new InsnList();
+                    goneInit.add(new VarInsnNode(ALOAD, 0));
+                    goneInit.add(new MethodInsnNode(INVOKESTATIC, FIXES, "vehicleGone", "(L" + VEH + ";)V", false));
+                    m.instructions.insert(goneInit);
+                    done.add("gravity-reset");
+                    changed = true;
+                }
+            }
             // Корпус автобуса и контроль оплаты: вызов в начале тика Vehicle
             for (MethodNode m : cn.methods) {
                 if (m.name.equals("m_8119_") && m.desc.equals("()V")) {

@@ -136,7 +136,7 @@ public class Patcher implements Opcodes {
         if (mismatch) {
             System.exit(1);
         }
-        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay", "gate-bankcard", "boarding-fare", "gate-exit-radius", "gate-exit-auto", "gate-in-radius", "terminal-cap", "arrival-reach", "arrival-inside", "lamp-cap", "red-commit", "patience", "bypass-still", "merge-check", "player-ahead", "merge-width", "parallel-width", "auto-links", "link-revision", "bus-priority", "validator", "wheel-filter", "hull", "depot-ui", "depot-order", "depot-spawn", "depot-spawn2", "depot-return", "terminal-pax", "depot-clear", "depot-crash", "gravity-reset"};
+        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay", "gate-bankcard", "boarding-fare", "gate-exit-radius", "gate-exit-auto", "gate-in-radius", "terminal-cap", "arrival-reach", "arrival-inside", "lamp-cap", "red-commit", "patience", "bypass-still", "merge-check", "player-ahead", "merge-width", "parallel-width", "auto-links", "link-revision", "bus-priority", "validator", "wheel-filter", "hull", "depot-ui", "depot-order", "depot-spawn", "depot-spawn2", "depot-park", "depot-return", "terminal-pax", "depot-clear", "depot-crash", "gravity-reset"};
         for (String r : required) {
             if (!done.contains(r)) {
                 System.err.println("ERROR: patch not applied: " + r);
@@ -880,6 +880,32 @@ public class Patcher implements Opcodes {
             }
         }
         if (name.equals(TM)) {
+            // Удаление транспорта после рейса: у линий с депо порог «доехал» расширяется (PtmFixes.parkReach)
+            for (MethodNode m : cn.methods) {
+                if (!m.name.equals("updateVirtualTransport")) {
+                    continue;
+                }
+                AbstractInsnNode[] all = m.instructions.toArray();
+                for (int i = 1; i + 1 < all.length; i++) {
+                    if (all[i] instanceof org.objectweb.asm.tree.LdcInsnNode && all[i + 1].getOpcode() == DCMPG
+                        && all[i - 1] instanceof MethodInsnNode
+                        && ((MethodInsnNode) all[i - 1]).name.equals("simpleDistance")) {
+                        org.objectweb.asm.tree.LdcInsnNode ldc = (org.objectweb.asm.tree.LdcInsnNode) all[i];
+                        if (ldc.cst instanceof Double && ((Double) ldc.cst).doubleValue() == 2.0D) {
+                            InsnList repl = new InsnList();
+                            repl.add(new VarInsnNode(ALOAD, 0));
+                            repl.add(new VarInsnNode(ALOAD, 8));
+                            repl.add(new VarInsnNode(ALOAD, 6));
+                            repl.add(new MethodInsnNode(INVOKESTATIC, FIXES, "parkReach",
+                                "(Lnet/minecraft/world/level/Level;Lcom/rinventor/ptm2/dimension/virtual/types/VDTrackableVehicle;Ljava/lang/String;)D", false));
+                            m.instructions.insertBefore(ldc, repl);
+                            m.instructions.remove(ldc);
+                            done.add("depot-park");
+                            changed = true;
+                        }
+                    }
+                }
+            }
             // Прибытие на остановку: допуск по зоне платформы и по остановке на месте 4+ секунды
             for (MethodNode m : cn.methods) {
                 if (!m.name.equals("updateVehicleDestination")) {

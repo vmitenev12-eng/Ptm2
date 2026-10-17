@@ -2856,6 +2856,52 @@ public final class PtmFixes {
         return platformID;
     }
 
+
+    private static final Map<String, double[]> PARK_WATCH = new ConcurrentHashMap<>();
+
+    /**
+     * Порог «доехал» для удаления транспорта после последнего рейса (вместо 2 блоков). Для линий с депо
+     * транспорт считается доехавшим внутри зоны депо или в 6 блоках от въезда; если он стоит на месте
+     * больше 75 секунд (не смог проехать в депо), он тоже убирается, а место записывается в лог.
+     */
+    public static double parkReach(Level level, VDTrackableVehicle v, String id) {
+        try {
+            if (v == null || v.lineID < 0 || v.position == null || id == null) {
+                return 2.0D;
+            }
+            String raw = VDStorageHandler.get(level, v.lineID, VDMemoryIDs.TRANSPORT_LINE);
+            if (raw == null || raw.isEmpty()) {
+                return 2.0D;
+            }
+            Slot s = slotFor(level, v.lineID, new VDTransportLine(raw));
+            if (s == null) {
+                return 2.0D;
+            }
+            double x = vc(v.position, 0);
+            double z = vc(v.position, 2);
+            double dist = Math.sqrt((x - s.ex) * (x - s.ex) + (z - s.ez) * (z - s.ez));
+            if (inAnyDepot(level, x, z) || dist < 6.0D) {
+                PARK_WATCH.remove(id);
+                return 1.0E9D;
+            }
+            long now = System.currentTimeMillis();
+            double[] rec = PARK_WATCH.get(id);
+            if (rec == null || Math.abs(rec[0] - x) > 2.0D || Math.abs(rec[1] - z) > 2.0D) {
+                if (PARK_WATCH.size() > 500) {
+                    PARK_WATCH.clear();
+                }
+                PARK_WATCH.put(id, new double[] {x, z, now});
+            } else if (now - (long) rec[2] > 75000L) {
+                PARK_WATCH.remove(id);
+                PTMLogger.info("PTM2 \u0434\u0435\u043f\u043e: \u043b\u0438\u043d\u0438\u044f " + v.lineID + " \u043d\u0435 \u0434\u043e\u0435\u0445\u0430\u043b\u0430 \u0434\u043e \u0434\u0435\u043f\u043e, \u0443\u0431\u0440\u0430\u043d\u0430 \u043d\u0430 " + (int) x + " " + (int) z + " (\u0432\u044a\u0435\u0437\u0434 " + (int) s.ex + " " + (int) s.ez + ")");
+                return 1.0E9D;
+            }
+        } catch (Throwable t) {
+            // не критично
+        }
+        return 2.0D;
+    }
+
     /** Замена getDriveAwayDestination: после последнего рейса транспорт едет в своё место в депо. */
     public static Object driveAway(Level level, VDTrackableVehicle vehicle, Object orig) {
         try {

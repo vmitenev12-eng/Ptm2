@@ -883,7 +883,7 @@ public final class PtmFixes {
                     + ", \u043c\u043e\u0434\u0435\u043b\u0435\u0439 \u0442\u0440\u0430\u043d\u0441\u043f\u043e\u0440\u0442\u0430=" + models
                     + ", \u043c\u0430\u0448\u0438\u043d \u0432 \u0438\u0433\u0440\u0435=" + active
                     + (noAi > 0 ? ", \u0411\u0415\u0417 \u0418\u0418 (\u0441\u0442\u043e\u044f\u0442)=" + noAi + noAiInfo : "")
-                    + ", \u0434\u0435\u043f\u043e=" + (line.depotID == -1 ? "\u043d\u0435\u0442" : String.valueOf(line.depotID))));
+                    + ", \u0434\u0435\u043f\u043e=" + (resolveDepot(level, line) == null ? "\u043d\u0435\u0442" : String.valueOf(resolveDepot(level, line).d.name))));
 
                 int shown = 0;
                 for (Map.Entry<Integer, String> re : routes.entrySet()) {
@@ -2473,8 +2473,53 @@ public final class PtmFixes {
                 }
             }
         }
+        // вложенность: зона депо внутри другой зоны депо (допуск 2 блока) считается дочерней сама
+        for (Depot a : n.list) {
+            Depot parent = null;
+            long pa = 0L;
+            for (Depot b : n.list) {
+                if (a == b) {
+                    continue;
+                }
+                long ab = (long) (b.maxX - b.minX + 1) * (b.maxZ - b.minZ + 1);
+                long aa = (long) (a.maxX - a.minX + 1) * (a.maxZ - a.minZ + 1);
+                if (aa < ab && a.minX >= b.minX - 2 && a.maxX <= b.maxX + 2 && a.minZ >= b.minZ - 2 && a.maxZ <= b.maxZ + 2
+                    && (parent == null || ab < pa)) {
+                    parent = b;
+                    pa = ab;
+                }
+            }
+            if (parent != null) {
+                a.child = true;
+                if (!parent.kids.contains(a)) {
+                    parent.kids.add(a);
+                }
+            }
+        }
         DEPOTS.put(key, n);
         return n.list;
+    }
+
+    /**
+     * Депо линии: дочерняя зона, имя которой совпадает с номером линии, привязывается автоматически
+     * (при выбранном депо ищется среди его дочерних зон). Иначе берётся выбранное в списке депо.
+     */
+    static Depot resolveDepot(Level level, VDTransportLine line) {
+        if (line == null) {
+            return null;
+        }
+        java.util.List<Depot> ds = depots(level);
+        Depot sel = line.depotID >= 0 && line.depotID < ds.size() ? ds.get(line.depotID) : null;
+        String nr = line.number == null ? "" : line.number.trim();
+        if (!nr.isEmpty() && !nr.equals("null")) {
+            for (Depot d : ds) {
+                if (d.child && !d.d.closed && d.d.name != null && d.d.name.trim().equals(nr)
+                    && (sel == null || sel == d || sel.kids.contains(d))) {
+                    return d;
+                }
+            }
+        }
+        return sel;
     }
 
     static boolean inAnyDepot(Level level, double x, double z) {
@@ -2527,36 +2572,36 @@ public final class PtmFixes {
      * свободная пара (по порядку номеров линий), пары внутри дочерних зон не трогаем.
      */
     static Slot slotFor(Level level, int lineID, VDTransportLine line) {
-        if (line == null || line.depotID < 0) {
+        if (line == null) {
+            return null;
+        }
+        Depot dep = resolveDepot(level, line);
+        if (dep == null) {
             return null;
         }
         long now = System.currentTimeMillis();
-        Slot cached = SLOTS.get(lineID * 1000 + line.depotID);
+        int ckey = lineID * 100003 + dep.id;
+        Slot cached = SLOTS.get(ckey);
         if (cached != null && now - cached.t < 8000L) {
             return cached.sx == Double.MAX_VALUE ? null : cached;
         }
-        Slot result = computeSlot(level, lineID, line);
+        Slot result = computeSlot(level, lineID, line, dep);
         Slot store = result;
         if (store == null) {
             store = new Slot();
             store.sx = Double.MAX_VALUE;
         }
         store.t = now;
-        SLOTS.put(lineID * 1000 + line.depotID, store);
+        SLOTS.put(ckey, store);
         return result;
     }
 
-    private static Slot computeSlot(Level level, int lineID, VDTransportLine line) {
+    private static Slot computeSlot(Level level, int lineID, VDTransportLine line, Depot dep) {
         try {
             initRefl();
             if (!reflOk) {
                 return null;
             }
-            java.util.List<Depot> ds = depots(level);
-            if (line.depotID >= ds.size()) {
-                return null;
-            }
-            Depot dep = ds.get(line.depotID);
             if (dep.d.closed) {
                 return null;
             }
@@ -2623,7 +2668,8 @@ public final class PtmFixes {
             // номер линии среди линий этого депо
             java.util.TreeSet<Integer> sameDepot = new java.util.TreeSet<>();
             for (Map.Entry<Integer, String> e : VDStorageHandler.getAll(level, VDMemoryIDs.TRANSPORT_LINE).entrySet()) {
-                if (new VDTransportLine(e.getValue()).depotID == line.depotID) {
+                Depot od = resolveDepot(level, new VDTransportLine(e.getValue()));
+                if (od != null && od.id == dep.id) {
                     sameDepot.add(e.getKey());
                 }
             }

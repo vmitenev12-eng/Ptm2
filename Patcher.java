@@ -486,7 +486,8 @@ public class Patcher implements Opcodes {
                     l.add(new VarInsnNode(ILOAD, 3));
                     l.add(new VarInsnNode(ILOAD, 4));
                     l.add(new MethodInsnNode(INVOKESTATIC, FIXES, "spawnFix",
-                        "(Lcom/rinventor/ptm2/engine/computing/DirectionalPos;Lnet/minecraft/world/level/Level;Lcom/rinventor/ptm2/dimension/virtual/types/VDTransportLine;II)V", false));
+                        "(Lcom/rinventor/ptm2/engine/computing/DirectionalPos;Lnet/minecraft/world/level/Level;Lcom/rinventor/ptm2/dimension/virtual/types/VDTransportLine;II)I", false));
+                    l.add(new VarInsnNode(ISTORE, 4));
                     m.instructions.insert(l);
                     done.add("depot-spawn2");
                     changed = true;

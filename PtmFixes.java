@@ -2808,7 +2808,7 @@ public final class PtmFixes {
                 return "\u043d\u0435\u0442";
             }
             Slot s = slotFor(level, lineId, line);
-            String r = String.valueOf(d.d.name) + (d.child ? " (\u0434\u043e\u0447.)" : "") + " [" + d.minX + ".." + d.maxX + ", " + d.minZ + ".." + d.maxZ + "]";
+            String r = String.valueOf(d.d.name) + (d.child ? " (\u0434\u043e\u0447.)" : "") + " x " + d.minX + ".." + d.maxX + ", z " + d.minZ + ".." + d.maxZ;
             if (s == null) {
                 return r + ", \u043c\u0435\u0441\u0442\u0430 \u043d\u0435\u0442 (\u0432\u044b\u0435\u0437\u0434\u043e\u0432 \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d\u043e)";
             }
@@ -2823,23 +2823,27 @@ public final class PtmFixes {
      * точка появления переносится на выезд своей пары (в цепочках рейсов, например кольцо, стандартный
      * код ставит появление на дороге перед платформой).
      */
-    public static void spawnFix(DirectionalPos dp, Level level, VDTransportLine line, int routeID, int platformID) {
+    public static int spawnFix(DirectionalPos dp, Level level, VDTransportLine line, int routeID, int platformID) {
         try {
             if (dp == null || line == null) {
-                return;
+                return platformID;
             }
             String raw = VDStorageHandler.get(level, routeID, VDMemoryIDs.ROUTE);
             if (raw == null || raw.isEmpty()) {
-                return;
+                return platformID;
             }
             VDRoute route = new VDRoute(raw);
-            List<Integer> stops = VDUtils.parseStops(route.stops);
-            if (stops == null || stops.isEmpty() || stops.get(0).intValue() != platformID) {
-                return;
-            }
             Slot s = slotFor(level, route.lineID, line);
             if (s == null) {
-                return;
+                return platformID;
+            }
+            List<Integer> stops = VDUtils.parseStops(route.stops);
+            if (stops == null || stops.isEmpty()) {
+                return platformID;
+            }
+            if (stops.get(0).intValue() != platformID) {
+                // у линии с депо транспорт появляется только из депо: появление на дороге у остановок подавляем
+                return -1;
             }
             setFinal(dp, "x", s.sx);
             setFinal(dp, "y", s.sy);
@@ -2849,6 +2853,7 @@ public final class PtmFixes {
         } catch (Throwable t) {
             PTMLogger.warn("PTM2 fixes: spawnFix " + t);
         }
+        return platformID;
     }
 
     /** Замена getDriveAwayDestination: после последнего рейса транспорт едет в своё место в депо. */

@@ -883,7 +883,7 @@ public final class PtmFixes {
                     + ", \u043c\u043e\u0434\u0435\u043b\u0435\u0439 \u0442\u0440\u0430\u043d\u0441\u043f\u043e\u0440\u0442\u0430=" + models
                     + ", \u043c\u0430\u0448\u0438\u043d \u0432 \u0438\u0433\u0440\u0435=" + active
                     + (noAi > 0 ? ", \u0411\u0415\u0417 \u0418\u0418 (\u0441\u0442\u043e\u044f\u0442)=" + noAi + noAiInfo : "")
-                    + ", \u0434\u0435\u043f\u043e=" + (resolveDepot(level, line) == null ? "\u043d\u0435\u0442" : String.valueOf(resolveDepot(level, line).d.name))));
+                    + ", \u0434\u0435\u043f\u043e=" + depotDiag(level, lineId, line)));
 
                 int shown = 0;
                 for (Map.Entry<Integer, String> re : routes.entrySet()) {
@@ -2746,6 +2746,58 @@ public final class PtmFixes {
             PTMLogger.info("PTM2 \u0434\u0435\u043f\u043e: \u043b\u0438\u043d\u0438\u044f " + route.lineID + " \u0432\u044b\u0435\u0437\u0436\u0430\u0435\u0442 \u0438\u0437 \u0434\u0435\u043f\u043e \u043d\u0430 " + (int) s.sx + " " + (int) s.sz);
         } catch (Throwable t) {
             PTMLogger.warn("PTM2 fixes: \u043e\u0448\u0438\u0431\u043a\u0430 \u0442\u043e\u0447\u043a\u0438 \u0432\u044b\u0435\u0437\u0434\u0430 \u0438\u0437 \u0434\u0435\u043f\u043e: " + t);
+        }
+    }
+
+
+    /** Строка диагностики: имя депо и найденное место выезда/въезда. */
+    static String depotDiag(Level level, int lineId, VDTransportLine line) {
+        try {
+            Depot d = resolveDepot(level, line);
+            if (d == null) {
+                return "\u043d\u0435\u0442";
+            }
+            Slot s = slotFor(level, lineId, line);
+            String r = String.valueOf(d.d.name) + (d.child ? " (\u0434\u043e\u0447.)" : "") + " [" + d.minX + ".." + d.maxX + ", " + d.minZ + ".." + d.maxZ + "]";
+            if (s == null) {
+                return r + ", \u043c\u0435\u0441\u0442\u0430 \u043d\u0435\u0442 (\u0432\u044b\u0435\u0437\u0434\u043e\u0432 \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d\u043e)";
+            }
+            return r + ", \u0432\u044b\u0435\u0437\u0434 " + (int) s.sx + " " + (int) s.sz + ", \u0432\u044a\u0435\u0437\u0434 " + (int) s.ex + " " + (int) s.ez;
+        } catch (Throwable t) {
+            return "\u043e\u0448\u0438\u0431\u043a\u0430 " + t;
+        }
+    }
+
+    /**
+     * Вызывается в начале createVirtualVehicle: если это первая остановка рейса линии с депо,
+     * точка появления переносится на выезд своей пары (в цепочках рейсов, например кольцо, стандартный
+     * код ставит появление на дороге перед платформой).
+     */
+    public static void spawnFix(DirectionalPos dp, Level level, VDTransportLine line, int routeID, int platformID) {
+        try {
+            if (dp == null || line == null) {
+                return;
+            }
+            String raw = VDStorageHandler.get(level, routeID, VDMemoryIDs.ROUTE);
+            if (raw == null || raw.isEmpty()) {
+                return;
+            }
+            VDRoute route = new VDRoute(raw);
+            List<Integer> stops = VDUtils.parseStops(route.stops);
+            if (stops == null || stops.isEmpty() || stops.get(0).intValue() != platformID) {
+                return;
+            }
+            Slot s = slotFor(level, route.lineID, line);
+            if (s == null) {
+                return;
+            }
+            setFinal(dp, "x", s.sx);
+            setFinal(dp, "y", s.sy);
+            setFinal(dp, "z", s.sz);
+            setFinal(dp, "direction", (float) s.yaw);
+            PTMLogger.info("PTM2 \u0434\u0435\u043f\u043e: \u0440\u0435\u0439\u0441 " + routeID + " \u043b\u0438\u043d\u0438\u0438 " + route.lineID + " \u043f\u043e\u044f\u0432\u043b\u044f\u0435\u0442\u0441\u044f \u043d\u0430 \u0432\u044b\u0435\u0437\u0434\u0435 " + (int) s.sx + " " + (int) s.sz);
+        } catch (Throwable t) {
+            PTMLogger.warn("PTM2 fixes: spawnFix " + t);
         }
     }
 

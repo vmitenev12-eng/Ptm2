@@ -136,7 +136,7 @@ public class Patcher implements Opcodes {
         if (mismatch) {
             System.exit(1);
         }
-        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay", "gate-bankcard", "boarding-fare", "gate-exit-radius", "gate-exit-auto", "gate-in-radius", "terminal-cap", "arrival-reach", "arrival-inside", "lamp-cap", "red-commit", "patience", "bypass-still", "merge-check", "player-ahead", "merge-width", "parallel-width", "auto-links", "link-revision", "bus-priority", "validator", "wheel-filter", "hull", "depot-ui", "depot-order", "depot-spawn", "depot-return", "terminal-pax", "depot-clear", "depot-crash", "gravity-reset"};
+        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay", "gate-bankcard", "boarding-fare", "gate-exit-radius", "gate-exit-auto", "gate-in-radius", "terminal-cap", "arrival-reach", "arrival-inside", "lamp-cap", "red-commit", "patience", "bypass-still", "merge-check", "player-ahead", "merge-width", "parallel-width", "auto-links", "link-revision", "bus-priority", "validator", "wheel-filter", "hull", "depot-ui", "depot-order", "depot-spawn", "depot-spawn2", "depot-return", "terminal-pax", "depot-clear", "depot-crash", "gravity-reset"};
         for (String r : required) {
             if (!done.contains(r)) {
                 System.err.println("ERROR: patch not applied: " + r);
@@ -478,6 +478,19 @@ public class Patcher implements Opcodes {
         if (name.equals(TM)) {
             // Депо: точка появления, возврат в депо, пассажиры на конечной остановке
             for (MethodNode m : cn.methods) {
+                if (m.name.equals("createVirtualVehicle") && m.desc.startsWith("(Lnet/minecraft/world/level/Level;Lcom/rinventor/ptm2/dimension/virtual/types/VDTransportLine;IIILcom/rinventor/ptm2/engine/computing/DirectionalPos;")) {
+                    InsnList l = new InsnList();
+                    l.add(new VarInsnNode(ALOAD, 5));
+                    l.add(new VarInsnNode(ALOAD, 0));
+                    l.add(new VarInsnNode(ALOAD, 1));
+                    l.add(new VarInsnNode(ILOAD, 3));
+                    l.add(new VarInsnNode(ILOAD, 4));
+                    l.add(new MethodInsnNode(INVOKESTATIC, FIXES, "spawnFix",
+                        "(Lcom/rinventor/ptm2/engine/computing/DirectionalPos;Lnet/minecraft/world/level/Level;Lcom/rinventor/ptm2/dimension/virtual/types/VDTransportLine;II)V", false));
+                    m.instructions.insert(l);
+                    done.add("depot-spawn2");
+                    changed = true;
+                }
                 if (m.name.equals("trackRoutesAndSchedules")) {
                     for (AbstractInsnNode insn : m.instructions.toArray()) {
                         if (insn instanceof MethodInsnNode) {

@@ -883,7 +883,20 @@ public final class PtmFixes {
                     + ", \u043c\u043e\u0434\u0435\u043b\u0435\u0439 \u0442\u0440\u0430\u043d\u0441\u043f\u043e\u0440\u0442\u0430=" + models
                     + ", \u043c\u0430\u0448\u0438\u043d \u0432 \u0438\u0433\u0440\u0435=" + active
                     + (noAi > 0 ? ", \u0411\u0415\u0417 \u0418\u0418 (\u0441\u0442\u043e\u044f\u0442)=" + noAi + noAiInfo : "")
-                    + ", \u0434\u0435\u043f\u043e=" + depotDiag(level, lineId, line)));
+                    + ", \u0434\u0435\u043f\u043e=" + depotShort(level, line)));
+
+                if (resolveDepot(level, line) != null) {
+                    entries.add(new VDOperationalData(companyID, OperationalSeverity.INFO,
+                        "\u0414\u0418\u0410\u0413: \u0434\u0435\u043f\u043e \u043b\u0438\u043d\u0438\u0438 " + number + ": " + depotDiag(level, lineId, line)));
+                }
+                int vshown = 0;
+                for (VDTrackableVehicle v : vehicles) {
+                    if (v.lineID == lineId && v.isTransport() && vshown < 3) {
+                        vshown++;
+                        entries.add(new VDOperationalData(companyID, OperationalSeverity.INFO,
+                            "\u0414\u0418\u0410\u0413: \u0430\u0432\u0442\u043e\u0431\u0443\u0441 \u043b\u0438\u043d\u0438\u0438 " + number + ": " + vehicleDiag(level, v)));
+                    }
+                }
 
                 int shown = 0;
                 for (Map.Entry<Integer, String> re : routes.entrySet()) {
@@ -2749,6 +2762,43 @@ public final class PtmFixes {
         }
     }
 
+
+
+    static String depotShort(Level level, VDTransportLine line) {
+        try {
+            Depot d = resolveDepot(level, line);
+            return d == null ? "\u043d\u0435\u0442" : String.valueOf(d.d.name);
+        } catch (Throwable t) {
+            return "?";
+        }
+    }
+
+    /** Состояние автобуса для диагностики остановки: цель, расстояние, внутри ли платформы, таймеры, двери. */
+    static String vehicleDiag(Level level, VDTrackableVehicle v) {
+        try {
+            long now = TimeHelper.now();
+            String dist = "?";
+            boolean inPos = false;
+            boolean inDest = false;
+            if (v.position != null && v.destination != null) {
+                dist = String.valueOf((int) com.rinventor.ptm2.engine.util.Maths.simpleDistance(v.position, v.destination));
+                inPos = VDUtils.getPlatformID(level, com.rinventor.ptm2.engine.computing.Converter.toPos(v.position)) == v.nextPlatformID;
+                inDest = VDUtils.getPlatformID(level, com.rinventor.ptm2.engine.computing.Converter.toPos(v.destination)) == v.nextPlatformID;
+            }
+            return "\u043f\u043b\u0430\u0442\u0444\u043e\u0440\u043c\u0430=" + v.nextPlatformID
+                + ", \u0434\u043e \u0446\u0435\u043b\u0438=" + dist
+                + ", \u0432 \u0437\u043e\u043d\u0435 \u0430\u0432\u0442\u043e\u0431\u0443\u0441=" + (inPos ? "\u0434\u0430" : "\u043d\u0435\u0442")
+                + ", \u0446\u0435\u043b\u044c=" + (inDest ? "\u0434\u0430" : "\u043d\u0435\u0442")
+                + ", \u0441\u0442\u043e\u0438\u0442 \u0441=" + (v.stopTime > 0L ? String.valueOf((now - v.stopTime) / 1000L) : "\u043d\u0435\u0442")
+                + ", \u0434\u043e \u043e\u0442\u043f\u0440.=" + (v.timeToLeave > 0L ? String.valueOf((v.timeToLeave - now) / 1000L) : "\u043d\u0435\u0442")
+                + ", \u0434\u0432\u0435\u0440\u0438=" + (v.doorsOpen ? "\u043e\u0442\u043a\u0440" : "\u0437\u0430\u043a\u0440")
+                + ", " + (v.virtual ? "\u0432\u0438\u0440\u0442" : "\u0444\u0438\u0437")
+                + ", ai=" + (v.ai ? "\u0434\u0430" : "\u043d\u0435\u0442")
+                + ", v=" + v.speed;
+        } catch (Throwable t) {
+            return "\u043e\u0448\u0438\u0431\u043a\u0430 " + t;
+        }
+    }
 
     /** Строка диагностики: имя депо и найденное место выезда/въезда. */
     static String depotDiag(Level level, int lineId, VDTransportLine line) {

@@ -2857,6 +2857,47 @@ public final class PtmFixes {
     }
 
 
+
+    /**
+     * Следующая цель по пути в депо: до въезда не дальше 90 блоков, иначе промежуточная точка по дороге
+     * примерно в 80 блоках в сторону въезда (поиск пути на очень большое расстояние у мода не справляется).
+     */
+    static double[] hop(Level level, Object pos, double ex, double ez) {
+        try {
+            double x = vc(pos, 0);
+            double y = vc(pos, 1);
+            double z = vc(pos, 2);
+            double dx = ex - x;
+            double dz = ez - z;
+            double d = Math.sqrt(dx * dx + dz * dz);
+            if (d <= 90.0D) {
+                return new double[] {ex, ez};
+            }
+            net.minecraft.world.phys.Vec3 target = (net.minecraft.world.phys.Vec3) vec3(pos, x + dx / d * 80.0D, y, z + dz / d * 80.0D);
+            com.rinventor.ptm2.dimension.virtual.util.RoadPath path =
+                new com.rinventor.ptm2.dimension.virtual.util.RoadPath(level, com.rinventor.ptm2.dimension.virtual.util.TransportMode.TRANSPORT)
+                    .create(com.rinventor.ptm2.engine.computing.Converter.toPos((net.minecraft.world.phys.Vec3) pos),
+                        com.rinventor.ptm2.engine.computing.Converter.toPos(target));
+            List<com.rinventor.ptm2.engine.bezier.utility.Pair<VDTrafficLane, Integer>> data = path.getPaths();
+            for (int i = data.size() - 1; i >= 0; i--) {
+                VDTrafficLane lane = data.get(i).getFirst();
+                if (lane != null && lane.getEnd() != null) {
+                    double hx = vc(lane.getEnd(), 0);
+                    double hz = vc(lane.getEnd(), 2);
+                    if (Math.abs(hx - x) + Math.abs(hz - z) > 10.0D) {
+                        return new double[] {hx, hz};
+                    }
+                    break;
+                }
+            }
+        } catch (Throwable t) {
+            // не критично
+        }
+        return new double[] {ex, ez};
+    }
+
+    private static final Map<String, Integer> PARK_HOPS = new ConcurrentHashMap<>();
+
     private static final Map<String, double[]> PARK_WATCH = new ConcurrentHashMap<>();
 
     /**
@@ -2880,9 +2921,25 @@ public final class PtmFixes {
             double x = vc(v.position, 0);
             double z = vc(v.position, 2);
             double dist = Math.sqrt((x - s.ex) * (x - s.ex) + (z - s.ez) * (z - s.ez));
-            if (inAnyDepot(level, x, z) || dist < 6.0D) {
+            if (inAnyDepot(level, x, z) || dist < 12.0D) {
                 PARK_WATCH.remove(id);
+                PARK_HOPS.remove(id);
                 return 1.0E9D;
+            }
+            if (v.destination != null) {
+                double ddx = x - vc(v.destination, 0);
+                double ddz = z - vc(v.destination, 2);
+                if (ddx * ddx + ddz * ddz < 16.0D) {
+                    // дошёл до промежуточной точки: следующая точка в сторону въезда в депо
+                    int hops = PARK_HOPS.merge(id, 1, Integer::sum);
+                    double[] be = bestEntry(level, new VDTransportLine(raw), s, v.position);
+                    double[] h = hops > 8 ? new double[] {be[0], be[2]} : hop(level, v.position, be[0], be[2]);
+                    v.origin = v.position;
+                    v.destination = (net.minecraft.world.phys.Vec3) vec3(v.destination, h[0], 0.0D, h[1]);
+                    PARK_WATCH.remove(id);
+                    PTMLogger.info("PTM2 \u0434\u0435\u043f\u043e: \u043b\u0438\u043d\u0438\u044f " + v.lineID + " \u0435\u0434\u0435\u0442 \u0447\u0435\u0440\u0435\u0437 \u0442\u043e\u0447\u043a\u0443 " + (int) h[0] + " " + (int) h[1] + " \u0438\u0437 " + (int) x + " " + (int) z);
+                    return 2.0D;
+                }
             }
             long now = System.currentTimeMillis();
             double[] rec = PARK_WATCH.get(id);
@@ -2891,7 +2948,7 @@ public final class PtmFixes {
                     PARK_WATCH.clear();
                 }
                 PARK_WATCH.put(id, new double[] {x, z, now});
-            } else if (now - (long) rec[2] > 75000L) {
+            } else if (now - (long) rec[2] > (dist < 40.0D ? 60000L : 240000L)) {
                 PARK_WATCH.remove(id);
                 PTMLogger.info("PTM2 \u0434\u0435\u043f\u043e: \u043b\u0438\u043d\u0438\u044f " + v.lineID + " \u043d\u0435 \u0434\u043e\u0435\u0445\u0430\u043b\u0430 \u0434\u043e \u0434\u0435\u043f\u043e, \u0443\u0431\u0440\u0430\u043d\u0430 \u043d\u0430 " + (int) x + " " + (int) z + " (\u0432\u044a\u0435\u0437\u0434 " + (int) s.ex + " " + (int) s.ez + ")");
                 return 1.0E9D;
@@ -2900,6 +2957,108 @@ public final class PtmFixes {
             // не критично
         }
         return 2.0D;
+    }
+
+
+    /** Въезды (концы дорожек) внутри зоны депо, не принадлежащие дочерним зонам. */
+    static java.util.List<double[]> entriesOf(Level level, Depot zone) {
+        java.util.List<double[]> res = new java.util.ArrayList<>();
+        try {
+            java.util.List<LaneRec> lanes = new java.util.ArrayList<>();
+            java.util.Set<Long> starts = new java.util.HashSet<>();
+            for (Map.Entry<Integer, String> e : VDStorageHandler.getAll(level, VDMemoryIDs.TRAFFIC_LANE).entrySet()) {
+                VDTrafficLane l = new VDTrafficLane(e.getValue());
+                if (!l.transport || l.getStart() == null || l.getEnd() == null) {
+                    continue;
+                }
+                LaneRec r = new LaneRec();
+                r.sx = vc(l.getStart(), 0);
+                r.sz = vc(l.getStart(), 2);
+                r.ex = vc(l.getEnd(), 0);
+                r.ey = vc(l.getEnd(), 1);
+                r.ez = vc(l.getEnd(), 2);
+                lanes.add(r);
+                starts.add(pkey(r.sx, r.sz));
+            }
+            for (LaneRec r : lanes) {
+                if (zone.contains(r.ex, r.ez) && !starts.contains(pkey(r.ex, r.ez)) && !inKids(zone, r.ex, r.ez)) {
+                    res.add(new double[] {r.ex, r.ey, r.ez});
+                }
+            }
+        } catch (Throwable t) {
+            // не критично
+        }
+        return res;
+    }
+
+    /** Есть ли путь от точки pos до точки въезда (конец найденного пути не дальше 4 блоков от неё). */
+    static boolean reachable(Level level, Object pos, double ex, double ey, double ez) {
+        try {
+            net.minecraft.world.phys.Vec3 target = (net.minecraft.world.phys.Vec3) vec3(pos, ex, ey, ez);
+            com.rinventor.ptm2.dimension.virtual.util.RoadPath path =
+                new com.rinventor.ptm2.dimension.virtual.util.RoadPath(level, com.rinventor.ptm2.dimension.virtual.util.TransportMode.TRANSPORT)
+                    .create(com.rinventor.ptm2.engine.computing.Converter.toPos((net.minecraft.world.phys.Vec3) pos),
+                        com.rinventor.ptm2.engine.computing.Converter.toPos(target));
+            List<com.rinventor.ptm2.engine.bezier.utility.Pair<VDTrafficLane, Integer>> data = path.getPaths();
+            for (int i = data.size() - 1; i >= 0; i--) {
+                VDTrafficLane lane = data.get(i).getFirst();
+                if (lane != null && lane.getEnd() != null) {
+                    double dx = vc(lane.getEnd(), 0) - ex;
+                    double dz = vc(lane.getEnd(), 2) - ez;
+                    return dx * dx + dz * dz <= 16.0D;
+                }
+            }
+        } catch (Throwable t) {
+            // не критично
+        }
+        return false;
+    }
+
+    /**
+     * Въезд, до которого автобус из точки pos реально доедет: сначала свой въезд пары, затем остальные
+     * въезды дочерней зоны и зоны, в которую она вложена, по близости к своему. Если ничего не найдено
+     * (или путь слишком длинный для проверки), остаётся свой въезд пары.
+     */
+    static double[] bestEntry(Level level, VDTransportLine line, Slot s, Object pos) {
+        double[] own = new double[] {s.ex, s.ey, s.ez};
+        try {
+            double px = vc(pos, 0);
+            double pz = vc(pos, 2);
+            if (Math.sqrt((px - s.ex) * (px - s.ex) + (pz - s.ez) * (pz - s.ez)) > 120.0D) {
+                return own;
+            }
+            if (reachable(level, pos, s.ex, s.ey, s.ez)) {
+                return own;
+            }
+            Depot dep = resolveDepot(level, line);
+            if (dep == null) {
+                return own;
+            }
+            java.util.List<double[]> cands = new java.util.ArrayList<>(entriesOf(level, dep));
+            for (Depot d : depots(level)) {
+                if (d.kids.contains(dep)) {
+                    cands.addAll(entriesOf(level, d));
+                }
+            }
+            cands.sort((a, b) -> Double.compare((a[0] - s.ex) * (a[0] - s.ex) + (a[2] - s.ez) * (a[2] - s.ez),
+                (b[0] - s.ex) * (b[0] - s.ex) + (b[2] - s.ez) * (b[2] - s.ez)));
+            int tried = 0;
+            for (double[] c : cands) {
+                if (tried >= 8) {
+                    break;
+                }
+                tried++;
+                if (reachable(level, pos, c[0], c[1], c[2])) {
+                    PTMLogger.info("PTM2 \u0434\u0435\u043f\u043e: \u0432\u044a\u0435\u0437\u0434 \u043b\u0438\u043d\u0438\u0438 " + line.number + " \u043d\u0430 " + (int) s.ex + " " + (int) s.ez
+                        + " \u043d\u0435\u0434\u043e\u0441\u0442\u0443\u043f\u0435\u043d, \u0435\u0434\u0435\u0442 \u043d\u0430 " + (int) c[0] + " " + (int) c[2]);
+                    return c;
+                }
+            }
+            PTMLogger.info("PTM2 \u0434\u0435\u043f\u043e: \u043d\u0438 \u043e\u0434\u0438\u043d \u0432\u044a\u0435\u0437\u0434 \u043b\u0438\u043d\u0438\u0438 " + line.number + " \u043d\u0435 \u0434\u043e\u0441\u0442\u0443\u043f\u0435\u043d (\u043f\u0440\u043e\u0432\u0435\u0440\u0435\u043d\u043e " + tried + ")");
+        } catch (Throwable t) {
+            // не критично
+        }
+        return own;
     }
 
     /** Замена getDriveAwayDestination: после последнего рейса транспорт едет в своё место в депо. */
@@ -2918,7 +3077,9 @@ public final class PtmFixes {
                 return orig;
             }
             PTMLogger.info("PTM2 \u0434\u0435\u043f\u043e: \u043b\u0438\u043d\u0438\u044f " + vehicle.lineID + " \u0435\u0434\u0435\u0442 \u0432 \u0434\u0435\u043f\u043e \u043d\u0430 " + (int) s.ex + " " + (int) s.ez);
-            return vec3(orig, s.ex, 0.0D, s.ez);
+            double[] be = bestEntry(level, line, s, vehicle.position);
+            double[] h = hop(level, vehicle.position, be[0], be[2]);
+            return vec3(orig, h[0], 0.0D, h[1]);
         } catch (Throwable t) {
             return orig;
         }

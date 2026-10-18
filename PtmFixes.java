@@ -765,6 +765,8 @@ public final class PtmFixes {
      * Радиус «прибытия» к точке остановки вместо константы 2.0: если автобус стоит (скорость около нуля)
      * дольше 4 секунд в пределах 14 блоков от точки остановки, считаем, что он прибыл (открываем двери, ждём, едем дальше).
      */
+    private static final Map<Integer, java.lang.ref.WeakReference<Vehicle>> LAST_OBS = new ConcurrentHashMap<>();
+
     private static final Map<Integer, long[]> WAIT_LOG = new ConcurrentHashMap<>();
 
     /** Если автобус стоит на месте больше минуты, пишем в лог причину (раз в 90 секунд на автобус). */
@@ -790,10 +792,45 @@ public final class PtmFixes {
                     + " \u043d\u0430 " + x + " " + z + " \u0441\u0442\u043e\u0438\u0442 " + (now - rec[2]) / 1000L + " \u0441, \u0434\u043e \u0446\u0435\u043b\u0438 " + (int) distance
                     + ", \u043e\u0441\u0442\u0430\u043d\u043e\u0432\u043a\u0430=" + (v.stopTime > 0L ? "\u0434\u0430" : "\u043d\u0435\u0442")
                     + ", \u0434\u043e \u043e\u0442\u043f\u0440. " + (v.timeToLeave > 0L ? String.valueOf((v.timeToLeave - now) / 1000L) : "-")
-                    + " \u0441, \u0434\u0432\u0435\u0440\u0438=" + (v.doorsOpen ? "\u043e\u0442\u043a\u0440" : "\u0437\u0430\u043a\u0440"));
+                    + " \u0441, \u0434\u0432\u0435\u0440\u0438=" + (v.doorsOpen ? "\u043e\u0442\u043a\u0440" : "\u0437\u0430\u043a\u0440") + stateInfo(ve) + obstacleInfo(key));
             }
         } catch (Throwable t) {
             // не критично
+        }
+    }
+
+    /** Состояние автобуса: поворотник, ИИ, целевая скорость, остаток пути. */
+    private static String stateInfo(Vehicle ve) {
+        try {
+            if (!(ve instanceof Transport)) {
+                return "";
+            }
+            Transport t = (Transport) ve;
+            double len = 0.0D;
+            int lanes = 0;
+            if (t.currentPath != null) {
+                lanes = t.currentPath.size();
+            }
+            return ", \u043f\u043e\u0432\u043e\u0440\u043e\u0442\u043d\u0438\u043a=" + t.getIndicators() + ", ai=" + (t.ai ? "\u0434\u0430" : "\u043d\u0435\u0442")
+                + ", \u0446\u0435\u043b\u0435\u0432\u0430\u044f \u0441\u043a\u043e\u0440\u043e\u0441\u0442\u044c=" + t.targetSpeed + ", \u043f\u043e\u043b\u043e\u0441 \u0432 \u043f\u0443\u0442\u0438=" + lanes
+                + ", \u043f\u0440\u043e\u0439\u0434\u0435\u043d\u043e=" + (int) t.pathProgress + ", \u0430\u0432\u0430\u0440\u0438\u044f=" + (t.crashed ? "\u0434\u0430" : "\u043d\u0435\u0442");
+        } catch (Throwable th) {
+            return "";
+        }
+    }
+
+    private static String obstacleInfo(int key) {
+        try {
+            java.lang.ref.WeakReference<Vehicle> ref = LAST_OBS.get(key);
+            Vehicle o = ref == null ? null : ref.get();
+            if (o == null) {
+                return ", \u043f\u0435\u0440\u0435\u0434 \u043d\u0438\u043c \u043f\u043e\u043c\u0435\u0445 \u043d\u0435\u0442";
+            }
+            String extra = o instanceof Transport ? " \u0440\u0435\u0439\u0441 " + ((Transport) o).getRouteID() : "";
+            return ", \u043f\u0435\u0440\u0435\u0434 \u043d\u0438\u043c " + o.getClass().getSimpleName() + extra + " \u043d\u0430 "
+                + (long) PTMEntity.getX(o) + " " + (long) PTMEntity.getZ(o) + " v=" + o.speed;
+        } catch (Throwable t) {
+            return "";
         }
     }
 
@@ -805,15 +842,18 @@ public final class PtmFixes {
             int key = System.identityHashCode(ve);
             long now = System.currentTimeMillis();
             waitLog(v, ve, distance, key, now);
-            if (distance < 14.0D && Math.abs(ve.speed) < 0.5F) {
+            if (distance < 150.0D && Math.abs(ve.speed) < 0.5F) {
+                // автобус уже внутри платформы (сюда попадаем только в этом случае) и стоит: приоритет остаётся за
+                // доездом до расчётной точки (порог 2 блока), но если автобус стоит больше 6 секунд (упёрся в
+                // конец пути, ждёт автобус впереди), он открывает двери там, где стоит
                 Long first = SLOW.get(key);
                 if (first == null) {
                     if (SLOW.size() > 500) {
                         SLOW.clear();
                     }
                     SLOW.put(key, now);
-                } else if (now - first >= 4000L) {
-                    return 14.0D;
+                } else if (now - first >= 6000L) {
+                    return 150.0D;
                 }
             } else {
                 SLOW.remove(key);
@@ -2914,7 +2954,7 @@ public final class PtmFixes {
             double x = vc(v.position, 0);
             double z = vc(v.position, 2);
             double dist = Math.sqrt((x - s.ex) * (x - s.ex) + (z - s.ez) * (z - s.ez));
-            if (inAnyDepot(level, x, z) || dist < 12.0D) {
+            if (dist < 3.5D) {
                 PARK_WATCH.remove(id);
                 return 1.0E9D;
             }
@@ -2985,6 +3025,17 @@ public final class PtmFixes {
 
     /** Внутри депо транспорт не считает другой транспорт препятствием. */
     public static Vehicle clearance(Vehicle v, double distance, Vehicle orig, Level level) {
+        if (v instanceof Transport) {
+            int ok = System.identityHashCode(v);
+            if (orig != null) {
+                if (LAST_OBS.size() > 500) {
+                    LAST_OBS.clear();
+                }
+                LAST_OBS.put(ok, new java.lang.ref.WeakReference<>(orig));
+            } else {
+                LAST_OBS.remove(ok);
+            }
+        }
         if (orig != null && v instanceof Transport && inAnyDepot(level, PTMEntity.getX(v), PTMEntity.getZ(v))) {
             return null;
         }

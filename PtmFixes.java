@@ -765,6 +765,37 @@ public final class PtmFixes {
      * Радиус «прибытия» к точке остановки вместо константы 2.0: если автобус стоит (скорость около нуля)
      * дольше 4 секунд в пределах 14 блоков от точки остановки, считаем, что он прибыл (открываем двери, ждём, едем дальше).
      */
+    private static final Map<Integer, long[]> STAND_LOG = new ConcurrentHashMap<>();
+
+    /** Любой автобус с ИИ, стоящий на месте больше минуты: пишем в лог рейс, место и состояние (раз в 120 секунд). */
+    private static void standLog(Transport t, int key) {
+        try {
+            if (!t.ai || Math.abs(t.speed) >= 0.5F || t.getLineID() < 0) {
+                STAND_LOG.remove(key);
+                return;
+            }
+            long now = System.currentTimeMillis();
+            long x = (long) PTMEntity.getX(t);
+            long z = (long) PTMEntity.getZ(t);
+            long[] rec = STAND_LOG.get(key);
+            if (rec == null || Math.abs(rec[0] - x) > 2L || Math.abs(rec[1] - z) > 2L) {
+                if (STAND_LOG.size() > 500) {
+                    STAND_LOG.clear();
+                }
+                STAND_LOG.put(key, new long[] {x, z, now, 0L});
+                return;
+            }
+            if (now - rec[2] > 60000L && now - rec[3] > 120000L) {
+                rec[3] = now;
+                PTMLogger.info("PTM2 \u0441\u0442\u043e\u0438\u0442: \u043b\u0438\u043d\u0438\u044f " + t.getLineID() + " \u0440\u0435\u0439\u0441 " + t.getRouteID() + " \u043d\u0430 " + x + " " + z
+                    + " " + (now - rec[2]) / 1000L + " \u0441, \u0434\u0432\u0435\u0440\u0438=" + (t.doorsOpen ? "\u043e\u0442\u043a\u0440" : "\u0437\u0430\u043a\u0440")
+                    + stateInfo(t) + obstacleInfo(key));
+            }
+        } catch (Throwable th) {
+            // не критично
+        }
+    }
+
     private static final Map<Integer, java.lang.ref.WeakReference<Vehicle>> LAST_OBS = new ConcurrentHashMap<>();
 
     private static final Map<Integer, long[]> WAIT_LOG = new ConcurrentHashMap<>();
@@ -3027,6 +3058,7 @@ public final class PtmFixes {
     public static Vehicle clearance(Vehicle v, double distance, Vehicle orig, Level level) {
         if (v instanceof Transport) {
             int ok = System.identityHashCode(v);
+            standLog((Transport) v, ok);
             if (orig != null) {
                 if (LAST_OBS.size() > 500) {
                     LAST_OBS.clear();

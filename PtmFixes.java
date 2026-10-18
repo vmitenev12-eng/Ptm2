@@ -92,8 +92,56 @@ public final class PtmFixes {
                 PTMLogger.info("PTM2 fixes loaded: " + BUILD);
             }
             linkStationsAndPlatforms(level);
+            watchVehicles(level);
         } catch (Exception e) {
             PTMLogger.error(e);
+        }
+    }
+
+    private static final Map<Integer, Long> NO_SLOT_LOG = new ConcurrentHashMap<>();
+
+    private static final Map<String, double[]> VEH_WATCH = new HashMap<>();
+    private static long lastVehWatch = 0L;
+
+    /**
+     * Раз в 5 секунд просматривает все записанные модом автобусы: если автобус с линией стоит на месте дольше
+     * полутора минут и не ждёт отправления на остановке по расписанию, пишет его состояние в лог (раз в 3 минуты).
+     */
+    private static void watchVehicles(Level level) {
+        long now = System.currentTimeMillis();
+        if (now - lastVehWatch < 5000L) {
+            return;
+        }
+        lastVehWatch = now;
+        try {
+            Map<String, String> stored = VDStorageHandler.getStrs(level, VDMemoryIDs.TRACKABLE_VEHICLE);
+            VEH_WATCH.keySet().retainAll(stored.keySet());
+            for (Map.Entry<String, String> e : stored.entrySet()) {
+                VDTrackableVehicle v;
+                try {
+                    v = new VDTrackableVehicle(e.getValue());
+                } catch (Exception ex) {
+                    continue;
+                }
+                if (!v.isTransport() || v.lineID < 0 || v.position == null) {
+                    continue;
+                }
+                double x = vc(v.position, 0);
+                double z = vc(v.position, 2);
+                double[] rec = VEH_WATCH.get(e.getKey());
+                if (rec == null || Math.abs(rec[0] - x) > 2.0D || Math.abs(rec[1] - z) > 2.0D) {
+                    VEH_WATCH.put(e.getKey(), new double[] {x, z, now, 0.0D});
+                    continue;
+                }
+                boolean waitingAtStop = v.stopTime > 0L && v.timeToLeave > TimeHelper.now() - 20000L;
+                if (!waitingAtStop && now - (long) rec[2] > 90000L && now - (long) rec[3] > 180000L) {
+                    rec[3] = now;
+                    PTMLogger.info("PTM2 \u0437\u0430\u0432\u0438\u0441: \u043b\u0438\u043d\u0438\u044f " + v.lineID + " \u0440\u0435\u0439\u0441 " + v.routeID + " \u043d\u0430 " + (int) x + " " + (int) z
+                        + " " + (now - (long) rec[2]) / 1000L + " \u0441, " + vehicleDiag(level, v));
+                }
+            }
+        } catch (Throwable t) {
+            // не критично
         }
     }
 
@@ -2939,6 +2987,14 @@ public final class PtmFixes {
             VDRoute route = new VDRoute(raw);
             Slot s = slotFor(level, route.lineID, line);
             if (s == null) {
+                if (resolveDepot(level, line) != null) {
+                    long nowMs = System.currentTimeMillis();
+                    Long last = NO_SLOT_LOG.get(route.lineID);
+                    if (last == null || nowMs - last > 60000L) {
+                        NO_SLOT_LOG.put(route.lineID, nowMs);
+                        PTMLogger.info("PTM2 \u0434\u0435\u043f\u043e: \u0443 \u043b\u0438\u043d\u0438\u0438 " + route.lineID + " \u0434\u0435\u043f\u043e \u0432\u044b\u0431\u0440\u0430\u043d\u043e, \u043d\u043e \u043c\u0435\u0441\u0442\u0430 (\u0432\u044b\u0435\u0437\u0434/\u0432\u044a\u0435\u0437\u0434) \u043d\u0435\u0442, \u0430\u0432\u0442\u043e\u0431\u0443\u0441 \u043f\u043e\u044f\u0432\u043b\u044f\u0435\u0442\u0441\u044f \u043d\u0430 \u043e\u0441\u0442\u0430\u043d\u043e\u0432\u043a\u0435 " + platformID);
+                    }
+                }
                 return platformID;
             }
             List<Integer> stops = VDUtils.parseStops(route.stops);

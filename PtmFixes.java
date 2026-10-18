@@ -813,12 +813,14 @@ public final class PtmFixes {
      * Радиус «прибытия» к точке остановки вместо константы 2.0: если автобус стоит (скорость около нуля)
      * дольше 4 секунд в пределах 14 блоков от точки остановки, считаем, что он прибыл (открываем двери, ждём, едем дальше).
      */
+    private static final Map<Integer, double[]> REACH_POS = new ConcurrentHashMap<>();
+
     private static final Map<Integer, long[]> STAND_LOG = new ConcurrentHashMap<>();
 
     /** Любой автобус с ИИ, стоящий на месте больше минуты: пишем в лог рейс, место и состояние (раз в 120 секунд). */
     private static void standLog(Transport t, int key) {
         try {
-            if (!t.ai || Math.abs(t.speed) >= 0.5F || t.getLineID() < 0) {
+            if (!t.ai || t.getLineID() < 0) {
                 STAND_LOG.remove(key);
                 return;
             }
@@ -851,10 +853,6 @@ public final class PtmFixes {
     /** Если автобус стоит на месте больше минуты, пишем в лог причину (раз в 90 секунд на автобус). */
     private static void waitLog(VDTrackableVehicle v, Vehicle ve, double distance, int key, long now) {
         try {
-            if (Math.abs(ve.speed) >= 0.5F) {
-                WAIT_LOG.remove(key);
-                return;
-            }
             long x = (long) PTMEntity.getX(ve);
             long z = (long) PTMEntity.getZ(ve);
             long[] rec = WAIT_LOG.get(key);
@@ -921,21 +919,20 @@ public final class PtmFixes {
             int key = System.identityHashCode(ve);
             long now = System.currentTimeMillis();
             waitLog(v, ve, distance, key, now);
-            if (distance < 150.0D && Math.abs(ve.speed) < 0.5F) {
-                // автобус уже внутри платформы (сюда попадаем только в этом случае) и стоит: приоритет остаётся за
-                // доездом до расчётной точки (порог 2 блока), но если автобус стоит больше 6 секунд (упёрся в
-                // конец пути, ждёт автобус впереди), он открывает двери там, где стоит
-                Long first = SLOW.get(key);
-                if (first == null) {
-                    if (SLOW.size() > 500) {
-                        SLOW.clear();
-                    }
-                    SLOW.put(key, now);
-                } else if (now - first >= 6000L) {
-                    return 150.0D;
+            // автобус уже внутри платформы (сюда попадаем только в этом случае). Приоритет остаётся за доездом
+            // до расчётной точки (порог 2 блока), но если автобус не сдвигается с места больше 6 секунд
+            // (упёрся в конец пути, ждёт автобус впереди; скорость в записи при этом может быть ненулевой),
+            // он открывает двери там, где стоит.
+            double x = PTMEntity.getX(ve);
+            double z = PTMEntity.getZ(ve);
+            double[] rec = REACH_POS.get(key);
+            if (rec == null || Math.abs(rec[0] - x) > 1.0D || Math.abs(rec[1] - z) > 1.0D) {
+                if (REACH_POS.size() > 500) {
+                    REACH_POS.clear();
                 }
-            } else {
-                SLOW.remove(key);
+                REACH_POS.put(key, new double[] {x, z, now});
+            } else if (distance < 150.0D && now - (long) rec[2] >= 6000L) {
+                return 150.0D;
             }
         } catch (Throwable t) {
             // не ломаем игру

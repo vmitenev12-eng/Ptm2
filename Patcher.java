@@ -136,7 +136,7 @@ public class Patcher implements Opcodes {
         if (mismatch) {
             System.exit(1);
         }
-        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay", "gate-bankcard", "boarding-fare", "gate-exit-radius", "gate-exit-auto", "gate-in-radius", "terminal-cap", "arrival-reach", "arrival-inside", "lamp-cap", "red-commit", "patience", "bypass-still", "merge-check", "player-ahead", "merge-width", "parallel-width", "auto-links", "link-revision", "bus-priority", "validator", "wheel-filter", "hull", "depot-ui", "depot-select", "schedule-toggle", "schedule-real", "depot-order", "depot-spawn", "depot-spawn2", "depot-park", "depot-return", "terminal-pax", "depot-clear", "depot-crash", "gravity-reset"};
+        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay", "gate-bankcard", "boarding-fare", "gate-exit-radius", "gate-exit-auto", "gate-in-radius", "terminal-cap", "arrival-reach", "arrival-inside", "lamp-cap", "red-commit", "patience", "bypass-still", "merge-check", "player-ahead", "merge-width", "parallel-width", "auto-links", "link-revision", "bus-priority", "validator", "wheel-filter", "hull", "depot-ui", "depot-select", "schedule-toggle", "schedule-edit", "schedule-real", "depot-order", "depot-spawn", "depot-spawn2", "depot-park", "depot-return", "terminal-pax", "depot-clear", "depot-crash", "gravity-reset"};
         for (String r : required) {
             if (!done.contains(r)) {
                 System.err.println("ERROR: patch not applied: " + r);
@@ -474,6 +474,27 @@ public class Patcher implements Opcodes {
                         m.instructions.insert(all[i - 1], repl);
                         m.instructions.remove(all[i - 1]);
                         done.add("depot-select");
+                        changed = true;
+                    }
+                }
+            }
+            // Кнопка редактирования расписания доступна и для «реалистичного» типа (при одном рейсе тоже), и открывает
+            // тот же экран и те же данные, что и упрощённое: генератор расписания у них общий.
+            for (MethodNode m : cn.methods) {
+                if (!m.name.startsWith("lambda$")) {
+                    continue;
+                }
+                AbstractInsnNode[] all = m.instructions.toArray();
+                for (int i = 0; i + 1 < all.length; i++) {
+                    if (all[i] instanceof org.objectweb.asm.tree.FieldInsnNode && all[i].getOpcode() == GETFIELD
+                        && ((org.objectweb.asm.tree.FieldInsnNode) all[i]).name.equals("scheduleType")
+                        && (all[i + 1].getOpcode() == IFNE || all[i + 1].getOpcode() == ISTORE)) {
+                        InsnList repl = new InsnList();
+                        repl.add(new InsnNode(POP));
+                        repl.add(new InsnNode(ICONST_0));
+                        m.instructions.insert(all[i], repl);
+                        m.instructions.remove(all[i]);
+                        done.add("schedule-edit");
                         changed = true;
                     }
                 }

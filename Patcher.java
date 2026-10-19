@@ -136,7 +136,7 @@ public class Patcher implements Opcodes {
         if (mismatch) {
             System.exit(1);
         }
-        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay", "gate-bankcard", "boarding-fare", "gate-exit-radius", "gate-exit-auto", "gate-in-radius", "terminal-cap", "arrival-reach", "arrival-inside", "lamp-cap", "red-commit", "patience", "bypass-still", "merge-check", "player-ahead", "merge-width", "parallel-width", "auto-links", "link-revision", "bus-priority", "validator", "wheel-filter", "hull", "depot-ui", "depot-select", "depot-order", "depot-spawn", "depot-spawn2", "depot-park", "depot-return", "terminal-pax", "depot-clear", "depot-crash", "gravity-reset"};
+        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay", "gate-bankcard", "boarding-fare", "gate-exit-radius", "gate-exit-auto", "gate-in-radius", "terminal-cap", "arrival-reach", "arrival-inside", "lamp-cap", "red-commit", "patience", "bypass-still", "merge-check", "player-ahead", "merge-width", "parallel-width", "auto-links", "link-revision", "bus-priority", "validator", "wheel-filter", "hull", "depot-ui", "depot-select", "schedule-toggle", "schedule-real", "depot-order", "depot-spawn", "depot-spawn2", "depot-park", "depot-return", "terminal-pax", "depot-clear", "depot-crash", "gravity-reset"};
         for (String r : required) {
             if (!done.contains(r)) {
                 System.err.println("ERROR: patch not applied: " + r);
@@ -158,7 +158,7 @@ public class Patcher implements Opcodes {
     }
 
     static byte[] patchClass(String name, byte[] data) {
-        boolean target = name.equals(OPD) || name.equals(ATM) || name.equals(VU) || name.equals(VSH) || name.equals(PTE) || name.equals(TRN) || name.equals(GATE_IN) || name.equals(VEH) || name.equals(GATE_EXIT) || name.equals(TM) || name.equals(TBM) || name.equals(VUT) || name.equals(TLU) || name.equals(RPATH) || name.equals(LES);
+        boolean target = name.equals(OPD) || name.equals(ATM) || name.equals(VU) || name.equals(VSH) || name.equals(PTE) || name.equals(TRN) || name.equals(GATE_IN) || name.equals(VEH) || name.equals(GATE_EXIT) || name.equals(TM) || name.equals(TBM) || name.equals(VUT) || name.equals(TLU) || name.equals(RPATH) || name.equals(LES) || name.equals("com/rinventor/ptm2/dimension/virtual/util/ScheduleUtils");
         boolean flags = contains(data, "INDEFINITE_BANK_ACCOUNT") || contains(data, "INDEFINITE_TRANSPORT_CARD");
         if (!target && !flags) {
             return data;
@@ -436,6 +436,22 @@ public class Patcher implements Opcodes {
                 changed = true;
             }
         }
+        if (name.equals("com/rinventor/ptm2/dimension/virtual/util/ScheduleUtils")) {
+            // Линии с «реалистичным» расписанием раньше получали пустое расписание («not implemented yet»):
+            // теперь для них используется тот же генератор, что и для упрощённого.
+            for (MethodNode m : cn.methods) {
+                AbstractInsnNode[] all = m.instructions.toArray();
+                for (int i = 1; i < all.length; i++) {
+                    if (all[i].getOpcode() == ICONST_1 && all[i - 1] instanceof org.objectweb.asm.tree.FieldInsnNode
+                        && ((org.objectweb.asm.tree.FieldInsnNode) all[i - 1]).name.equals("scheduleType")) {
+                        m.instructions.insert(all[i], new InsnNode(ICONST_M1));
+                        m.instructions.remove(all[i]);
+                        done.add("schedule-real");
+                        changed = true;
+                    }
+                }
+            }
+        }
         if (name.equals(LES)) {
             // Выбор депо вручную: обработчик списка записывал в линию номер зоны, а открытие и сохранение экрана
             // работают с порядковым номером в списке. Теперь обработчик тоже записывает порядковый номер.
@@ -459,6 +475,28 @@ public class Patcher implements Opcodes {
                         m.instructions.remove(all[i - 1]);
                         done.add("depot-select");
                         changed = true;
+                    }
+                }
+            }
+            // Переключатель «Реалистичное расписание» больше не сбрасывается (ошибка «в разработке» убрана)
+            for (MethodNode m : cn.methods) {
+                if (!m.name.equals("m_88315_")) {
+                    continue;
+                }
+                AbstractInsnNode[] all = m.instructions.toArray();
+                for (int i = 1; i < all.length; i++) {
+                    if (all[i] instanceof MethodInsnNode && ((MethodInsnNode) all[i]).name.equals("getValue")
+                        && ((MethodInsnNode) all[i]).owner.endsWith("ToggleButton")
+                        && all[i - 1] instanceof org.objectweb.asm.tree.FieldInsnNode
+                        && ((org.objectweb.asm.tree.FieldInsnNode) all[i - 1]).name.equals("BScheduleType")) {
+                        InsnList repl = new InsnList();
+                        repl.add(new InsnNode(POP));
+                        repl.add(new InsnNode(ICONST_0));
+                        m.instructions.insert(all[i], repl);
+                        m.instructions.remove(all[i]);
+                        done.add("schedule-toggle");
+                        changed = true;
+                        break;
                     }
                 }
             }

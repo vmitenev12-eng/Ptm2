@@ -1034,6 +1034,13 @@ public final class PtmFixes {
                     + (noAi > 0 ? ", \u0411\u0415\u0417 \u0418\u0418 (\u0441\u0442\u043e\u044f\u0442)=" + noAi + noAiInfo : "")
                     + ", \u0434\u0435\u043f\u043e=" + depotShort(level, line)));
 
+                int[] rec = recommendedBuses(sched);
+                if (rec != null) {
+                    entries.add(new VDOperationalData(companyID, OperationalSeverity.INFO,
+                        "\u0414\u0418\u0410\u0413: \u043b\u0438\u043d\u0438\u044f " + number + " \u0440\u0435\u043a\u043e\u043c\u0435\u043d\u0434\u0443\u0435\u0442\u0441\u044f \u0430\u0432\u0442\u043e\u0431\u0443\u0441\u043e\u0432: " + rec[0]
+                        + " (\u0440\u0435\u0439\u0441\u043e\u0432 \u0437\u0430 \u0434\u0435\u043d\u044c " + rec[1] + ", \u043e\u0431\u043e\u0440\u043e\u0442 ~" + rec[2] + " \u043c\u0438\u043d, \u0438\u043d\u0442\u0435\u0440\u0432\u0430\u043b ~" + rec[3]
+                        + " \u043c\u0438\u043d, \u0441\u0435\u0439\u0447\u0430\u0441 \u0432 \u0438\u0433\u0440\u0435 " + active + ")"));
+                }
                 if (resolveDepot(level, line) != null) {
                     entries.add(new VDOperationalData(companyID, OperationalSeverity.INFO,
                         "\u0414\u0418\u0410\u0413: \u0434\u0435\u043f\u043e \u043b\u0438\u043d\u0438\u0438 " + number + ": " + depotDiag(level, lineId, line)));
@@ -2912,6 +2919,77 @@ public final class PtmFixes {
     }
 
 
+
+    /**
+     * Рекомендуемое число автобусов линии по расписанию на день: рейсы восстанавливаются из записей расписания
+     * (новый рейс начинается, когда остановка повторяется или время «откатывается»), каждый рейс занимает автобус на
+     * время рейса плюс 5 минут на разворот, ответ равен наибольшему числу одновременно занятых автобусов.
+     * Возвращает {рекомендуется, рейсов, оборот в минутах, интервал в минутах} или null, если расписания нет.
+     */
+    static int[] recommendedBuses(List<Pair<Integer, Pair<Integer, String>>> sched) {
+        try {
+            if (sched == null || sched.isEmpty()) {
+                return null;
+            }
+            List<double[]> trips = new ArrayList<>();
+            java.util.Set<Integer> seen = new java.util.HashSet<>();
+            double wrap = 0.0D;
+            double prevRaw = -1.0D;
+            double first = 0.0D;
+            double last = 0.0D;
+            int count = 0;
+            for (Pair<Integer, Pair<Integer, String>> e : sched) {
+                int platform = e.getSecond().getFirst();
+                double raw = TimeHelper.parseTime(e.getSecond().getSecond());
+                if (raw < 0) {
+                    continue;
+                }
+                if (prevRaw >= 0 && raw < prevRaw - 600.0D) {
+                    wrap += 1440.0D;
+                }
+                double abs = raw + wrap;
+                prevRaw = raw;
+                if (count > 0 && seen.contains(platform)) {
+                    double gap = count > 1 ? (last - first) / (count - 1) : 5.0D;
+                    trips.add(new double[] {first, last + gap});
+                    seen.clear();
+                    count = 0;
+                }
+                if (count == 0) {
+                    first = abs;
+                }
+                last = abs;
+                seen.add(platform);
+                count++;
+            }
+            if (count > 0) {
+                double gap = count > 1 ? (last - first) / (count - 1) : 5.0D;
+                trips.add(new double[] {first, last + gap});
+            }
+            if (trips.isEmpty()) {
+                return null;
+            }
+            List<double[]> events = new ArrayList<>();
+            double sumLen = 0.0D;
+            for (double[] t : trips) {
+                events.add(new double[] {t[0], 1.0D});
+                events.add(new double[] {t[1] + 5.0D, -1.0D});
+                sumLen += t[1] - t[0] + 5.0D;
+            }
+            events.sort((a, b) -> a[0] != b[0] ? Double.compare(a[0], b[0]) : Double.compare(a[1], b[1]));
+            int cur = 0;
+            int peak = 0;
+            for (double[] ev : events) {
+                cur += (int) ev[1];
+                peak = Math.max(peak, cur);
+            }
+            trips.sort((a, b) -> Double.compare(a[0], b[0]));
+            double interval = trips.size() > 1 ? (trips.get(trips.size() - 1)[0] - trips.get(0)[0]) / (trips.size() - 1) : 0.0D;
+            return new int[] {peak, trips.size(), (int) Math.round(sumLen / trips.size()), (int) Math.round(interval)};
+        } catch (Throwable t) {
+            return null;
+        }
+    }
 
     static String depotShort(Level level, VDTransportLine line) {
         try {

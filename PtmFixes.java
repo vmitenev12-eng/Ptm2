@@ -95,12 +95,66 @@ public final class PtmFixes {
             }
             linkStationsAndPlatforms(level);
             watchVehicles(level);
+            summaryLog(level);
         } catch (Exception e) {
             PTMLogger.error(e);
         }
     }
 
     private static final Map<Integer, Long> NO_SLOT_LOG = new ConcurrentHashMap<>();
+
+    private static long lastSummary = 0L;
+
+    /** Раз в 2 минуты пишет в лог сводку по линиям: время, тип расписания, число отправлений, ближайшее, автобусов в игре. */
+    private static void summaryLog(Level level) {
+        long nowMs = System.currentTimeMillis();
+        if (nowMs - lastSummary < 120000L) {
+            return;
+        }
+        lastSummary = nowMs;
+        try {
+            int hour = TimeHelper.hour(level);
+            int minute = TimeHelper.minute(level);
+            int day = Math.floorMod(TimeHelper.weekday(level) - 1, 7);
+            int nowMin = hour * 60 + minute;
+            Map<String, String> stored = VDStorageHandler.getStrs(level, VDMemoryIDs.TRACKABLE_VEHICLE);
+            Map<Integer, Integer> perLine = new HashMap<>();
+            for (String sv : stored.values()) {
+                try {
+                    VDTrackableVehicle tv = new VDTrackableVehicle(sv);
+                    if (tv.isTransport() && tv.lineID >= 0) {
+                        perLine.merge(tv.lineID, 1, Integer::sum);
+                    }
+                } catch (Exception ignored) {
+                    // пропускаем повреждённые записи
+                }
+            }
+            StringBuilder b = new StringBuilder("PTM2 \u043b\u0438\u043d\u0438\u0438: \u0432\u0440\u0435\u043c\u044f " + String.format("%02d:%02d", hour, minute) + " \u0434\u0435\u043d\u044c " + day
+                + (TimeHelper.isTimeStopped(level) ? " (\u0432\u0440\u0435\u043c\u044f \u043e\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d\u043e)" : ""));
+            for (Map.Entry<Integer, String> le : VDStorageHandler.getAll(level, VDMemoryIDs.TRANSPORT_LINE).entrySet()) {
+                VDTransportLine line = new VDTransportLine(le.getValue());
+                List<Pair<Integer, Pair<Integer, String>>> sched = ScheduleUtils.getSimpleScheduleEntriesFor(level, le.getKey(), day);
+                int next = -1;
+                int count = sched == null ? 0 : sched.size();
+                if (sched != null) {
+                    for (Pair<Integer, Pair<Integer, String>> e : sched) {
+                        int tm = (int) TimeHelper.parseTime(e.getSecond().getSecond());
+                        if (tm >= nowMin && (next < 0 || tm < next)) {
+                            next = tm;
+                        }
+                    }
+                }
+                b.append("; \u043b\u0438\u043d\u0438\u044f ").append(le.getKey()).append(" (").append(line.number).append(") \u0442\u0438\u043f ").append(line.scheduleType)
+                    .append(", \u0437\u0430\u043f\u0438\u0441\u0435\u0439 ").append(count)
+                    .append(", \u0431\u043b\u0438\u0436\u0430\u0439\u0448\u0435\u0435 ").append(next >= 0 ? String.format("%02d:%02d", next / 60, next % 60) : "-")
+                    .append(", \u0432 \u0438\u0433\u0440\u0435 ").append(perLine.getOrDefault(le.getKey(), 0))
+                    .append(line.suspended ? ", \u043f\u0440\u0438\u043e\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d\u0430" : "");
+            }
+            PTMLogger.info(b.toString());
+        } catch (Throwable t) {
+            // не критично
+        }
+    }
 
     private static final Map<String, double[]> VEH_WATCH = new HashMap<>();
     private static long lastVehWatch = 0L;

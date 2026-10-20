@@ -136,7 +136,7 @@ public class Patcher implements Opcodes {
         if (mismatch) {
             System.exit(1);
         }
-        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay", "gate-bankcard", "boarding-fare", "gate-exit-radius", "gate-exit-auto", "gate-in-radius", "terminal-cap", "arrival-reach", "arrival-inside", "lamp-cap", "red-commit", "patience", "bypass-still", "merge-check", "player-ahead", "merge-width", "parallel-width", "auto-links", "link-revision", "bus-priority", "validator", "wheel-filter", "hull", "depot-ui", "depot-select", "schedule-toggle", "schedule-edit", "schedule-real", "depot-order", "depot-spawn", "depot-spawn2", "garage-fleet", "depot-park", "depot-return", "terminal-pax", "depot-clear", "depot-crash", "gravity-reset"};
+        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay", "gate-bankcard", "boarding-fare", "gate-exit-radius", "gate-exit-auto", "gate-in-radius", "terminal-cap", "arrival-reach", "arrival-inside", "lamp-cap", "red-commit", "patience", "bypass-still", "merge-check", "player-ahead", "merge-width", "parallel-width", "auto-links", "link-revision", "bus-priority", "validator", "wheel-filter", "hull", "depot-ui", "depot-select", "schedule-toggle", "schedule-edit", "schedule-real", "schedule-cache", "depot-order", "depot-spawn", "depot-spawn2", "garage-fleet", "depot-park", "depot-return", "terminal-pax", "depot-clear", "depot-crash", "gravity-reset"};
         for (String r : required) {
             if (!done.contains(r)) {
                 System.err.println("ERROR: patch not applied: " + r);
@@ -437,6 +437,28 @@ public class Patcher implements Opcodes {
             }
         }
         if (name.equals("com/rinventor/ptm2/dimension/virtual/util/ScheduleUtils")) {
+            // Расписание строится заново при каждом вызове (на каждом тике и на каждую линию): оборачиваем в кэш на 5 секунд
+            final String sdesc = "(Lnet/minecraft/world/level/Level;II)Ljava/util/List;";
+            MethodNode sorig = null;
+            for (MethodNode m : cn.methods) {
+                if (m.name.equals("getSimpleScheduleEntriesFor") && m.desc.equals(sdesc)) {
+                    sorig = m;
+                }
+            }
+            if (sorig != null) {
+                sorig.name = "ptmScheduleEntries";
+                MethodNode w = new MethodNode(ACC_PUBLIC | ACC_STATIC, "getSimpleScheduleEntriesFor", sdesc, null, null);
+                w.instructions.add(new VarInsnNode(ALOAD, 0));
+                w.instructions.add(new VarInsnNode(ILOAD, 1));
+                w.instructions.add(new VarInsnNode(ILOAD, 2));
+                w.instructions.add(new MethodInsnNode(INVOKESTATIC, FIXES, "cachedEntries", sdesc, false));
+                w.instructions.add(new InsnNode(ARETURN));
+                w.maxStack = 3;
+                w.maxLocals = 3;
+                cn.methods.add(w);
+                done.add("schedule-cache");
+                changed = true;
+            }
             // Линии с «реалистичным» расписанием раньше получали пустое расписание («not implemented yet»):
             // теперь для них используется тот же генератор, что и для упрощённого.
             for (MethodNode m : cn.methods) {

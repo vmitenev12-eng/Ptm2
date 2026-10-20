@@ -103,6 +103,48 @@ public final class PtmFixes {
 
     private static final Map<Integer, Long> NO_SLOT_LOG = new ConcurrentHashMap<>();
 
+    private static final class CachedList {
+        final long time;
+        final List<?> list;
+
+        CachedList(long time, List<?> list) {
+            this.time = time;
+            this.list = list;
+        }
+    }
+
+    private static final Map<String, CachedList> SCHEDULE_CACHE = new ConcurrentHashMap<>();
+    private static java.lang.reflect.Method scheduleOrig;
+
+    /**
+     * Кэш расписания линии на 5 секунд. Мод строит расписание заново при каждом вызове (на каждом тике для каждой
+     * линии), а у больших линий в нём тысячи записей. Новые настройки применяются с задержкой не больше 5 секунд.
+     */
+    @SuppressWarnings("unchecked")
+    public static List cachedEntries(Level level, int lineID, int day) {
+        try {
+            String key = System.identityHashCode(level) + ":" + lineID + ":" + day;
+            long now = System.currentTimeMillis();
+            CachedList c = SCHEDULE_CACHE.get(key);
+            if (c != null && now - c.time < 5000L) {
+                return new ArrayList<>(c.list);
+            }
+            if (scheduleOrig == null) {
+                scheduleOrig = Class.forName("com.rinventor.ptm2.dimension.virtual.util.ScheduleUtils")
+                    .getMethod("ptmScheduleEntries", Level.class, int.class, int.class);
+            }
+            List<?> r = (List<?>) scheduleOrig.invoke(null, level, lineID, day);
+            if (SCHEDULE_CACHE.size() > 300) {
+                SCHEDULE_CACHE.clear();
+            }
+            SCHEDULE_CACHE.put(key, new CachedList(now, r));
+            return new ArrayList<>(r);
+        } catch (Throwable t) {
+            PTMLogger.warn("PTM2 fixes: cachedEntries " + t);
+            return new ArrayList();
+        }
+    }
+
     private static long lastSummary = 0L;
 
     /** Раз в 2 минуты пишет в лог сводку по линиям: время, тип расписания, число отправлений, ближайшее, автобусов в игре. */

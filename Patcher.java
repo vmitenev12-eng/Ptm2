@@ -136,7 +136,7 @@ public class Patcher implements Opcodes {
         if (mismatch) {
             System.exit(1);
         }
-        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay", "gate-bankcard", "boarding-fare", "gate-exit-radius", "gate-exit-auto", "gate-in-radius", "terminal-cap", "arrival-reach", "arrival-inside", "lamp-cap", "red-commit", "patience", "bypass-still", "merge-check", "player-ahead", "merge-width", "parallel-width", "auto-links", "link-revision", "bus-priority", "validator", "wheel-filter", "hull", "depot-ui", "depot-select", "schedule-toggle", "schedule-edit", "schedule-real", "depot-order", "depot-spawn", "depot-spawn2", "depot-park", "depot-return", "terminal-pax", "depot-clear", "depot-crash", "gravity-reset"};
+        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay", "gate-bankcard", "boarding-fare", "gate-exit-radius", "gate-exit-auto", "gate-in-radius", "terminal-cap", "arrival-reach", "arrival-inside", "lamp-cap", "red-commit", "patience", "bypass-still", "merge-check", "player-ahead", "merge-width", "parallel-width", "auto-links", "link-revision", "bus-priority", "validator", "wheel-filter", "hull", "depot-ui", "depot-select", "schedule-toggle", "schedule-edit", "schedule-real", "depot-order", "depot-spawn", "depot-spawn2", "garage-fleet", "depot-park", "depot-return", "terminal-pax", "depot-clear", "depot-crash", "gravity-reset"};
         for (String r : required) {
             if (!done.contains(r)) {
                 System.err.println("ERROR: patch not applied: " + r);
@@ -575,6 +575,26 @@ public class Patcher implements Opcodes {
                     m.instructions.insert(l);
                     done.add("depot-spawn2");
                     changed = true;
+                    // постоянные гаражные номера линий с «реалистичным» расписанием (PtmFixes.assignGarage)
+                    AbstractInsnNode[] gi = m.instructions.toArray();
+                    for (int i = 2; i < gi.length; i++) {
+                        if (gi[i].getOpcode() == PUTFIELD && gi[i] instanceof org.objectweb.asm.tree.FieldInsnNode
+                            && ((org.objectweb.asm.tree.FieldInsnNode) gi[i]).name.equals("vehicleID")
+                            && gi[i - 1].getOpcode() == ILOAD && gi[i - 2].getOpcode() == ALOAD) {
+                            InsnList g = new InsnList();
+                            g.add(new VarInsnNode(ALOAD, ((VarInsnNode) gi[i - 2]).var));
+                            g.add(new VarInsnNode(ALOAD, 0));
+                            g.add(new VarInsnNode(ALOAD, 1));
+                            g.add(new VarInsnNode(ILOAD, 2));
+                            g.add(new VarInsnNode(ILOAD, 3));
+                            g.add(new VarInsnNode(ALOAD, 10));
+                            g.add(new MethodInsnNode(INVOKESTATIC, FIXES, "assignGarage",
+                                "(Lcom/rinventor/ptm2/dimension/virtual/types/VDTrackableVehicle;Lnet/minecraft/world/level/Level;Lcom/rinventor/ptm2/dimension/virtual/types/VDTransportLine;IILjava/util/List;)V", false));
+                            m.instructions.insert(gi[i], g);
+                            done.add("garage-fleet");
+                            break;
+                        }
+                    }
                 }
                 if (m.name.equals("trackRoutesAndSchedules")) {
                     for (AbstractInsnNode insn : m.instructions.toArray()) {

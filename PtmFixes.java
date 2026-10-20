@@ -37,6 +37,8 @@ import com.rinventor.ptm2.dimension.virtual.types.VDRoadMarking;
 import com.rinventor.ptm2.dimension.virtual.types.VDTrafficLane;
 import net.minecraft.core.BlockPos;
 import com.rinventor.ptm2.dimension.physical.VehicleUtils;
+import com.rinventor.ptm2.dimension.virtual.types.VDTransportCompany;
+import com.rinventor.ptm2.dimension.virtual.types.VDSchedule;
 import com.rinventor.ptm2.objects.entities.pedestrian.Pedestrian;
 import com.rinventor.ptm2.objects.entities.vehicle.Transport;
 import java.util.ArrayDeque;
@@ -1039,7 +1041,7 @@ public final class PtmFixes {
                     entries.add(new VDOperationalData(companyID, OperationalSeverity.INFO,
                         "\u0414\u0418\u0410\u0413: \u043b\u0438\u043d\u0438\u044f " + number + " \u0440\u0435\u043a\u043e\u043c\u0435\u043d\u0434\u0443\u0435\u0442\u0441\u044f \u0430\u0432\u0442\u043e\u0431\u0443\u0441\u043e\u0432: " + rec[0]
                         + " (\u0440\u0435\u0439\u0441\u043e\u0432 \u0437\u0430 \u0434\u0435\u043d\u044c " + rec[1] + ", \u043e\u0431\u043e\u0440\u043e\u0442 ~" + rec[2] + " \u043c\u0438\u043d, \u0438\u043d\u0442\u0435\u0440\u0432\u0430\u043b ~" + rec[3]
-                        + " \u043c\u0438\u043d, \u0441\u0435\u0439\u0447\u0430\u0441 \u0432 \u0438\u0433\u0440\u0435 " + active + ")"));
+                        + " \u043c\u0438\u043d, \u0441\u0435\u0439\u0447\u0430\u0441 \u0432 \u0438\u0433\u0440\u0435 " + active + ")" + fleetInfo(level, lineId)));
                 }
                 if (resolveDepot(level, line) != null) {
                     entries.add(new VDOperationalData(companyID, OperationalSeverity.INFO,
@@ -2989,6 +2991,112 @@ public final class PtmFixes {
         } catch (Throwable t) {
             return null;
         }
+    }
+
+    /**
+     * Гаражные номера по линиям с «реалистичным» расписанием: у линии есть постоянный список номеров (парк), он
+     * хранится в поле «временная шкала» расписания (номер транспорта и пока пустой список рейсов). Новый автобус линии
+     * получает первый номер парка, который сейчас не занят живым автобусом этой линии; если свободных нет и парк
+     * не больше 40, в парк добавляется новый номер из диапазона компании. Так на линии работают одни и те же номера,
+     * а их число само равно числу одновременно нужных автобусов.
+     */
+    public static void assignGarage(VDTrackableVehicle v, Level level, VDTransportLine line, int lineID, int routeID,
+                                    List<VDTrackableVehicle> stored) {
+        try {
+            if (v == null || line == null || line.scheduleType != 1) {
+                return;
+            }
+            Integer scheduleKey = null;
+            VDSchedule schedule = null;
+            for (Map.Entry<Integer, String> e : VDStorageHandler.getAll(level, VDMemoryIDs.SCHEDULE).entrySet()) {
+                VDSchedule sc = new VDSchedule(e.getValue());
+                if (sc.lineID == lineID) {
+                    scheduleKey = e.getKey();
+                    schedule = sc;
+                    break;
+                }
+            }
+            if (schedule == null || scheduleKey == null) {
+                return;
+            }
+            java.util.Set<Integer> busy = new java.util.HashSet<>();
+            if (stored != null) {
+                for (VDTrackableVehicle o : stored) {
+                    if (o != null && o != v && o.vehicleID >= 0) {
+                        busy.add(o.vehicleID);
+                    }
+                }
+            }
+            for (Pair<Integer, List<Pair<Integer, Integer>>> f : schedule.timeline) {
+                int n = f.getFirst();
+                if (n >= 0 && !busy.contains(n)) {
+                    v.vehicleID = n;
+                    return;
+                }
+            }
+            if (schedule.timeline.size() >= 40) {
+                return;
+            }
+            String companyData = VDStorageHandler.get(level, line.companyID, VDMemoryIDs.TRANSPORT_COMPANY);
+            if (companyData == null || companyData.isEmpty()) {
+                return;
+            }
+            VDTransportCompany company = new VDTransportCompany(companyData);
+            java.util.Set<Integer> used = new java.util.HashSet<>(busy);
+            for (Map.Entry<Integer, String> e : VDStorageHandler.getAll(level, VDMemoryIDs.SCHEDULE).entrySet()) {
+                for (Pair<Integer, List<Pair<Integer, Integer>>> f : new VDSchedule(e.getValue()).timeline) {
+                    used.add(f.getFirst());
+                }
+            }
+            int number = -1;
+            for (int attempt = 0; attempt < 30; attempt++) {
+                int cand = VehicleUtils.newVehicleID(company, VehicleTypes.fromID(line.type));
+                if (cand >= 0 && !used.contains(cand)) {
+                    number = cand;
+                    break;
+                }
+            }
+            if (number < 0) {
+                return;
+            }
+            schedule.timeline.add(Pair.of(number, new ArrayList<Pair<Integer, Integer>>()));
+            VDStorageHandler.update(level, scheduleKey, schedule.toString());
+            v.vehicleID = number;
+            PTMLogger.info("PTM2 \u043f\u0430\u0440\u043a: \u043b\u0438\u043d\u0438\u044f " + lineID + " \u043f\u043e\u043b\u0443\u0447\u0438\u043b\u0430 \u043d\u043e\u0432\u044b\u0439 \u0433\u0430\u0440\u0430\u0436\u043d\u044b\u0439 \u043d\u043e\u043c\u0435\u0440 " + number
+                + " (\u0432 \u043f\u0430\u0440\u043a\u0435 " + schedule.timeline.size() + ")");
+        } catch (Throwable t) {
+            PTMLogger.warn("PTM2 fixes: assignGarage " + t);
+        }
+    }
+
+    /** Парк линии с реалистичным расписанием: сколько гаражных номеров закреплено и какие. */
+    static String fleetInfo(Level level, int lineId) {
+        try {
+            for (Map.Entry<Integer, String> e : VDStorageHandler.getAll(level, VDMemoryIDs.SCHEDULE).entrySet()) {
+                VDSchedule sc = new VDSchedule(e.getValue());
+                if (sc.lineID == lineId) {
+                    if (sc.timeline.isEmpty()) {
+                        return "";
+                    }
+                    StringBuilder b = new StringBuilder(", \u0432 \u043f\u0430\u0440\u043a\u0435 " + sc.timeline.size() + ": ");
+                    int shown = 0;
+                    for (Pair<Integer, List<Pair<Integer, Integer>>> f : sc.timeline) {
+                        if (shown++ > 0) {
+                            b.append(", ");
+                        }
+                        b.append(f.getFirst());
+                        if (shown >= 12) {
+                            b.append("\u2026");
+                            break;
+                        }
+                    }
+                    return b.toString();
+                }
+            }
+        } catch (Throwable t) {
+            // не критично
+        }
+        return "";
     }
 
     static String depotShort(Level level, VDTransportLine line) {

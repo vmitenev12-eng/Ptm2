@@ -610,8 +610,9 @@ public class Patcher implements Opcodes {
                             g.add(new VarInsnNode(ILOAD, 2));
                             g.add(new VarInsnNode(ILOAD, 3));
                             g.add(new VarInsnNode(ALOAD, 10));
+                            g.add(new VarInsnNode(LLOAD, 6));
                             g.add(new MethodInsnNode(INVOKESTATIC, FIXES, "assignGarage",
-                                "(Lcom/rinventor/ptm2/dimension/virtual/types/VDTrackableVehicle;Lnet/minecraft/world/level/Level;Lcom/rinventor/ptm2/dimension/virtual/types/VDTransportLine;IILjava/util/List;)V", false));
+                                "(Lcom/rinventor/ptm2/dimension/virtual/types/VDTrackableVehicle;Lnet/minecraft/world/level/Level;Lcom/rinventor/ptm2/dimension/virtual/types/VDTransportLine;IILjava/util/List;J)V", false));
                             m.instructions.insert(gi[i], g);
                             done.add("garage-fleet");
                             break;

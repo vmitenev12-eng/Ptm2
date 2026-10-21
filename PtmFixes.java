@@ -96,12 +96,277 @@ public final class PtmFixes {
             linkStationsAndPlatforms(level);
             watchVehicles(level);
             summaryLog(level);
+            loadTimetableFile(level);
         } catch (Exception e) {
             PTMLogger.error(e);
         }
     }
 
     private static final Map<Integer, Long> NO_SLOT_LOG = new ConcurrentHashMap<>();
+
+    // ---------------------------------------------------------------------------------------------
+    // Ручное (точное) расписание линий с «реалистичным» типом.
+    // Хранится в поле «временная шкала» расписания: для каждого гаражного номера список пар
+    // (время, рейс), где время = день недели * 1440 + минута суток (понедельник = 0), рейс = номер записи рейса.
+    // Если в шкале есть хотя бы одно время, расписание линии строится из неё (по дням, точно), число автобусов
+    // задаётся самой таблицей и не зависит от рекомендаций. Иначе работает автоматическое расписание по интервалам.
+    // Место под будущую кнопку «добавить автобус из инвентаря в парк компании»: список номеров парка здесь же.
+    // ---------------------------------------------------------------------------------------------
+
+    private static java.lang.reflect.Method schedGroups;
+    private static java.lang.reflect.Method schedStopTimes;
+    private static java.lang.reflect.Method msPerMinute;
+
+    private static VDSchedule scheduleOf(Level level, int lineID, int[] keyOut) {
+        for (Map.Entry<Integer, String> e : VDStorageHandler.getAll(level, VDMemoryIDs.SCHEDULE).entrySet()) {
+            VDSchedule sc = new VDSchedule(e.getValue());
+            if (sc.lineID == lineID) {
+                if (keyOut != null) {
+                    keyOut[0] = e.getKey();
+                }
+                return sc;
+            }
+        }
+        return null;
+    }
+
+    private static boolean hasManualTimes(VDSchedule sc) {
+        if (sc == null || sc.timeline == null) {
+            return false;
+        }
+        for (Pair<Integer, List<Pair<Integer, Integer>>> v : sc.timeline) {
+            if (v.getSecond() != null && !v.getSecond().isEmpty()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Записи расписания линии на день из ручной таблицы или null, если у линии автоматическое расписание. */
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    static List manualEntries(Level level, int lineID, int day) {
+        try {
+            String lineData = VDStorageHandler.get(level, lineID, VDMemoryIDs.TRANSPORT_LINE);
+            if (lineData == null || lineData.isEmpty() || new VDTransportLine(lineData).scheduleType != 1) {
+                return null;
+            }
+            VDSchedule sc = scheduleOf(level, lineID, null);
+            if (!hasManualTimes(sc)) {
+                return null;
+            }
+            Map<Integer, VDRoute> routes = new HashMap<>();
+            List<Pair<Integer, List<Integer>>> byRoute = new ArrayList<>();
+            for (Map.Entry<Integer, String> e : VDStorageHandler.getAll(level, VDMemoryIDs.ROUTE).entrySet()) {
+                VDRoute r = new VDRoute(e.getValue());
+                if (r.lineID == lineID && r.stops != null && r.stops.length != 0) {
+                    List<Integer> stops = com.rinventor.ptm2.engine.computing.Converter.toIntList(r.stops);
+                    if (stops.size() >= 2) {
+                        routes.put(e.getKey(), r);
+                        byRoute.add(Pair.of(e.getKey(), stops));
+                    }
+                }
+            }
+            List result = new ArrayList();
+            if (byRoute.isEmpty()) {
+                return result;
+            }
+            byRoute.sort(java.util.Comparator.comparingInt(Pair::getFirst));
+            Class<?> su = Class.forName("com.rinventor.ptm2.dimension.virtual.util.ScheduleUtils");
+            if (schedGroups == null) {
+                schedGroups = su.getDeclaredMethod("buildRouteStopGroups", List.class);
+                schedGroups.setAccessible(true);
+                schedStopTimes = su.getDeclaredMethod("buildStopTimes", List.class, Map.class, int.class, int.class);
+                schedStopTimes.setAccessible(true);
+            }
+            List<List<Pair<Integer, Integer>>> groups = (List<List<Pair<Integer, Integer>>>) schedGroups.invoke(null, byRoute);
+            for (Pair<Integer, List<Pair<Integer, Integer>>> veh : sc.timeline) {
+                for (Pair<Integer, Integer> tr : veh.getSecond()) {
+                    int t = tr.getFirst();
+                    if (Math.floorDiv(t, 1440) != day) {
+                        continue;
+                    }
+                    int minute = Math.floorMod(t, 1440);
+                    int routeID = tr.getSecond();
+                    List<Pair<Integer, Integer>> group = null;
+                    for (List<Pair<Integer, Integer>> g : groups) {
+                        if (!g.isEmpty() && g.get(0).getFirst() == routeID) {
+                            group = g;
+                            break;
+                        }
+                    }
+                    if (group == null) {
+                        continue;
+                    }
+                    List<Pair<Integer, Pair<Integer, Integer>>> st = (List<Pair<Integer, Pair<Integer, Integer>>>) schedStopTimes.invoke(null, group, routes, day, minute);
+                    if (st == null || st.isEmpty()) {
+                        continue;
+                    }
+                    st.remove(st.size() - 1);
+                    for (Pair<Integer, Pair<Integer, Integer>> x : st) {
+                        result.add(Pair.of(x.getFirst(), Pair.of(x.getSecond().getFirst(), TimeHelper.formatTime(Math.floorMod(x.getSecond().getSecond(), 1440)))));
+                    }
+                }
+            }
+            return result;
+        } catch (Throwable t) {
+            PTMLogger.warn("PTM2 fixes: manualEntries " + t);
+            return null;
+        }
+    }
+
+    /** Гаражный номер из ручной таблицы для выезда (рейс, время): ищется по дню недели и минуте с допуском 1 минута. */
+    static int manualVehicle(Level level, VDSchedule sc, int routeID, long routeSet) {
+        try {
+            if (msPerMinute == null) {
+                msPerMinute = Class.forName("com.rinventor.ptm2.dimension.physical.TransportManager").getDeclaredMethod("millisPerGameMinute", Level.class);
+                msPerMinute.setAccessible(true);
+            }
+            long ms = (Long) msPerMinute.invoke(null, level);
+            int nowMin = TimeHelper.hour(level) * 60 + TimeHelper.minute(level);
+            int day = Math.floorMod(TimeHelper.weekday(level) - 1, 7);
+            long diff = Math.round((routeSet - TimeHelper.now()) / (double) ms);
+            int dep = nowMin + (int) diff;
+            int dDay = Math.floorMod(day + Math.floorDiv(dep, 1440), 7);
+            int dMin = Math.floorMod(dep, 1440);
+            for (Pair<Integer, List<Pair<Integer, Integer>>> v : sc.timeline) {
+                for (Pair<Integer, Integer> tr : v.getSecond()) {
+                    int t = tr.getFirst();
+                    if (Math.floorDiv(t, 1440) == dDay && tr.getSecond() == routeID && Math.abs(Math.floorMod(t, 1440) - dMin) <= 1) {
+                        return v.getFirst();
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            // не критично
+        }
+        return -1;
+    }
+
+    private static long lastTimetableFile = 0L;
+    private static int timetableHash = 0;
+
+    private static final String[] DAY_NAMES = {"\u043f\u043d", "\u0432\u0442", "\u0441\u0440", "\u0447\u0442", "\u043f\u0442", "\u0441\u0431", "\u0432\u0441"};
+
+    /**
+     * Загрузка ручной таблицы из файла config/ptm2-timetable.txt (раз в 30 секунд, при изменении файла). Строка файла:
+     *   линия 6: 1764 пн,ср,пт 09:00 13:00 17:00 рейс 1
+     * (номер линии как в её настройках; гаражный номер; дни через запятую или «все»; времена выезда; «рейс» необязателен,
+     * по умолчанию первый). Строки с тем же номером линии объединяются, начинаются с # — комментарии. Для линии,
+     * которая есть в файле, старая таблица заменяется целиком. Это временный способ ввода, пока нет экрана редактирования.
+     */
+    private static void loadTimetableFile(Level level) {
+        long nowMs = System.currentTimeMillis();
+        if (nowMs - lastTimetableFile < 30000L) {
+            return;
+        }
+        lastTimetableFile = nowMs;
+        try {
+            java.nio.file.Path path = java.nio.file.Paths.get("config", "ptm2-timetable.txt");
+            if (!java.nio.file.Files.exists(path)) {
+                return;
+            }
+            String text = new String(java.nio.file.Files.readAllBytes(path), java.nio.charset.StandardCharsets.UTF_8);
+            int hash = text.hashCode();
+            if (hash == timetableHash) {
+                return;
+            }
+            timetableHash = hash;
+            Map<String, Map<Integer, List<int[]>>> byLine = new java.util.LinkedHashMap<>();
+            int bad = 0;
+            for (String raw : text.split("\\r?\\n")) {
+                String ln = raw.trim();
+                if (ln.isEmpty() || ln.startsWith("#")) {
+                    continue;
+                }
+                try {
+                    int colon = ln.indexOf(':');
+                    String head = ln.substring(0, colon).trim();
+                    if (!head.toLowerCase().startsWith("\u043b\u0438\u043d\u0438\u044f")) {
+                        throw new IllegalArgumentException("head");
+                    }
+                    String lineNum = head.substring(5).trim();
+                    String[] tok = ln.substring(colon + 1).trim().split("\\s+");
+                    int garage = Integer.parseInt(tok[0]);
+                    java.util.Set<Integer> days = new java.util.TreeSet<>();
+                    for (String d : tok[1].toLowerCase().split(",")) {
+                        if (d.equals("\u0432\u0441\u0435")) {
+                            for (int i = 0; i < 7; i++) {
+                                days.add(i);
+                            }
+                        } else {
+                            int idx = java.util.Arrays.asList(DAY_NAMES).indexOf(d);
+                            if (idx < 0) {
+                                throw new IllegalArgumentException("day " + d);
+                            }
+                            days.add(idx);
+                        }
+                    }
+                    int routeIdx = 1;
+                    List<Integer> times = new ArrayList<>();
+                    for (int i = 2; i < tok.length; i++) {
+                        if (tok[i].equalsIgnoreCase("\u0440\u0435\u0439\u0441")) {
+                            routeIdx = Integer.parseInt(tok[++i]);
+                        } else {
+                            int m = (int) TimeHelper.parseTime(tok[i]);
+                            if (m < 0) {
+                                throw new IllegalArgumentException("time " + tok[i]);
+                            }
+                            times.add(m);
+                        }
+                    }
+                    List<int[]> list = byLine.computeIfAbsent(lineNum, k -> new java.util.LinkedHashMap<Integer, List<int[]>>()).computeIfAbsent(garage, k -> new ArrayList<>());
+                    for (int d : days) {
+                        for (int m : times) {
+                            list.add(new int[] {d * 1440 + m, routeIdx});
+                        }
+                    }
+                } catch (Exception ex) {
+                    bad++;
+                    PTMLogger.warn("PTM2 \u0440\u0430\u0441\u043f\u0438\u0441\u0430\u043d\u0438\u0435: \u0441\u0442\u0440\u043e\u043a\u0430 \u0444\u0430\u0439\u043b\u0430 \u043d\u0435 \u0440\u0430\u0437\u043e\u0431\u0440\u0430\u043d\u0430: " + ln + " (" + ex.getMessage() + ")");
+                }
+            }
+            for (Map.Entry<Integer, String> le : VDStorageHandler.getAll(level, VDMemoryIDs.TRANSPORT_LINE).entrySet()) {
+                VDTransportLine line = new VDTransportLine(le.getValue());
+                Map<Integer, List<int[]>> vehs = byLine.get(String.valueOf(line.number).trim());
+                if (vehs == null) {
+                    continue;
+                }
+                int[] key = new int[1];
+                VDSchedule sc = scheduleOf(level, le.getKey(), key);
+                if (sc == null) {
+                    PTMLogger.warn("PTM2 \u0440\u0430\u0441\u043f\u0438\u0441\u0430\u043d\u0438\u0435: \u0443 \u043b\u0438\u043d\u0438\u0438 " + line.number + " \u043d\u0435\u0442 \u0437\u0430\u043f\u0438\u0441\u0438 \u0440\u0430\u0441\u043f\u0438\u0441\u0430\u043d\u0438\u044f, \u0441\u043d\u0430\u0447\u0430\u043b\u0430 \u0441\u043e\u0445\u0440\u0430\u043d\u0438\u0442\u0435 \u0435\u0451 \u0432 \u0440\u0435\u0434\u0430\u043a\u0442\u043e\u0440\u0435");
+                    continue;
+                }
+                List<Integer> routeIds = new ArrayList<>();
+                for (Map.Entry<Integer, String> re : VDStorageHandler.getAll(level, VDMemoryIDs.ROUTE).entrySet()) {
+                    VDRoute r = new VDRoute(re.getValue());
+                    if (r.lineID == le.getKey() && r.stops != null && r.stops.length >= 2) {
+                        routeIds.add(re.getKey());
+                    }
+                }
+                java.util.Collections.sort(routeIds);
+                List<Pair<Integer, List<Pair<Integer, Integer>>>> tl = new ArrayList<>();
+                int trips = 0;
+                for (Map.Entry<Integer, List<int[]>> ve : vehs.entrySet()) {
+                    List<Pair<Integer, Integer>> items = new ArrayList<>();
+                    for (int[] it : ve.getValue()) {
+                        if (it[1] >= 1 && it[1] <= routeIds.size()) {
+                            items.add(Pair.of(it[0], routeIds.get(it[1] - 1)));
+                            trips++;
+                        }
+                    }
+                    items.sort(java.util.Comparator.comparingInt(Pair::getFirst));
+                    tl.add(Pair.of(ve.getKey(), items));
+                }
+                sc.timeline = tl;
+                VDStorageHandler.update(level, key[0], sc.toString());
+                SCHEDULE_CACHE.clear();
+                PTMLogger.info("PTM2 \u0440\u0430\u0441\u043f\u0438\u0441\u0430\u043d\u0438\u0435: \u043b\u0438\u043d\u0438\u044f " + line.number + " \u0437\u0430\u0433\u0440\u0443\u0436\u0435\u043d\u0430 \u0438\u0437 \u0444\u0430\u0439\u043b\u0430: \u0430\u0432\u0442\u043e\u0431\u0443\u0441\u043e\u0432 " + tl.size() + ", \u0432\u044b\u0435\u0437\u0434\u043e\u0432 \u0432 \u043d\u0435\u0434\u0435\u043b\u044e " + trips + (bad > 0 ? ", \u043e\u0448\u0438\u0431\u043e\u043a " + bad : ""));
+            }
+        } catch (Throwable t) {
+            PTMLogger.warn("PTM2 fixes: loadTimetableFile " + t);
+        }
+    }
 
     private static final class CachedList {
         final long time;
@@ -129,6 +394,11 @@ public final class PtmFixes {
             if (c != null && now - c.time < 5000L) {
                 return new ArrayList<>(c.list);
             }
+            List<?> manual = manualEntries(level, lineID, day);
+            if (manual != null) {
+                SCHEDULE_CACHE.put(key, new CachedList(now, manual));
+                return new ArrayList<>(manual);
+            }
             if (scheduleOrig == null) {
                 scheduleOrig = Class.forName("com.rinventor.ptm2.dimension.virtual.util.ScheduleUtils")
                     .getMethod("ptmScheduleEntries", Level.class, int.class, int.class);
@@ -143,6 +413,23 @@ public final class PtmFixes {
             PTMLogger.warn("PTM2 fixes: cachedEntries " + t);
             return new ArrayList();
         }
+    }
+
+    /** Краткие настройки расписания линии для сводки в логе: время, интервалы, режим 24/7 и ночные дни. */
+    private static String scheduleBrief(Level level, int lineId) {
+        try {
+            for (Map.Entry<Integer, String> e : VDStorageHandler.getAll(level, VDMemoryIDs.SCHEDULE).entrySet()) {
+                VDSchedule sc = new VDSchedule(e.getValue());
+                if (sc.lineID == lineId) {
+                    return " [" + sc.firstAfter + "-" + sc.lastBefore + ", \u0438\u043d\u0442\u0435\u0440\u0432\u0430\u043b\u044b " + sc.interval1 + "/" + sc.interval2 + "/" + sc.interval3
+                        + ", \u043f\u0438\u043a " + sc.rushHourInterval + ", \u043d\u043e\u0447\u044c " + sc.nightInterval + ", 24/7=" + (sc.operating24 ? "\u0434\u0430" : "\u043d\u0435\u0442")
+                        + ", \u043d\u043e\u0447\u043d\u044b\u0435 \u0434\u043d\u0438 " + sc.nightOpDays + "]";
+                }
+            }
+        } catch (Throwable t) {
+            // не критично
+        }
+        return "";
     }
 
     private static long lastSummary = 0L;
@@ -190,7 +477,8 @@ public final class PtmFixes {
                     .append(", \u0437\u0430\u043f\u0438\u0441\u0435\u0439 ").append(count)
                     .append(", \u0431\u043b\u0438\u0436\u0430\u0439\u0448\u0435\u0435 ").append(next >= 0 ? String.format("%02d:%02d", next / 60, next % 60) : "-")
                     .append(", \u0432 \u0438\u0433\u0440\u0435 ").append(perLine.getOrDefault(le.getKey(), 0))
-                    .append(line.suspended ? ", \u043f\u0440\u0438\u043e\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d\u0430" : "");
+                    .append(line.suspended ? ", \u043f\u0440\u0438\u043e\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d\u0430" : "")
+                    .append(scheduleBrief(level, le.getKey()));
             }
             PTMLogger.info(b.toString());
         } catch (Throwable t) {
@@ -3097,7 +3385,7 @@ public final class PtmFixes {
      * а их число само равно числу одновременно нужных автобусов.
      */
     public static void assignGarage(VDTrackableVehicle v, Level level, VDTransportLine line, int lineID, int routeID,
-                                    List<VDTrackableVehicle> stored) {
+                                    List<VDTrackableVehicle> stored, long routeSet) {
         try {
             if (v == null || line == null || line.scheduleType != 1) {
                 return;
@@ -3114,6 +3402,13 @@ public final class PtmFixes {
             }
             if (schedule == null || scheduleKey == null) {
                 return;
+            }
+            if (hasManualTimes(schedule)) {
+                int mv = manualVehicle(level, schedule, routeID, routeSet);
+                if (mv >= 0) {
+                    v.vehicleID = mv;
+                    return;
+                }
             }
             java.util.Set<Integer> busy = new java.util.HashSet<>();
             if (stored != null) {

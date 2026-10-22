@@ -56,6 +56,11 @@ import com.rinventor.ptm2.engine.base.PTMLogger;
 import com.rinventor.ptm2.engine.base.PTMScreen;
 import com.rinventor.ptm2.engine.base.PTMWorld;
 import com.rinventor.ptm2.engine.util.Translation;
+import com.rinventor.ptm2.dimension.digital.rows.TimetableRowLayout;
+import com.rinventor.ptm2.engine.component.LayoutListBox;
+import com.rinventor.ptm2.engine.component.IconButton;
+import com.rinventor.ptm2.engine.component.TimeBox;
+import com.rinventor.ptm2.engine.component.ComboBox;
 import com.rinventor.ptm2.objects.blockentities.atm.ATMMenu;
 import java.util.HashMap;
 import java.util.Map;
@@ -365,6 +370,308 @@ public final class PtmFixes {
             }
         } catch (Throwable t) {
             PTMLogger.warn("PTM2 fixes: loadTimetableFile " + t);
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Экран редактирования ручного расписания (ScheduleEditScreen, заготовка автора): патчи в Patcher подменяют
+    // пустые методы экрана вызовами ниже. День недели выбирается в списке «вариант», рейс — в списке рейса,
+    // строки списка — времена выезда. Выезды, добавленные в экране, хранятся под номером транспорта -1
+    // («номер назначается автоматически»); номера, заданные файлом, сохраняются как есть.
+    // ---------------------------------------------------------------------------------------------
+
+    private static final Map<Object, VDSchedule> EDIT_STATE = new java.util.WeakHashMap<>();
+
+    private static Object screenField(Object screen, String name) throws Exception {
+        Class<?> c = screen.getClass();
+        while (c != null) {
+            try {
+                java.lang.reflect.Field f = c.getDeclaredField(name);
+                f.setAccessible(true);
+                return f.get(screen);
+            } catch (NoSuchFieldException e) {
+                c = c.getSuperclass();
+            }
+        }
+        throw new NoSuchFieldException(name);
+    }
+
+    private static VDSchedule editSchedule(Object screen) throws Exception {
+        VDSchedule sc = EDIT_STATE.get(screen);
+        if (sc == null) {
+            Level level = (Level) screenField(screen, "level");
+            int id = (Integer) screenField(screen, "scheduleID");
+            sc = new VDSchedule(VDStorageHandler.get(level, id, VDMemoryIDs.SCHEDULE));
+            EDIT_STATE.put(screen, sc);
+        }
+        return sc;
+    }
+
+    private static void editSave(Object screen, VDSchedule sc) throws Exception {
+        Level level = (Level) screenField(screen, "level");
+        int id = (Integer) screenField(screen, "scheduleID");
+        VDStorageHandler.update(level, id, sc.toString());
+    }
+
+    private static int editDay(Object screen) throws Exception {
+        int d = ((ComboBox) screenField(screen, "CBOption")).getSelectedIndex();
+        return d < 0 ? 0 : d;
+    }
+
+    private static int editRoute(Object screen, int which) throws Exception {
+        Object v = screenField(screen, which == 1 ? "routeID1" : "routeID2");
+        return v == null ? -1 : (Integer) v;
+    }
+
+    private static String fmtMin(int m) {
+        return String.format("%02d:%02d", m / 60, m % 60);
+    }
+
+    private static int parseHM(String s) {
+        if (s == null || s.length() != 5 || s.charAt(2) != ':') {
+            return -1;
+        }
+        try {
+            int h = Integer.parseInt(s.substring(0, 2));
+            int m = Integer.parseInt(s.substring(3, 5));
+            return h < 24 && m < 60 ? h * 60 + m : -1;
+        } catch (NumberFormatException e) {
+            return -1;
+        }
+    }
+
+    /** Маршруты линии, с которых начинается цепочка рейсов (на них строятся выезды). */
+    @SuppressWarnings("unchecked")
+    private static java.util.Set<Integer> groupFirstRoutes(Level level, int lineID) {
+        java.util.Set<Integer> res = new java.util.HashSet<>();
+        try {
+            List<Pair<Integer, List<Integer>>> byRoute = new ArrayList<>();
+            for (Map.Entry<Integer, String> e : VDStorageHandler.getAll(level, VDMemoryIDs.ROUTE).entrySet()) {
+                VDRoute r = new VDRoute(e.getValue());
+                if (r.lineID == lineID && r.stops != null && r.stops.length != 0) {
+                    List<Integer> stops = com.rinventor.ptm2.engine.computing.Converter.toIntList(r.stops);
+                    if (stops.size() >= 2) {
+                        byRoute.add(Pair.of(e.getKey(), stops));
+                    }
+                }
+            }
+            byRoute.sort(java.util.Comparator.comparingInt(Pair::getFirst));
+            if (schedGroups == null) {
+                Class<?> su = Class.forName("com.rinventor.ptm2.dimension.virtual.util.ScheduleUtils");
+                schedGroups = su.getDeclaredMethod("buildRouteStopGroups", List.class);
+                schedGroups.setAccessible(true);
+                schedStopTimes = su.getDeclaredMethod("buildStopTimes", List.class, Map.class, int.class, int.class);
+                schedStopTimes.setAccessible(true);
+            }
+            for (List<Pair<Integer, Integer>> g : (List<List<Pair<Integer, Integer>>>) schedGroups.invoke(null, byRoute)) {
+                if (!g.isEmpty()) {
+                    res.add(g.get(0).getFirst());
+                }
+            }
+        } catch (Throwable t) {
+            // не критично
+        }
+        return res;
+    }
+
+    private static List<Pair<Integer, Integer>> autoVehicleList(VDSchedule sc) {
+        for (Pair<Integer, List<Pair<Integer, Integer>>> v : sc.timeline) {
+            if (v.getFirst() == -1) {
+                return v.getSecond();
+            }
+        }
+        List<Pair<Integer, Integer>> items = new ArrayList<>();
+        sc.timeline.add(Pair.of(-1, items));
+        return items;
+    }
+
+    /** Список «вариант» = дни недели; пустая таблица заполняется из текущего автоматического расписания. */
+    public static void editorOptions(Object screen) {
+        try {
+            ComboBox cb = (ComboBox) screenField(screen, "CBOption");
+            int selected = cb.getSelectedIndex();
+            List<String> names = new ArrayList<>(Translation.getList("ptm2.schedule.interval_options"));
+            if (names.size() != 7) {
+                names = new ArrayList<>(java.util.Arrays.asList("\u041f\u043d", "\u0412\u0442", "\u0421\u0440", "\u0427\u0442", "\u041f\u0442", "\u0421\u0431", "\u0412\u0441"));
+            }
+            cb.setValues(names);
+            cb.setSelectedIndex(selected < 0 || selected > 6 ? 0 : selected);
+            VDSchedule sc = editSchedule(screen);
+            if (!hasManualTimes(sc)) {
+                Level level = (Level) screenField(screen, "level");
+                int lineID = (Integer) screenField(screen, "lineID");
+                java.util.Set<Integer> firsts = groupFirstRoutes(level, lineID);
+                Map<Integer, Integer> firstPlatform = new HashMap<>();
+                for (Map.Entry<Integer, String> e : VDStorageHandler.getAll(level, VDMemoryIDs.ROUTE).entrySet()) {
+                    VDRoute r = new VDRoute(e.getValue());
+                    if (r.lineID == lineID && firsts.contains(e.getKey()) && r.stops != null && r.stops.length != 0) {
+                        firstPlatform.put(e.getKey(), com.rinventor.ptm2.engine.computing.Converter.toIntList(r.stops).get(0));
+                    }
+                }
+                List<Pair<Integer, Integer>> items = autoVehicleList(sc);
+                for (int d = 0; d < 7; d++) {
+                    for (Object o : ScheduleUtils.getSimpleScheduleEntriesFor(level, lineID, d)) {
+                        Pair<Integer, Pair<Integer, String>> en = (Pair<Integer, Pair<Integer, String>>) o;
+                        Integer fp = firstPlatform.get(en.getFirst());
+                        if (fp != null && fp.intValue() == en.getSecond().getFirst()) {
+                            int m = (int) TimeHelper.parseTime(en.getSecond().getSecond());
+                            if (m >= 0) {
+                                items.add(Pair.of(d * 1440 + m, en.getFirst()));
+                            }
+                        }
+                    }
+                }
+                if (!items.isEmpty()) {
+                    items.sort(java.util.Comparator.comparingInt(Pair::getFirst));
+                    editSave(screen, sc);
+                }
+            }
+        } catch (Throwable t) {
+            PTMLogger.warn("PTM2 fixes: editorOptions " + t);
+        }
+    }
+
+    /** Обновляет список выездов выбранного рейса (which = 1 или 2) на выбранный день. */
+    public static void editorRefresh(Object screen, int which) {
+        try {
+            int day = editDay(screen);
+            int route = editRoute(screen, which);
+            List<TimetableRowLayout> rows = new ArrayList<>();
+            if (route != -1) {
+                List<Integer> mins = new ArrayList<>();
+                for (Pair<Integer, List<Pair<Integer, Integer>>> v : editSchedule(screen).timeline) {
+                    for (Pair<Integer, Integer> tr : v.getSecond()) {
+                        if (Math.floorDiv(tr.getFirst(), 1440) == day && tr.getSecond() == route) {
+                            mins.add(Math.floorMod(tr.getFirst(), 1440));
+                        }
+                    }
+                }
+                java.util.Collections.sort(mins);
+                for (int m : mins) {
+                    Object row = editorRow(screen, fmtMin(m) + "-" + fmtMin(m), which);
+                    if (row != null) {
+                        rows.add((TimetableRowLayout) row);
+                    }
+                }
+            }
+            LayoutListBox box = (LayoutListBox) screenField(screen, which == 1 ? "LBTimetable1" : "LBTimetable2");
+            box.setRows(rows);
+        } catch (Throwable t) {
+            PTMLogger.warn("PTM2 fixes: editorRefresh " + t);
+        }
+    }
+
+    /** Строка списка: время выезда, показ того же времени справа и кнопка удаления. */
+    public static Object editorRow(Object screen, String time, int which) {
+        try {
+            Level level = (Level) screenField(screen, "level");
+            final String[] cur = {time.substring(0, 5)};
+            int width = 150;
+            LayoutListBox box = (LayoutListBox) screenField(screen, which == 1 ? "LBTimetable1" : "LBTimetable2");
+            try {
+                Object w = box.getClass().getMethod("m_5711_").invoke(box);
+                if (w instanceof Integer && (Integer) w > 20) {
+                    width = (Integer) w;
+                }
+            } catch (Throwable ignored) {
+                // ширина по умолчанию
+            }
+            IconButton delete = new IconButton(0, 0, 12, "icon_delete", (e) -> {
+                editorDelete(screen, which, cur[0]);
+                editorRefresh(screen, which);
+            });
+            TimeBox start = new TimeBox(0, 0, 50, 12, cur[0], level, (e) -> {
+                if (e instanceof TimeBox) {
+                    String nv = ((TimeBox) e).getValue();
+                    if (parseHM(nv) >= 0 && !nv.equals(cur[0])) {
+                        if (editorMove(screen, which, cur[0], nv)) {
+                            cur[0] = nv;
+                        }
+                    }
+                }
+            });
+            TimeBox end = new TimeBox(0, 0, 50, 12, cur[0], level, (e) -> { });
+            return new TimetableRowLayout(width, start, end, delete);
+        } catch (Throwable t) {
+            PTMLogger.warn("PTM2 fixes: editorRow " + t);
+            return null;
+        }
+    }
+
+    private static Pair<Integer, Integer> findItem(VDSchedule sc, int day, int route, int minute, List<Pair<Integer, Integer>>[] ownerOut) {
+        for (Pair<Integer, List<Pair<Integer, Integer>>> v : sc.timeline) {
+            for (Pair<Integer, Integer> tr : v.getSecond()) {
+                if (Math.floorDiv(tr.getFirst(), 1440) == day && tr.getSecond() == route && Math.floorMod(tr.getFirst(), 1440) == minute) {
+                    ownerOut[0] = v.getSecond();
+                    return tr;
+                }
+            }
+        }
+        return null;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void editorDelete(Object screen, int which, String time) {
+        try {
+            VDSchedule sc = editSchedule(screen);
+            List<Pair<Integer, Integer>>[] owner = new List[1];
+            Pair<Integer, Integer> it = findItem(sc, editDay(screen), editRoute(screen, which), parseHM(time), owner);
+            if (it != null) {
+                owner[0].remove(it);
+                editSave(screen, sc);
+            }
+        } catch (Throwable t) {
+            PTMLogger.warn("PTM2 fixes: editorDelete " + t);
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static boolean editorMove(Object screen, int which, String oldTime, String newTime) {
+        try {
+            VDSchedule sc = editSchedule(screen);
+            int day = editDay(screen);
+            int route = editRoute(screen, which);
+            List<Pair<Integer, Integer>>[] owner = new List[1];
+            Pair<Integer, Integer> it = findItem(sc, day, route, parseHM(oldTime), owner);
+            if (it == null) {
+                return false;
+            }
+            owner[0].remove(it);
+            owner[0].add(Pair.of(day * 1440 + parseHM(newTime), route));
+            owner[0].sort(java.util.Comparator.comparingInt(Pair::getFirst));
+            editSave(screen, sc);
+            return true;
+        } catch (Throwable t) {
+            PTMLogger.warn("PTM2 fixes: editorMove " + t);
+            return false;
+        }
+    }
+
+    /** Кнопка добавления: новый выезд через час после последнего на этот день (или в 12:00). */
+    public static void editorAdd(Object screen, int which) {
+        try {
+            int route = editRoute(screen, which);
+            if (route == -1) {
+                return;
+            }
+            VDSchedule sc = editSchedule(screen);
+            int day = editDay(screen);
+            int last = -1;
+            for (Pair<Integer, List<Pair<Integer, Integer>>> v : sc.timeline) {
+                for (Pair<Integer, Integer> tr : v.getSecond()) {
+                    if (Math.floorDiv(tr.getFirst(), 1440) == day && tr.getSecond() == route) {
+                        last = Math.max(last, Math.floorMod(tr.getFirst(), 1440));
+                    }
+                }
+            }
+            int minute = last < 0 ? 12 * 60 : Math.min(last + 60, 23 * 60 + 59);
+            List<Pair<Integer, Integer>> items = autoVehicleList(sc);
+            items.add(Pair.of(day * 1440 + minute, route));
+            items.sort(java.util.Comparator.comparingInt(Pair::getFirst));
+            editSave(screen, sc);
+            editorRefresh(screen, which);
+        } catch (Throwable t) {
+            PTMLogger.warn("PTM2 fixes: editorAdd " + t);
         }
     }
 
@@ -3466,12 +3773,21 @@ public final class PtmFixes {
             for (Map.Entry<Integer, String> e : VDStorageHandler.getAll(level, VDMemoryIDs.SCHEDULE).entrySet()) {
                 VDSchedule sc = new VDSchedule(e.getValue());
                 if (sc.lineID == lineId) {
-                    if (sc.timeline.isEmpty()) {
+                    int fleet = 0;
+                    for (Pair<Integer, List<Pair<Integer, Integer>>> f : sc.timeline) {
+                        if (f.getFirst() >= 0) {
+                            fleet++;
+                        }
+                    }
+                    if (fleet == 0) {
                         return "";
                     }
-                    StringBuilder b = new StringBuilder(", \u0432 \u043f\u0430\u0440\u043a\u0435 " + sc.timeline.size() + ": ");
+                    StringBuilder b = new StringBuilder(", \u0432 \u043f\u0430\u0440\u043a\u0435 " + fleet + ": ");
                     int shown = 0;
                     for (Pair<Integer, List<Pair<Integer, Integer>>> f : sc.timeline) {
+                        if (f.getFirst() < 0) {
+                            continue;
+                        }
                         if (shown++ > 0) {
                             b.append(", ");
                         }

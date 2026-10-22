@@ -136,7 +136,7 @@ public class Patcher implements Opcodes {
         if (mismatch) {
             System.exit(1);
         }
-        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay", "gate-bankcard", "boarding-fare", "gate-exit-radius", "gate-exit-auto", "gate-in-radius", "terminal-cap", "arrival-reach", "arrival-inside", "lamp-cap", "red-commit", "patience", "bypass-still", "merge-check", "player-ahead", "merge-width", "parallel-width", "auto-links", "link-revision", "bus-priority", "validator", "wheel-filter", "hull", "depot-ui", "depot-select", "schedule-toggle", "schedule-edit", "schedule-real", "schedule-cache", "depot-order", "depot-spawn", "depot-spawn2", "garage-fleet", "depot-park", "depot-return", "terminal-pax", "depot-clear", "depot-crash", "gravity-reset"};
+        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay", "gate-bankcard", "boarding-fare", "gate-exit-radius", "gate-exit-auto", "gate-in-radius", "terminal-cap", "arrival-reach", "arrival-inside", "lamp-cap", "red-commit", "patience", "bypass-still", "merge-check", "player-ahead", "merge-width", "parallel-width", "auto-links", "link-revision", "bus-priority", "validator", "wheel-filter", "hull", "depot-ui", "depot-select", "schedule-toggle", "schedule-edit", "editor-updateOptions", "editor-updateRouteList1", "editor-updateRouteList2", "editor-createRow1", "editor-createRow2", "editor-add", "schedule-screen", "schedule-real", "schedule-cache", "depot-order", "depot-spawn", "depot-spawn2", "garage-fleet", "depot-park", "depot-return", "terminal-pax", "depot-clear", "depot-crash", "gravity-reset"};
         for (String r : required) {
             if (!done.contains(r)) {
                 System.err.println("ERROR: patch not applied: " + r);
@@ -158,7 +158,7 @@ public class Patcher implements Opcodes {
     }
 
     static byte[] patchClass(String name, byte[] data) {
-        boolean target = name.equals(OPD) || name.equals(ATM) || name.equals(VU) || name.equals(VSH) || name.equals(PTE) || name.equals(TRN) || name.equals(GATE_IN) || name.equals(VEH) || name.equals(GATE_EXIT) || name.equals(TM) || name.equals(TBM) || name.equals(VUT) || name.equals(TLU) || name.equals(RPATH) || name.equals(LES) || name.equals("com/rinventor/ptm2/dimension/virtual/util/ScheduleUtils");
+        boolean target = name.equals(OPD) || name.equals(ATM) || name.equals(VU) || name.equals(VSH) || name.equals(PTE) || name.equals(TRN) || name.equals(GATE_IN) || name.equals(VEH) || name.equals(GATE_EXIT) || name.equals(TM) || name.equals(TBM) || name.equals(VUT) || name.equals(TLU) || name.equals(RPATH) || name.equals(LES) || name.equals("com/rinventor/ptm2/dimension/virtual/util/ScheduleUtils") || name.equals("com/rinventor/ptm2/dimension/digital/screens/ScheduleEditScreen");
         boolean flags = contains(data, "INDEFINITE_BANK_ACCOUNT") || contains(data, "INDEFINITE_TRANSPORT_CARD");
         if (!target && !flags) {
             return data;
@@ -436,6 +436,71 @@ public class Patcher implements Opcodes {
                 changed = true;
             }
         }
+        if (name.equals("com/rinventor/ptm2/dimension/digital/screens/ScheduleEditScreen")) {
+            // Экран редактирования расписания: методы-заглушки автора заменены вызовами PtmFixes.editor*
+            final String sesName = "com/rinventor/ptm2/dimension/digital/screens/ScheduleEditScreen";
+            for (MethodNode m : cn.methods) {
+                InsnList body = null;
+                if (m.name.equals("updateOptions") && m.desc.equals("()V")) {
+                    body = new InsnList();
+                    body.add(new VarInsnNode(ALOAD, 0));
+                    body.add(new MethodInsnNode(INVOKESTATIC, FIXES, "editorOptions", "(Ljava/lang/Object;)V", false));
+                    body.add(new InsnNode(RETURN));
+                } else if ((m.name.equals("updateRouteList1") || m.name.equals("updateRouteList2")) && m.desc.equals("(Lcom/rinventor/ptm2/dimension/virtual/types/VDRoute;)V")) {
+                    body = new InsnList();
+                    body.add(new VarInsnNode(ALOAD, 0));
+                    body.add(new InsnNode(m.name.endsWith("1") ? ICONST_1 : ICONST_2));
+                    body.add(new MethodInsnNode(INVOKESTATIC, FIXES, "editorRefresh", "(Ljava/lang/Object;I)V", false));
+                    body.add(new InsnNode(RETURN));
+                } else if ((m.name.equals("createRow1") || m.name.equals("createRow2"))
+                    && m.desc.equals("(Ljava/lang/String;)Lcom/rinventor/ptm2/dimension/digital/rows/TimetableRowLayout;")) {
+                    body = new InsnList();
+                    body.add(new VarInsnNode(ALOAD, 0));
+                    body.add(new VarInsnNode(ALOAD, 1));
+                    body.add(new InsnNode(m.name.endsWith("1") ? ICONST_1 : ICONST_2));
+                    body.add(new MethodInsnNode(INVOKESTATIC, FIXES, "editorRow", "(Ljava/lang/Object;Ljava/lang/String;I)Ljava/lang/Object;", false));
+                    body.add(new org.objectweb.asm.tree.TypeInsnNode(CHECKCAST, "com/rinventor/ptm2/dimension/digital/rows/TimetableRowLayout"));
+                    body.add(new InsnNode(ARETURN));
+                } else if (m.name.startsWith("lambda$")) {
+                    boolean usesUpdate = false;
+                    int list = 0;
+                    for (AbstractInsnNode in : m.instructions.toArray()) {
+                        if (in instanceof MethodInsnNode) {
+                            MethodInsnNode mi = (MethodInsnNode) in;
+                            if (mi.name.equals("updateVal") && mi.owner.endsWith("VDStorageHandler")) {
+                                usesUpdate = true;
+                            }
+                            if (mi.name.equals("updateRouteList1")) {
+                                list = 1;
+                            }
+                            if (mi.name.equals("updateRouteList2")) {
+                                list = 2;
+                            }
+                        }
+                    }
+                    if (usesUpdate && list != 0) {
+                        body = new InsnList();
+                        body.add(new VarInsnNode(ALOAD, 0));
+                        body.add(new InsnNode(list == 1 ? ICONST_1 : ICONST_2));
+                        body.add(new MethodInsnNode(INVOKESTATIC, FIXES, "editorAdd", "(Ljava/lang/Object;I)V", false));
+                        body.add(new InsnNode(RETURN));
+                        done.add("editor-add");
+                    }
+                }
+                if (body != null) {
+                    m.instructions.clear();
+                    m.tryCatchBlocks.clear();
+                    m.localVariables = null;
+                    m.instructions.add(body);
+                    m.maxStack = Math.max(m.maxStack, 4);
+                    m.maxLocals = Math.max(m.maxLocals, 3);
+                    if (!m.name.startsWith("lambda$")) {
+                        done.add("editor-" + m.name);
+                    }
+                    changed = true;
+                }
+            }
+        }
         if (name.equals("com/rinventor/ptm2/dimension/virtual/util/ScheduleUtils")) {
             // Расписание строится заново при каждом вызове (на каждом тике и на каждую линию): оборачиваем в кэш на 5 секунд
             final String sdesc = "(Lnet/minecraft/world/level/Level;II)Ljava/util/List;";
@@ -517,6 +582,28 @@ public class Patcher implements Opcodes {
                         m.instructions.insert(all[i], repl);
                         m.instructions.remove(all[i]);
                         done.add("schedule-edit");
+                        changed = true;
+                    }
+                }
+            }
+            // Для линии с «реалистичным» расписанием кнопка-карандаш открывает экран редактирования таблицы (644) вместо
+            // упрощённого (638): номер экрана = 638 + 6 * тип расписания линии (без ветвлений в байт-коде)
+            for (MethodNode m : cn.methods) {
+                if (!m.name.startsWith("lambda$")) {
+                    continue;
+                }
+                AbstractInsnNode[] all = m.instructions.toArray();
+                for (AbstractInsnNode in : all) {
+                    if (in.getOpcode() == SIPUSH && in instanceof org.objectweb.asm.tree.IntInsnNode && ((org.objectweb.asm.tree.IntInsnNode) in).operand == 638) {
+                        InsnList add = new InsnList();
+                        add.add(new VarInsnNode(ALOAD, 0));
+                        add.add(new org.objectweb.asm.tree.FieldInsnNode(GETFIELD, LES, "line", "Lcom/rinventor/ptm2/dimension/virtual/types/VDTransportLine;"));
+                        add.add(new org.objectweb.asm.tree.FieldInsnNode(GETFIELD, "com/rinventor/ptm2/dimension/virtual/types/VDTransportLine", "scheduleType", "I"));
+                        add.add(new org.objectweb.asm.tree.IntInsnNode(BIPUSH, 6));
+                        add.add(new InsnNode(IMUL));
+                        add.add(new InsnNode(IADD));
+                        m.instructions.insert(in, add);
+                        done.add("schedule-screen");
                         changed = true;
                     }
                 }

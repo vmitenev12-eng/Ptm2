@@ -123,16 +123,25 @@ public final class PtmFixes {
     private static java.lang.reflect.Method msPerMinute;
 
     private static VDSchedule scheduleOf(Level level, int lineID, int[] keyOut) {
+        VDSchedule best = null;
+        int bestKey = Integer.MAX_VALUE;
+        boolean bestManual = false;
         for (Map.Entry<Integer, String> e : VDStorageHandler.getAll(level, VDMemoryIDs.SCHEDULE).entrySet()) {
             VDSchedule sc = new VDSchedule(e.getValue());
-            if (sc.lineID == lineID) {
-                if (keyOut != null) {
-                    keyOut[0] = e.getKey();
-                }
-                return sc;
+            if (sc.lineID != lineID) {
+                continue;
+            }
+            boolean manual = hasManualTimes(sc);
+            if (best == null || (manual && !bestManual) || (manual == bestManual && e.getKey() < bestKey)) {
+                best = sc;
+                bestKey = e.getKey();
+                bestManual = manual;
             }
         }
-        return null;
+        if (best != null && keyOut != null) {
+            keyOut[0] = bestKey;
+        }
+        return best;
     }
 
     private static boolean hasManualTimes(VDSchedule sc) {
@@ -272,10 +281,25 @@ public final class PtmFixes {
             }
             String text = new String(java.nio.file.Files.readAllBytes(path), java.nio.charset.StandardCharsets.UTF_8);
             int hash = text.hashCode();
+            if (timetableHash == 0) {
+                java.nio.file.Path hp = java.nio.file.Paths.get("config", "ptm2-timetable.applied");
+                if (java.nio.file.Files.exists(hp)) {
+                    try {
+                        timetableHash = Integer.parseInt(new String(java.nio.file.Files.readAllBytes(hp), java.nio.charset.StandardCharsets.UTF_8).trim());
+                    } catch (NumberFormatException ignored) {
+                        timetableHash = 0;
+                    }
+                }
+            }
             if (hash == timetableHash) {
                 return;
             }
             timetableHash = hash;
+            try {
+                java.nio.file.Files.write(java.nio.file.Paths.get("config", "ptm2-timetable.applied"), String.valueOf(hash).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            } catch (java.io.IOException ignored) {
+                // не критично
+            }
             Map<String, Map<Integer, List<int[]>>> byLine = new java.util.LinkedHashMap<>();
             int bad = 0;
             for (String raw : text.split("\\r?\\n")) {
@@ -381,6 +405,8 @@ public final class PtmFixes {
     // ---------------------------------------------------------------------------------------------
 
     private static final Map<Object, VDSchedule> EDIT_STATE = new java.util.WeakHashMap<>();
+    private static final Map<Object, Integer> EDIT_KEYS = new java.util.WeakHashMap<>();
+    private static final Map<Object, Boolean> EDIT_LABELED = new java.util.WeakHashMap<>();
 
     private static Object screenField(Object screen, String name) throws Exception {
         Class<?> c = screen.getClass();
@@ -401,7 +427,15 @@ public final class PtmFixes {
         if (sc == null) {
             Level level = (Level) screenField(screen, "level");
             int id = (Integer) screenField(screen, "scheduleID");
-            sc = new VDSchedule(VDStorageHandler.get(level, id, VDMemoryIDs.SCHEDULE));
+            int lineIdOfScreen = (Integer) screenField(screen, "lineID");
+            int[] kh = new int[1];
+            VDSchedule same = scheduleOf(level, lineIdOfScreen, kh);
+            if (same != null) {
+                sc = same;
+                EDIT_KEYS.put(screen, kh[0]);
+            } else {
+                sc = new VDSchedule(VDStorageHandler.get(level, id, VDMemoryIDs.SCHEDULE));
+            }
             EDIT_STATE.put(screen, sc);
         }
         return sc;
@@ -409,7 +443,8 @@ public final class PtmFixes {
 
     private static void editSave(Object screen, VDSchedule sc) throws Exception {
         Level level = (Level) screenField(screen, "level");
-        int id = (Integer) screenField(screen, "scheduleID");
+        Integer k = EDIT_KEYS.get(screen);
+        int id = k != null ? k : (Integer) screenField(screen, "scheduleID");
         VDStorageHandler.update(level, id, sc.toString());
     }
 
@@ -531,8 +566,70 @@ public final class PtmFixes {
         }
     }
 
+    /** Подписи рейсов в списках: номер, названия конечных остановок и число остановок (чтобы рейсы различались). */
+    private static void relabelRoutes(Object screen) {
+        try {
+            if (EDIT_LABELED.containsKey(screen)) {
+                return;
+            }
+            Level level = (Level) screenField(screen, "level");
+            Map<?, ?> idx = (Map<?, ?>) screenField(screen, "routeIDs");
+            List<String> labels = new ArrayList<>();
+            for (int i = 0; i < idx.size(); i++) {
+                Object rid = idx.get(i);
+                if (rid == null) {
+                    continue;
+                }
+                VDRoute r = new VDRoute(VDStorageHandler.get(level, (Integer) rid, VDMemoryIDs.ROUTE));
+                labels.add((i + 1) + ". " + r.getDisplayName(level) + " (" + r.stops.length + ")");
+            }
+            for (String f : new String[] {"CBRoute1", "CBRoute2"}) {
+                ComboBox cb = (ComboBox) screenField(screen, f);
+                int sel = cb.getSelectedIndex();
+                cb.setValues(new ArrayList<>(labels));
+                cb.setSelectedIndex(sel);
+            }
+            EDIT_LABELED.put(screen, Boolean.TRUE);
+        } catch (Throwable t) {
+            // подписи по умолчанию
+        }
+    }
+
+    /** Время прихода на конечную для выезда в заданную минуту (или -1). */
+    @SuppressWarnings("unchecked")
+    private static int tripEnd(Level level, int lineID, int day, int minute, int routeID) {
+        try {
+            Map<Integer, VDRoute> routes = new HashMap<>();
+            List<Pair<Integer, List<Integer>>> byRoute = new ArrayList<>();
+            for (Map.Entry<Integer, String> e : VDStorageHandler.getAll(level, VDMemoryIDs.ROUTE).entrySet()) {
+                VDRoute r = new VDRoute(e.getValue());
+                if (r.lineID == lineID && r.stops != null && r.stops.length != 0) {
+                    List<Integer> stops = com.rinventor.ptm2.engine.computing.Converter.toIntList(r.stops);
+                    if (stops.size() >= 2) {
+                        routes.put(e.getKey(), r);
+                        byRoute.add(Pair.of(e.getKey(), stops));
+                    }
+                }
+            }
+            byRoute.sort(java.util.Comparator.comparingInt(Pair::getFirst));
+            groupFirstRoutes(level, lineID);
+            for (List<Pair<Integer, Integer>> g : (List<List<Pair<Integer, Integer>>>) schedGroups.invoke(null, byRoute)) {
+                if (!g.isEmpty() && g.get(0).getFirst() == routeID) {
+                    List<Pair<Integer, Pair<Integer, Integer>>> st = (List<Pair<Integer, Pair<Integer, Integer>>>) schedStopTimes.invoke(null, g, routes, day, minute);
+                    if (st != null && !st.isEmpty()) {
+                        return Math.floorMod(st.get(st.size() - 1).getSecond().getSecond(), 1440);
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            // не критично
+        }
+        return -1;
+    }
+
     /** Обновляет список выездов выбранного рейса (which = 1 или 2) на выбранный день. */
     public static void editorRefresh(Object screen, int which) {
+        relabelRoutes(screen);
         try {
             int day = editDay(screen);
             int route = editRoute(screen, which);
@@ -547,8 +644,11 @@ public final class PtmFixes {
                     }
                 }
                 java.util.Collections.sort(mins);
+                Level lv = (Level) screenField(screen, "level");
+                int lineIdOfScreen = (Integer) screenField(screen, "lineID");
                 for (int m : mins) {
-                    Object row = editorRow(screen, fmtMin(m) + "-" + fmtMin(m), which);
+                    int endMin = tripEnd(lv, lineIdOfScreen, day, m, route);
+                    Object row = editorRow(screen, fmtMin(m) + "-" + fmtMin(endMin < 0 ? m : endMin), which);
                     if (row != null) {
                         rows.add((TimetableRowLayout) row);
                     }
@@ -590,7 +690,8 @@ public final class PtmFixes {
                     }
                 }
             });
-            TimeBox end = new TimeBox(0, 0, 50, 12, cur[0], level, (e) -> { });
+            final String endText = time.length() >= 11 ? time.substring(6, 11) : cur[0];
+            TimeBox end = new TimeBox(0, 0, 50, 12, endText, level, (e) -> { });
             return new TimetableRowLayout(width, start, end, delete);
         } catch (Throwable t) {
             PTMLogger.warn("PTM2 fixes: editorRow " + t);
@@ -3697,16 +3798,9 @@ public final class PtmFixes {
             if (v == null || line == null || line.scheduleType != 1) {
                 return;
             }
-            Integer scheduleKey = null;
-            VDSchedule schedule = null;
-            for (Map.Entry<Integer, String> e : VDStorageHandler.getAll(level, VDMemoryIDs.SCHEDULE).entrySet()) {
-                VDSchedule sc = new VDSchedule(e.getValue());
-                if (sc.lineID == lineID) {
-                    scheduleKey = e.getKey();
-                    schedule = sc;
-                    break;
-                }
-            }
+            int[] keyHolder = new int[1];
+            VDSchedule schedule = scheduleOf(level, lineID, keyHolder);
+            Integer scheduleKey = schedule == null ? null : keyHolder[0];
             if (schedule == null || scheduleKey == null) {
                 return;
             }
@@ -3770,9 +3864,9 @@ public final class PtmFixes {
     /** Парк линии с реалистичным расписанием: сколько гаражных номеров закреплено и какие. */
     static String fleetInfo(Level level, int lineId) {
         try {
-            for (Map.Entry<Integer, String> e : VDStorageHandler.getAll(level, VDMemoryIDs.SCHEDULE).entrySet()) {
-                VDSchedule sc = new VDSchedule(e.getValue());
-                if (sc.lineID == lineId) {
+            {
+                VDSchedule sc = scheduleOf(level, lineId, null);
+                if (sc != null) {
                     int fleet = 0;
                     for (Pair<Integer, List<Pair<Integer, Integer>>> f : sc.timeline) {
                         if (f.getFirst() >= 0) {

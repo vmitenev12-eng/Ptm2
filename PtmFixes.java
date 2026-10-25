@@ -678,7 +678,8 @@ public final class PtmFixes {
             }
             IconButton delete = new IconButton(0, 0, 12, "icon_delete", (e) -> {
                 editorDelete(screen, which, cur[0]);
-                editorRefresh(screen, which);
+                editorRefresh(screen, 1);
+                editorRefresh(screen, 2);
             });
             TimeBox start = new TimeBox(0, 0, 50, 12, cur[0], level, (e) -> {
                 if (e instanceof TimeBox) {
@@ -741,6 +742,9 @@ public final class PtmFixes {
             owner[0].add(Pair.of(day * 1440 + parseHM(newTime), route));
             owner[0].sort(java.util.Comparator.comparingInt(Pair::getFirst));
             editSave(screen, sc);
+            synchronized (EDIT_DIRTY) {
+                EDIT_DIRTY.put(screen, System.currentTimeMillis());
+            }
             return true;
         } catch (Throwable t) {
             PTMLogger.warn("PTM2 fixes: editorMove " + t);
@@ -770,9 +774,85 @@ public final class PtmFixes {
             items.add(Pair.of(day * 1440 + minute, route));
             items.sort(java.util.Comparator.comparingInt(Pair::getFirst));
             editSave(screen, sc);
-            editorRefresh(screen, which);
+            editorRefresh(screen, 1);
+            editorRefresh(screen, 2);
         } catch (Throwable t) {
             PTMLogger.warn("PTM2 fixes: editorAdd " + t);
+        }
+    }
+
+    private static java.lang.reflect.Method dayOptionsOrig;
+    private static java.lang.reflect.Method arrivingOrig;
+
+    /** Дни недели с выездами для ручной таблицы: по одному варианту на день (ключи 1..7), иначе стандартные группы дней. */
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    public static java.util.HashMap dayOptions(Level level, int lineID) {
+        try {
+            String ld = VDStorageHandler.get(level, lineID, VDMemoryIDs.TRANSPORT_LINE);
+            if (ld != null && !ld.isEmpty() && new VDTransportLine(ld).scheduleType == 1) {
+                VDSchedule sc = scheduleOf(level, lineID, null);
+                if (hasManualTimes(sc)) {
+                    java.util.HashMap<Integer, List<Integer>> m = new java.util.HashMap<>();
+                    for (Pair<Integer, List<Pair<Integer, Integer>>> v : sc.timeline) {
+                        for (Pair<Integer, Integer> tr : v.getSecond()) {
+                            int d = Math.floorDiv(tr.getFirst(), 1440);
+                            if (d >= 0 && d <= 6 && !m.containsKey(d + 1)) {
+                                m.put(d + 1, new ArrayList<>(java.util.Collections.singletonList(d)));
+                            }
+                        }
+                    }
+                    return m;
+                }
+            }
+            if (dayOptionsOrig == null) {
+                dayOptionsOrig = Class.forName("com.rinventor.ptm2.dimension.virtual.util.ScheduleUtils")
+                    .getMethod("ptmDayOptions", Level.class, int.class);
+            }
+            return (java.util.HashMap) dayOptionsOrig.invoke(null, level, lineID);
+        } catch (Throwable t) {
+            PTMLogger.warn("PTM2 fixes: dayOptions " + t);
+            return new java.util.HashMap();
+        }
+    }
+
+    /**
+     * Табло остановки: автобус «прибывает» на платформу, только если эта платформа его ближайшая остановка. Раньше
+     * автобус, который просто проезжал по платформе (из депо к первой остановке или в депо после рейса), на несколько
+     * секунд попадал в табло как прибывший.
+     */
+    public static boolean arriving(Level level, VDTrackableVehicle vehicle, int platformID) {
+        try {
+            if (vehicle.nextPlatformID != platformID) {
+                return false;
+            }
+            if (arrivingOrig == null) {
+                arrivingOrig = Class.forName("com.rinventor.ptm2.dimension.virtual.util.Departures")
+                    .getDeclaredMethod("ptmArriving", Level.class, VDTrackableVehicle.class, int.class);
+                arrivingOrig.setAccessible(true);
+            }
+            return (Boolean) arrivingOrig.invoke(null, level, vehicle, platformID);
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    private static final Map<Object, Long> EDIT_DIRTY = new java.util.WeakHashMap<>();
+
+    /** Тик экрана редактирования: через 1,5 секунды после правки времени списки перестраиваются и сортируются. */
+    public static void editorTick(Object screen) {
+        try {
+            Long ts;
+            synchronized (EDIT_DIRTY) {
+                ts = EDIT_DIRTY.get(screen);
+                if (ts == null || System.currentTimeMillis() - ts < 1500L) {
+                    return;
+                }
+                EDIT_DIRTY.remove(screen);
+            }
+            editorRefresh(screen, 1);
+            editorRefresh(screen, 2);
+        } catch (Throwable t) {
+            // не критично
         }
     }
 
@@ -1714,7 +1794,7 @@ public final class PtmFixes {
             long now = System.currentTimeMillis();
             waitLog(v, ve, distance, key, now);
             // автобус уже внутри платформы (сюда попадаем только в этом случае). Приоритет остаётся за доездом
-            // до расчётной точки (порог 2 блока), но если автобус не сдвигается с места больше 6 секунд
+            // до расчётной точки (порог 2 блока), но если автобус не сдвигается с места больше 3 секунд
             // (упёрся в конец пути, ждёт автобус впереди; скорость в записи при этом может быть ненулевой),
             // он открывает двери там, где стоит.
             double x = PTMEntity.getX(ve);
@@ -1725,7 +1805,7 @@ public final class PtmFixes {
                     REACH_POS.clear();
                 }
                 REACH_POS.put(key, new double[] {x, z, now});
-            } else if (distance < 150.0D && now - (long) rec[2] >= 6000L) {
+            } else if (distance < 150.0D && now - (long) rec[2] >= 3000L) {
                 return 150.0D;
             }
         } catch (Throwable t) {
@@ -1934,6 +2014,8 @@ public final class PtmFixes {
         long exitCheck;
         boolean exitHold;
         long exitHoldSince;
+        /** Машина впереди просит освободить место позади: до этого времени можно отъезжать назад. */
+        long chainUntil;
     }
 
     static final Map<Integer, Drv> DRV = new ConcurrentHashMap<>();
@@ -2079,7 +2161,18 @@ public final class PtmFixes {
                 return orig;
             }
             // Отъезд назад (уступаем более «старому» ожидающему)
+            // Цепочка: машина впереди не может отъехать назад, потому что позади стоим мы. Отъезжаем первыми, если есть место
+            if (!d.backing && now < d.chainUntil && still && d.stillSince > 0L && now - d.stillSince > 800L
+                && !(v instanceof Transport && ((Transport) v).doorsOpen) && spaceBehind(v, level)) {
+                d.backing = true;
+                d.backLeft = 5.0D;
+                d.chainUntil = 0L;
+                drvLog(d, now, "\u043e\u0442\u044a\u0435\u0437\u0436\u0430\u0435\u0442 \u043d\u0430\u0437\u0430\u0434, \u043e\u0441\u0432\u043e\u0431\u043e\u0436\u0434\u0430\u044f \u043c\u0435\u0441\u0442\u043e \u043f\u0435\u0440\u0435\u0434\u043d\u0435\u0439 \u043c\u0430\u0448\u0438\u043d\u0435 " + (int) PTMEntity.getX(v) + " " + (int) PTMEntity.getZ(v));
+            }
             if (d.backing) {
+                if (d.backLeft > 0.0D && still && !spaceBehind(v, level)) {
+                    markBehind(v, now);
+                }
                 if (d.backLeft <= 0.0D || !still || !spaceBehind(v, level) || !stepBack(v, 0.15D)) {
                     d.backing = false;
                     d.holdUntil = now + 6000L;
@@ -2619,6 +2712,27 @@ public final class PtmFixes {
         } catch (Throwable t) {
             PTMLogger.warn("PTM2 fixes: ошибка заднего хода: " + t);
             return false;
+        }
+    }
+
+    /** Просит машины, стоящие вплотную позади, отъехать назад первыми (цепочка отъезда). */
+    private static void markBehind(Vehicle v, long now) {
+        double yaw = Math.toRadians(PTMEntity.getYaw(v));
+        double fx = -Math.sin(yaw);
+        double fz = Math.cos(yaw);
+        double x = PTMEntity.getX(v);
+        double z = PTMEntity.getZ(v);
+        for (Vehicle o : PTMEntity.getDifferentVehicles(24.0D, v)) {
+            double dx = PTMEntity.getX(o) - x;
+            double dz = PTMEntity.getZ(o) - z;
+            double along = dx * fx + dz * fz;
+            double lat = Math.abs(-dx * fz + dz * fx);
+            if (along < 0.0D && along > -(v.length / 2.0D + o.length / 2.0D + 2.0D) && lat < v.width / 2.0D + o.width / 2.0D + 0.8D) {
+                Drv od = DRV.get(System.identityHashCode(o));
+                if (od != null) {
+                    od.chainUntil = now + 4000L;
+                }
+            }
         }
     }
 
@@ -3464,25 +3578,43 @@ public final class PtmFixes {
     }
 
     /**
-     * Депо линии: дочерняя зона, имя которой совпадает с номером линии, привязывается автоматически
-     * (при выбранном депо ищется среди его дочерних зон). Иначе берётся выбранное в списке депо.
+     * Депо линии. Кандидаты: все дочерние зоны депо, имя которых совпадает с номером линии (так линии можно
+     * назначить несколько депо), и выбранное в списке депо, если оно не является родителем одной из таких зон.
+     * Рейс начинается из ближайшего к началу рейса кандидата (slotFor).
      */
-    static Depot resolveDepot(Level level, VDTransportLine line) {
+    static java.util.List<Depot> candidateDepots(Level level, VDTransportLine line) {
+        java.util.List<Depot> res = new ArrayList<>();
         if (line == null) {
-            return null;
+            return res;
         }
         java.util.List<Depot> ds = depots(level);
         Depot sel = line.depotID >= 0 && line.depotID < ds.size() ? ds.get(line.depotID) : null;
         String nr = line.number == null ? "" : line.number.trim();
         if (!nr.isEmpty() && !nr.equals("null")) {
             for (Depot d : ds) {
-                if (d.child && !d.d.closed && d.d.name != null && d.d.name.trim().equals(nr)
-                    && (sel == null || sel == d || sel.kids.contains(d))) {
-                    return d;
+                if (d.child && !d.d.closed && d.d.name != null && d.d.name.trim().equals(nr)) {
+                    res.add(d);
                 }
             }
         }
-        return sel;
+        if (sel != null && !res.contains(sel)) {
+            boolean parentOfMatch = false;
+            for (Depot m : res) {
+                if (sel.kids.contains(m)) {
+                    parentOfMatch = true;
+                }
+            }
+            if (!parentOfMatch) {
+                res.add(0, sel);
+            }
+        }
+        return res;
+    }
+
+    /** Первое депо линии (для проверок «депо выбрано» и подписей). */
+    static Depot resolveDepot(Level level, VDTransportLine line) {
+        java.util.List<Depot> c = candidateDepots(level, line);
+        return c.isEmpty() ? null : c.get(0);
     }
 
     static boolean inAnyDepot(Level level, double x, double z) {
@@ -3535,12 +3667,30 @@ public final class PtmFixes {
      * свободная пара (по порядку номеров линий), пары внутри дочерних зон не трогаем.
      */
     static Slot slotFor(Level level, int lineID, VDTransportLine line) {
+        return slotFor(level, lineID, line, 0.0D, 0.0D, false);
+    }
+
+    /** Место линии в ближайшем к точке (nx, nz) депо из кандидатов; без точки берётся первое депо. */
+    static Slot slotFor(Level level, int lineID, VDTransportLine line, double nx, double nz, boolean hasNear) {
         if (line == null) {
             return null;
         }
-        Depot dep = resolveDepot(level, line);
-        if (dep == null) {
+        java.util.List<Depot> cands = candidateDepots(level, line);
+        if (cands.isEmpty()) {
             return null;
+        }
+        Depot dep = cands.get(0);
+        if (hasNear && cands.size() > 1) {
+            double best = Double.MAX_VALUE;
+            for (Depot c : cands) {
+                double cx = (c.minX + c.maxX) / 2.0D;
+                double cz = (c.minZ + c.maxZ) / 2.0D;
+                double dist = (cx - nx) * (cx - nx) + (cz - nz) * (cz - nz);
+                if (dist < best) {
+                    best = dist;
+                    dep = c;
+                }
+            }
         }
         long now = System.currentTimeMillis();
         int ckey = lineID * 100003 + dep.id;
@@ -3631,9 +3781,10 @@ public final class PtmFixes {
             // номер линии среди линий этого депо
             java.util.TreeSet<Integer> sameDepot = new java.util.TreeSet<>();
             for (Map.Entry<Integer, String> e : VDStorageHandler.getAll(level, VDMemoryIDs.TRANSPORT_LINE).entrySet()) {
-                Depot od = resolveDepot(level, new VDTransportLine(e.getValue()));
-                if (od != null && od.id == dep.id) {
-                    sameDepot.add(e.getKey());
+                for (Depot od : candidateDepots(level, new VDTransportLine(e.getValue()))) {
+                    if (od.id == dep.id) {
+                        sameDepot.add(e.getKey());
+                    }
                 }
             }
             int rank = new java.util.ArrayList<>(sameDepot).indexOf(lineID);
@@ -3698,7 +3849,7 @@ public final class PtmFixes {
             if (route == null || line == null) {
                 return;
             }
-            Slot s = slotFor(level, route.lineID, line);
+            Slot s = slotFor(level, route.lineID, line, dp.getX(), dp.getZ(), true);
             if (s == null) {
                 return;
             }
@@ -3903,7 +4054,11 @@ public final class PtmFixes {
     static String depotShort(Level level, VDTransportLine line) {
         try {
             Depot d = resolveDepot(level, line);
-            return d == null ? "\u043d\u0435\u0442" : String.valueOf(d.d.name);
+            if (d == null) {
+                return "\u043d\u0435\u0442";
+            }
+            int more = candidateDepots(level, line).size() - 1;
+            return String.valueOf(d.d.name) + (more > 0 ? " +" + more : "");
         } catch (Throwable t) {
             return "?";
         }
@@ -3969,7 +4124,7 @@ public final class PtmFixes {
                 return platformID;
             }
             VDRoute route = new VDRoute(raw);
-            Slot s = slotFor(level, route.lineID, line);
+            Slot s = slotFor(level, route.lineID, line, dp.getX(), dp.getZ(), true);
             if (s == null) {
                 if (resolveDepot(level, line) != null) {
                     long nowMs = System.currentTimeMillis();
@@ -4018,7 +4173,8 @@ public final class PtmFixes {
             if (raw == null || raw.isEmpty()) {
                 return 2.0D;
             }
-            Slot s = slotFor(level, v.lineID, new VDTransportLine(raw));
+            Slot s = slotFor(level, v.lineID, new VDTransportLine(raw), v.destination == null ? 0.0D : vc(v.destination, 0),
+                v.destination == null ? 0.0D : vc(v.destination, 2), v.destination != null);
             if (s == null) {
                 return 2.0D;
             }
@@ -4059,7 +4215,7 @@ public final class PtmFixes {
                 return orig;
             }
             VDTransportLine line = new VDTransportLine(raw);
-            Slot s = slotFor(level, vehicle.lineID, line);
+            Slot s = slotFor(level, vehicle.lineID, line, vc(vehicle.position, 0), vc(vehicle.position, 2), true);
             if (s == null) {
                 return orig;
             }

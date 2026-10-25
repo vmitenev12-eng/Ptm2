@@ -136,7 +136,7 @@ public class Patcher implements Opcodes {
         if (mismatch) {
             System.exit(1);
         }
-        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay", "gate-bankcard", "boarding-fare", "gate-exit-radius", "gate-exit-auto", "gate-in-radius", "terminal-cap", "arrival-reach", "arrival-inside", "lamp-cap", "red-commit", "patience", "bypass-still", "merge-check", "player-ahead", "merge-width", "parallel-width", "auto-links", "link-revision", "bus-priority", "validator", "wheel-filter", "hull", "depot-ui", "depot-select", "schedule-toggle", "schedule-edit", "editor-updateOptions", "editor-updateRouteList1", "editor-updateRouteList2", "editor-createRow1", "editor-createRow2", "editor-add", "schedule-screen", "schedule-real", "schedule-cache", "depot-order", "depot-spawn", "depot-spawn2", "garage-fleet", "depot-park", "depot-return", "terminal-pax", "depot-clear", "depot-crash", "gravity-reset"};
+        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay", "gate-bankcard", "boarding-fare", "gate-exit-radius", "gate-exit-auto", "gate-in-radius", "terminal-cap", "arrival-reach", "arrival-inside", "lamp-cap", "red-commit", "patience", "bypass-still", "merge-check", "player-ahead", "merge-width", "parallel-width", "auto-links", "link-revision", "bus-priority", "validator", "wheel-filter", "hull", "depot-ui", "depot-select", "schedule-toggle", "schedule-edit", "editor-updateOptions", "editor-updateRouteList1", "editor-updateRouteList2", "editor-createRow1", "editor-createRow2", "editor-add", "editor-tick", "day-options", "day-loops", "board-arriving", "schedule-screen", "schedule-real", "schedule-cache", "depot-order", "depot-spawn", "depot-spawn2", "garage-fleet", "depot-park", "depot-return", "terminal-pax", "depot-clear", "depot-crash", "gravity-reset"};
         for (String r : required) {
             if (!done.contains(r)) {
                 System.err.println("ERROR: patch not applied: " + r);
@@ -158,7 +158,7 @@ public class Patcher implements Opcodes {
     }
 
     static byte[] patchClass(String name, byte[] data) {
-        boolean target = name.equals(OPD) || name.equals(ATM) || name.equals(VU) || name.equals(VSH) || name.equals(PTE) || name.equals(TRN) || name.equals(GATE_IN) || name.equals(VEH) || name.equals(GATE_EXIT) || name.equals(TM) || name.equals(TBM) || name.equals(VUT) || name.equals(TLU) || name.equals(RPATH) || name.equals(LES) || name.equals("com/rinventor/ptm2/dimension/virtual/util/ScheduleUtils") || name.equals("com/rinventor/ptm2/dimension/digital/screens/ScheduleEditScreen");
+        boolean target = name.equals(OPD) || name.equals(ATM) || name.equals(VU) || name.equals(VSH) || name.equals(PTE) || name.equals(TRN) || name.equals(GATE_IN) || name.equals(VEH) || name.equals(GATE_EXIT) || name.equals(TM) || name.equals(TBM) || name.equals(VUT) || name.equals(TLU) || name.equals(RPATH) || name.equals(LES) || name.equals("com/rinventor/ptm2/dimension/virtual/util/ScheduleUtils") || name.equals("com/rinventor/ptm2/dimension/digital/screens/ScheduleEditScreen") || name.equals("com/rinventor/ptm2/dimension/virtual/util/Departures") || name.equals("com/rinventor/ptm2/dimension/digital/screens/LineViewScreen") || name.equals("com/rinventor/ptm2/dimension/digital/panels/PlatformSchedulePanel") || name.equals("com/rinventor/ptm2/dimension/digital/screens/SchedulePreviewScreen");
         boolean flags = contains(data, "INDEFINITE_BANK_ACCOUNT") || contains(data, "INDEFINITE_TRANSPORT_CARD");
         if (!target && !flags) {
             return data;
@@ -436,7 +436,56 @@ public class Patcher implements Opcodes {
                 changed = true;
             }
         }
+        if (name.equals("com/rinventor/ptm2/dimension/virtual/util/Departures")) {
+            final String adesc = "(Lnet/minecraft/world/level/Level;Lcom/rinventor/ptm2/dimension/virtual/types/VDTrackableVehicle;I)Z";
+            MethodNode aorig = null;
+            for (MethodNode m : cn.methods) {
+                if (m.name.equals("arriving") && m.desc.equals(adesc)) {
+                    aorig = m;
+                }
+            }
+            if (aorig != null) {
+                aorig.name = "ptmArriving";
+                MethodNode w = new MethodNode(ACC_PRIVATE | ACC_STATIC, "arriving", adesc, null, null);
+                w.instructions.add(new VarInsnNode(ALOAD, 0));
+                w.instructions.add(new VarInsnNode(ALOAD, 1));
+                w.instructions.add(new VarInsnNode(ILOAD, 2));
+                w.instructions.add(new MethodInsnNode(INVOKESTATIC, FIXES, "arriving", adesc, false));
+                w.instructions.add(new InsnNode(IRETURN));
+                w.maxStack = 3;
+                w.maxLocals = 3;
+                cn.methods.add(w);
+                done.add("board-arriving");
+                changed = true;
+            }
+        }
+        if (name.equals("com/rinventor/ptm2/dimension/digital/screens/LineViewScreen")
+            || name.equals("com/rinventor/ptm2/dimension/digital/panels/PlatformSchedulePanel")
+            || name.equals("com/rinventor/ptm2/dimension/digital/screens/SchedulePreviewScreen")) {
+            // Список вариантов дней: вместо трёх групп до семи (по одному дню для ручной таблицы)
+            for (MethodNode m : cn.methods) {
+                AbstractInsnNode[] all = m.instructions.toArray();
+                for (int i = 0; i + 1 < all.length; i++) {
+                    if (all[i].getOpcode() == ICONST_3 && all[i + 1].getOpcode() == IF_ICMPGT) {
+                        m.instructions.insert(all[i], new org.objectweb.asm.tree.IntInsnNode(BIPUSH, 7));
+                        m.instructions.remove(all[i]);
+                        done.add("day-loops");
+                        changed = true;
+                    }
+                }
+            }
+        }
         if (name.equals("com/rinventor/ptm2/dimension/digital/screens/ScheduleEditScreen")) {
+            for (MethodNode m : cn.methods) {
+                if (m.name.equals("m_181908_") && m.desc.equals("()V")) {
+                    InsnList tick = new InsnList();
+                    tick.add(new VarInsnNode(ALOAD, 0));
+                    tick.add(new MethodInsnNode(INVOKESTATIC, FIXES, "editorTick", "(Ljava/lang/Object;)V", false));
+                    m.instructions.insert(tick);
+                    done.add("editor-tick");
+                    changed = true;
+                }
+            }
             // Экран редактирования расписания: методы-заглушки автора заменены вызовами PtmFixes.editor*
             final String sesName = "com/rinventor/ptm2/dimension/digital/screens/ScheduleEditScreen";
             for (MethodNode m : cn.methods) {
@@ -502,6 +551,27 @@ public class Patcher implements Opcodes {
             }
         }
         if (name.equals("com/rinventor/ptm2/dimension/virtual/util/ScheduleUtils")) {
+            // Варианты дней для ручной таблицы: обёртка scheduleDayOptions
+            final String ddesc = "(Lnet/minecraft/world/level/Level;I)Ljava/util/HashMap;";
+            MethodNode dorig = null;
+            for (MethodNode m : cn.methods) {
+                if (m.name.equals("scheduleDayOptions") && m.desc.equals(ddesc)) {
+                    dorig = m;
+                }
+            }
+            if (dorig != null) {
+                dorig.name = "ptmDayOptions";
+                MethodNode w = new MethodNode(ACC_PUBLIC | ACC_STATIC, "scheduleDayOptions", ddesc, null, null);
+                w.instructions.add(new VarInsnNode(ALOAD, 0));
+                w.instructions.add(new VarInsnNode(ILOAD, 1));
+                w.instructions.add(new MethodInsnNode(INVOKESTATIC, FIXES, "dayOptions", ddesc, false));
+                w.instructions.add(new InsnNode(ARETURN));
+                w.maxStack = 2;
+                w.maxLocals = 2;
+                cn.methods.add(w);
+                done.add("day-options");
+                changed = true;
+            }
             // Расписание строится заново при каждом вызове (на каждом тике и на каждую линию): оборачиваем в кэш на 5 секунд
             final String sdesc = "(Lnet/minecraft/world/level/Level;II)Ljava/util/List;";
             MethodNode sorig = null;

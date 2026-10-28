@@ -86,7 +86,7 @@ public final class PtmFixes {
      * 1) даёт название станциям, у которых его нет;
      * 2) привязывает каждую платформу к станции, в зоне которой она находится.
      */
-    public static final String BUILD = "fixes-2026-10-13-lamp-cap";
+    public static final String BUILD = "fixes-2026-10-28-plan2-pocket";
     private static boolean announced = false;
 
     public static void tick(Level level) {
@@ -2451,7 +2451,7 @@ public final class PtmFixes {
     /** Как часто машина пересчитывает прогноз. */
     static final long PLAN_PERIOD_MS = 200L;
     /** Дольше этого планировщик не держит машину подряд (дальше решает обычный ИИ). */
-    static final long PLAN_MAX_HOLD_MS = 14000L;
+    static final long PLAN_MAX_HOLD_MS = 7000L;
     static final double PLAN_STEP = 1.5D;
     static final int PLAN_POINTS = 26;
     /** Запас времени общественному транспорту при определении очереди проезда, секунд. */
@@ -2773,15 +2773,19 @@ public final class PtmFixes {
                 }
                 Drv od = DRV.get(System.identityHashCode(o));
                 boolean known = od != null && now - od.seen < 2000L;
-                boolean oInside = inIntersectionAt(level, PTMEntity.getX(o), PTMEntity.getZ(o));
+                boolean oSlow = Math.abs(o.speed) < 3.0F;
                 if (known) {
                     if (od.planHold) {
                         continue;
                     }
-                    if (!od.lastOrig && !od.forced && !oInside) {
+                    // Не уступаем тем, кто сам стоит или ждёт: иначе (особенно на перекрёстке) машины держат друг друга
+                    if (!od.lastOrig && !od.forced && oSlow) {
                         continue;
                     }
-                } else if (Math.abs(o.speed) < 1.0F && !oInside) {
+                    if (Math.abs(o.speed) < 1.0F && od.stillSince > 0L && now - od.stillSince > 1500L) {
+                        continue;
+                    }
+                } else if (Math.abs(o.speed) < 1.0F) {
                     continue;
                 }
                 Pred po = predOf(o, level, now);
@@ -2814,7 +2818,7 @@ public final class PtmFixes {
             }
             if (winner == null || me.inside) {
                 // Проезжаем первыми: закрепляем право, когда подъехали близко
-                if (me.inside || line < 16.0D) {
+                if ((me.inside || line < 16.0D) && (d.stillSince == 0L || now - d.stillSince < 1500L)) {
                     d.planGrantUntil = now + 5000L;
                 }
                 d.planHoldSince = 0L;
@@ -2822,7 +2826,7 @@ public final class PtmFixes {
             }
             if (!wasHold && line < stopDist - 1.0D) {
                 // Остановиться до перекрёстка уже нельзя: проезжаем, остальные пропустят
-                d.planGrantUntil = now + 5000L;
+                d.planGrantUntil = now + 3000L;
                 d.planHoldSince = 0L;
                 return false;
             }
@@ -2835,7 +2839,7 @@ public final class PtmFixes {
                 drvLog(d, now, "планировщик: уступает (" + reason + ") " + (int) PTMEntity.getX(v) + " " + (int) PTMEntity.getZ(v)
                     + (isPublic(v) ? " (транспорт)" : ""));
             } else if (now - d.planHoldSince > PLAN_MAX_HOLD_MS) {
-                d.planFreeUntil = now + 8000L;
+                d.planFreeUntil = now + 12000L;
                 d.planHoldSince = 0L;
                 drvLog(d, now, "планировщик: ждал слишком долго, отпускаю " + (int) PTMEntity.getX(v) + " " + (int) PTMEntity.getZ(v));
                 return false;
@@ -2908,9 +2912,10 @@ public final class PtmFixes {
             List<Object> all = new ArrayList<>(cols);
             if (all.size() == 7 && !PREV_ALL.containsKey(id)) {
                 Level level = levelOfScreen(fieldValue(box, "this$0"));
-                if (level != null) {
-                    java.util.Collections.rotate(all, -Math.floorMod(TimeHelper.weekday(level) - 1, 7));
-                }
+                int today = level != null ? Math.floorMod(TimeHelper.weekday(level) - 1, 7)
+                    : java.time.LocalDate.now().getDayOfWeek().getValue() - 1;
+                java.util.Collections.rotate(all, -today);
+                PTMLogger.info("PTM2 расписание: колонок " + cols.size() + ", сегодня день " + today + (level == null ? " (по системным часам)" : ""));
             } else if (PREV_ALL.containsKey(id) && PREV_ALL.get(id).size() == all.size()) {
                 all = new ArrayList<>(PREV_ALL.get(id));
             }
@@ -2952,6 +2957,29 @@ public final class PtmFixes {
     //  Остановки: автобус должен заезжать в карман (полосу с разметкой «зигзаг»), а не вставать на соседней полосе
     // ======================================================================
 
+    private static final java.util.Map<Long, Long> POCKET_LOG = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** Типы разметки в радиусе 2 блока от точки (для диагностики). */
+    private static String markingsAround(Level level, Object p) {
+        try {
+            int x = (int) Math.floor(vc(p, 0));
+            int y = (int) Math.floor(vc(p, 1));
+            int z = (int) Math.floor(vc(p, 2));
+            java.util.TreeSet<String> set = new java.util.TreeSet<>();
+            for (int dx = -2; dx <= 2; dx++) {
+                for (int dz = -2; dz <= 2; dz++) {
+                    RoadMarkingTypes t = markingAt(level, x + dx, y, z + dz);
+                    if (t != null) {
+                        set.add(t.name());
+                    }
+                }
+            }
+            return set.toString();
+        } catch (Throwable t) {
+            return "?";
+        }
+    }
+
     /** Есть ли у точки (Vec3) рядом разметка «зигзаг» остановочного кармана. */
     private static boolean isPocketPoint(Level level, Object p) throws ReflectiveOperationException {
         int x = (int) Math.floor(vc(p, 0));
@@ -2980,7 +3008,7 @@ public final class PtmFixes {
                 return cands;
             }
             Object lv = fieldValue(self, "level");
-            if (!(lv instanceof Level)) {
+            if (!(lv instanceof Level) || PTMWorld.isClient((Level) lv)) {
                 return cands;
             }
             initRefl();
@@ -2989,8 +3017,14 @@ public final class PtmFixes {
             }
             Level level = (Level) lv;
             double min = Double.MAX_VALUE;
+            Object bestPoint = null;
             for (Object o : cands) {
-                min = Math.min(min, (Double) ((com.rinventor.ptm2.engine.computing.Triad<?, ?, ?>) o).getFirst());
+                com.rinventor.ptm2.engine.computing.Triad<?, ?, ?> t0 = (com.rinventor.ptm2.engine.computing.Triad<?, ?, ?>) o;
+                if ((Double) t0.getFirst() < min) {
+                    min = (Double) t0.getFirst();
+                    Object th = t0.getThird();
+                    bestPoint = th instanceof VDTrafficLane ? ((VDTrafficLane) th).getEnd() : t0.getSecond();
+                }
             }
             List<Object> pocket = new ArrayList<>();
             for (Object o : cands) {
@@ -3008,6 +3042,19 @@ public final class PtmFixes {
                 if (p != null && isPocketPoint(level, p)) {
                     pocket.add(o);
                 }
+            }
+            try {
+                var plat = ((com.rinventor.ptm2.dimension.virtual.util.RoadPath) self).endPlatform;
+                long key = ((long) plat.getCenterX() << 32) ^ (plat.getCenterZ() & 0xFFFFFFFFL);
+                long now = System.currentTimeMillis();
+                Long last = POCKET_LOG.get(key);
+                if (last == null || now - last > 60000L) {
+                    POCKET_LOG.put(key, now);
+                    PTMLogger.info("PTM2 остановка: платформа " + plat.getCenterX() + " " + plat.getCenterZ() + ": полос-кандидатов " + cands.size()
+                        + ", с зигзагом достижимых " + pocket.size() + (pocket.isEmpty() ? ", разметка у лучшей полосы " + (bestPoint == null ? "?" : markingsAround(level, bestPoint)) : ", карман выбран"));
+                }
+            } catch (Throwable t) {
+                // диагностика не критична
             }
             return pocket.isEmpty() ? cands : pocket;
         } catch (Throwable t) {

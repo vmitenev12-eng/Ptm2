@@ -1805,8 +1805,24 @@ public final class PtmFixes {
                     REACH_POS.clear();
                 }
                 REACH_POS.put(key, new double[] {x, z, now});
-            } else if (distance < 150.0D && now - (long) rec[2] >= 3000L) {
-                return 150.0D;
+            } else if (distance < 150.0D) {
+                // автобус в соседней полосе (боковое смещение от точки остановки больше 2.5 блока) может просто ждать
+                // окна для перестроения: там открываем двери не раньше чем через 15 секунд
+                long need = 3000L;
+                try {
+                    double yaw = Math.toRadians(PTMEntity.getYaw(ve));
+                    double dx = vc(v.destination, 0) - x;
+                    double dz = vc(v.destination, 2) - z;
+                    double lat = Math.abs(-dx * Math.cos(yaw) + dz * (-Math.sin(yaw)));
+                    if (lat > 2.5D) {
+                        need = 15000L;
+                    }
+                } catch (Throwable ignored) {
+                    need = 3000L;
+                }
+                if (now - (long) rec[2] >= need) {
+                    return 150.0D;
+                }
             }
         } catch (Throwable t) {
             // не ломаем игру
@@ -2016,6 +2032,20 @@ public final class PtmFixes {
         long exitHoldSince;
         /** Машина впереди просит освободить место позади: до этого времени можно отъезжать назад. */
         long chainUntil;
+        /** Когда машина начала ждать у перекрёстка с занятым выездом (0 = не ждёт). */
+        long boxSince;
+        /** С какого момента отъезжающая назад машина ждёт, пока освободят место задние (0 = не ждёт). */
+        long backWait;
+        // --- планировщик перекрёстков
+        long planAt;
+        boolean planHold;
+        int planHoldFor;
+        long planHoldSince;
+        long planFreeUntil;
+        long planGrantUntil;
+        double planStop = -1.0D;
+        Pred pred;
+        long predAt;
     }
 
     static final Map<Integer, Drv> DRV = new ConcurrentHashMap<>();
@@ -2072,8 +2102,23 @@ public final class PtmFixes {
             if (!inside) {
                 d.committed = false;
                 d.zoneEntry = Double.NaN;
+                if (!red) {
+                    long nowMs = System.currentTimeMillis();
+                    if (boxBlocked(v, (Level) srg(v, "m_9236_"))) {
+                        if (d.boxSince == 0L) {
+                            d.boxSince = nowMs;
+                        }
+                        // не загораживаем перекрёсток: ждём у стоп-линии, но не дольше 15 секунд подряд
+                        if (nowMs - d.boxSince < 15000L) {
+                            return true;
+                        }
+                    } else {
+                        d.boxSince = 0L;
+                    }
+                }
                 return red;
             }
+            d.boxSince = 0L;
             if (d.committed) {
                 return false;
             }
@@ -2089,6 +2134,56 @@ public final class PtmFixes {
             PTMLogger.error(e);
         }
         return red;
+    }
+
+    /**
+     * За перекрёстком по ходу движения стоит машина (выезд занят): въезжать нельзя, иначе мы встанем посреди перекрёстка
+     * и перекроем поперечное движение. Проверяется только прямое направление на ближайшие 8 блоков до перекрёстка.
+     */
+    private static boolean boxBlocked(Vehicle v, Level level) {
+        if (level == null || Math.abs(v.speed) > 12.0F) {
+            return false;
+        }
+        double yaw = Math.toRadians(PTMEntity.getYaw(v));
+        double fx = -Math.sin(yaw);
+        double fz = Math.cos(yaw);
+        double x = PTMEntity.getX(v);
+        double z = PTMEntity.getZ(v);
+        double half = Math.max(0.0F, v.length) / 2.0D;
+        int entry = -1;
+        for (int k = 2; k <= 8; k++) {
+            if (inIntersectionAt(level, x + fx * (half + k), z + fz * (half + k))) {
+                entry = k;
+                break;
+            }
+        }
+        if (entry < 0) {
+            return false;
+        }
+        int exit = -1;
+        for (int k = entry + 1; k <= entry + 24; k++) {
+            if (!inIntersectionAt(level, x + fx * (half + k), z + fz * (half + k))) {
+                exit = k;
+                break;
+            }
+        }
+        if (exit < 0) {
+            return false;
+        }
+        double limit = half + exit + Math.max(0.0F, v.length) + 2.0D;
+        for (Vehicle o : PTMEntity.getDifferentVehicles(limit + 4.0D, v)) {
+            if (Math.abs(o.speed) >= 0.5F) {
+                continue;
+            }
+            double dx = PTMEntity.getX(o) - x;
+            double dz = PTMEntity.getZ(o) - z;
+            double along = dx * fx + dz * fz;
+            double lat = Math.abs(-dx * fz + dz * fx);
+            if (along > half + entry && along < limit && lat < v.width / 2.0D + o.width / 2.0D + 0.8D) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static double wrap180(double a) {
@@ -2161,20 +2256,36 @@ public final class PtmFixes {
                 return orig;
             }
             // Отъезд назад (уступаем более «старому» ожидающему)
-            // Цепочка: машина впереди не может отъехать назад, потому что позади стоим мы. Отъезжаем первыми, если есть место
+            // Цепочка: машина впереди не может отъехать назад, потому что позади стоим мы.
+            // Если позади свободно - отъезжаем первыми; если позади тоже стоят - просим их отъехать (запрос идёт по цепочке назад)
             if (!d.backing && now < d.chainUntil && still && d.stillSince > 0L && now - d.stillSince > 800L
-                && !(v instanceof Transport && ((Transport) v).doorsOpen) && spaceBehind(v, level)) {
-                d.backing = true;
-                d.backLeft = 5.0D;
-                d.chainUntil = 0L;
-                drvLog(d, now, "\u043e\u0442\u044a\u0435\u0437\u0436\u0430\u0435\u0442 \u043d\u0430\u0437\u0430\u0434, \u043e\u0441\u0432\u043e\u0431\u043e\u0436\u0434\u0430\u044f \u043c\u0435\u0441\u0442\u043e \u043f\u0435\u0440\u0435\u0434\u043d\u0435\u0439 \u043c\u0430\u0448\u0438\u043d\u0435 " + (int) PTMEntity.getX(v) + " " + (int) PTMEntity.getZ(v));
-            }
-            if (d.backing) {
-                if (d.backLeft > 0.0D && still && !spaceBehind(v, level)) {
+                && !(v instanceof Transport && ((Transport) v).doorsOpen)) {
+                if (spaceBehind(v, level)) {
+                    d.backing = true;
+                    d.backLeft = 5.0D;
+                    d.chainUntil = 0L;
+                    drvLog(d, now, "отъезжает назад, освобождая место передней машине " + (int) PTMEntity.getX(v) + " " + (int) PTMEntity.getZ(v));
+                } else {
                     markBehind(v, now);
                 }
-                if (d.backLeft <= 0.0D || !still || !spaceBehind(v, level) || !stepBack(v, 0.15D)) {
+            }
+            if (d.backing) {
+                boolean space = spaceBehind(v, level);
+                if (!space && d.backLeft > 0.0D && still) {
+                    // сзади занято: просим задних отъехать и ждём до 3.5 с
+                    markBehind(v, now);
+                    if (d.backWait == 0L) {
+                        d.backWait = now;
+                    }
+                    if (now - d.backWait < 3500L) {
+                        return false;
+                    }
+                } else {
+                    d.backWait = 0L;
+                }
+                if (d.backLeft <= 0.0D || !still || !space || !stepBack(v, 0.15D)) {
                     d.backing = false;
+                    d.backWait = 0L;
                     d.holdUntil = now + 6000L;
                     d.blockedSince = now;
                     return false;
@@ -2183,6 +2294,14 @@ public final class PtmFixes {
                 return false;
             }
             if (now < d.holdUntil) {
+                return false;
+            }
+            // Планировщик перекрёстка: заранее согласованный проезд (уступаем тому, кто должен проехать первым)
+            if ((orig || d.forced) && planHold(v, d, level, now)) {
+                d.blockedSince = 0L;
+                d.firstBlocked = 0L;
+                d.forced = false;
+                d.candidate = false;
                 return false;
             }
             if (orig) {
@@ -2311,6 +2430,349 @@ public final class PtmFixes {
         } catch (Exception e) {
             PTMLogger.error(e);
             return orig;
+        }
+    }
+
+    // ======================================================================
+    //  Планировщик перекрёстков: заранее согласованный проезд.
+    //  Каждая машина, подъезжающая к перекрёстку, строит прогноз: по каким точкам и в какое время она пройдёт зону.
+    //  Если её прогноз пересекается с прогнозом другой машины, по единым правилам определяется, кто проезжает первым:
+    //  уже внутри перекрёстка, тот кому уже дали проезд, знаки (главная дорога / уступи / стоп), поворот через встречный поток,
+    //  время подъезда (общественный транспорт получает запас), правило правой руки. Проигравший заранее сбавляет скорость
+    //  и останавливается у границы перекрёстка, а когда пересечение исчезает, едет дальше.
+    //  Обычный ИИ остаётся страховкой (физическая проверка, отъезд назад).
+    // ======================================================================
+
+    static final boolean PLAN_ENABLED = true;
+    /** Как часто машина пересчитывает прогноз. */
+    static final long PLAN_PERIOD_MS = 200L;
+    /** Дольше этого планировщик не держит машину подряд (дальше решает обычный ИИ). */
+    static final long PLAN_MAX_HOLD_MS = 14000L;
+    static final double PLAN_STEP = 1.5D;
+    static final int PLAN_POINTS = 26;
+    /** Запас времени общественному транспорту при определении очереди проезда, секунд. */
+    static final double PLAN_PUBLIC_BONUS = 2.0D;
+
+    /** Прогноз проезда одной машины. Точки: {x, z, fx, fz}. */
+    static final class Pred {
+        double[][] pts;
+        double[] t;
+        int in = -1;
+        int out = -1;
+        boolean inside;
+        double v0;
+        double len;
+        /** Угол поворота по пути, градусы: больше нуля - вправо, меньше - влево. */
+        double turn;
+        double hx;
+        double hz;
+    }
+
+    /** Время (с), за которое машина со скоростью v0 (м/с) проедет d блоков, разгоняясь до 6 м/с. */
+    private static double eta(double d, double v0) {
+        if (d <= 0.0D) {
+            return 0.0D;
+        }
+        double a = 2.0D;
+        double vc = Math.max(v0, 6.0D);
+        double da = (vc * vc - v0 * v0) / (2.0D * a);
+        if (d <= da) {
+            return (-v0 + Math.sqrt(v0 * v0 + 2.0D * a * d)) / a;
+        }
+        return (vc - v0) / a + (d - da) / vc;
+    }
+
+    /** Строит прогноз для машины. rest - считать, что она стартует с места (так прогнозируется ждущая машина). */
+    private static Pred makePred(Vehicle x, Level level, boolean rest) {
+        double[][] pa = pathAhead(x, PLAN_STEP, PLAN_POINTS);
+        double ox = PTMEntity.getX(x);
+        double oz = PTMEntity.getZ(x);
+        double spd = Math.abs(x.speed) * 0.2778D;
+        if (pa == null) {
+            // Нет известного пути (машина игрока): едет прямо, если движется
+            if (spd < 1.0D) {
+                return null;
+            }
+            double[] h = headingOf(x);
+            pa = new double[PLAN_POINTS][];
+            for (int i = 0; i < PLAN_POINTS; i++) {
+                pa[i] = new double[] {h[0] * i * PLAN_STEP, h[1] * i * PLAN_STEP, h[0], h[1]};
+            }
+        }
+        Pred p = new Pred();
+        int n = pa.length;
+        p.pts = new double[n][];
+        p.t = new double[n];
+        p.v0 = rest ? 0.0D : spd;
+        p.len = x.length * Math.max(1, x.totalSections);
+        for (int i = 0; i < n; i++) {
+            p.pts[i] = new double[] {ox + pa[i][0], oz + pa[i][1], pa[i][2], pa[i][3]};
+            p.t[i] = eta(i * PLAN_STEP, p.v0);
+            boolean zin = inIntersectionAt(level, p.pts[i][0], p.pts[i][1]);
+            if (i == 0) {
+                p.inside = zin;
+            }
+            if (p.in < 0) {
+                if (zin) {
+                    p.in = i;
+                }
+            } else if (p.out < 0 && !zin) {
+                p.out = i;
+            }
+        }
+        if (p.in >= 0 && p.out < 0) {
+            p.out = n - 1;
+        }
+        int e = p.out >= 0 ? p.out : n - 1;
+        double[] f0 = p.pts[p.in >= 0 ? p.in : 0];
+        double[] f1 = p.pts[e];
+        p.hx = f0[2];
+        p.hz = f0[3];
+        double cross = f0[2] * f1[3] - f0[3] * f1[2];
+        double dot = f0[2] * f1[2] + f0[3] * f1[3];
+        p.turn = Math.toDegrees(Math.atan2(cross, dot));
+        return p;
+    }
+
+    private static Pred predOf(Vehicle o, Level level, long now) {
+        Drv od = drv(o);
+        if (od.pred != null && now - od.predAt < PLAN_PERIOD_MS) {
+            return od.pred;
+        }
+        Pred p = makePred(o, level, od.planHold);
+        od.pred = p;
+        od.predAt = now;
+        return p;
+    }
+
+    /** Пересекаются ли в пространстве и времени пути двух машин в зоне перекрёстка машины a (попутные направления не считаются). */
+    private static boolean pathsConflict(Pred a, Pred b, Vehicle va, Vehicle vb) {
+        if (a.in < 0) {
+            return false;
+        }
+        double hlA = va.length / 2.0D + 0.4D;
+        double hwA = va.width / 2.0D + 0.4D;
+        double hlB = vb.length / 2.0D + 0.4D;
+        double hwB = vb.width / 2.0D + 0.4D;
+        double reach = hlA + hwA + hlB + hwB;
+        double gap = 1.3D + (a.len + b.len) / 10.0D;
+        int from = Math.max(0, a.in - 1);
+        int to = Math.min(a.pts.length - 1, a.out + 1);
+        for (int i = from; i <= to; i++) {
+            double[] pi = a.pts[i];
+            for (int k = 0; k < b.pts.length; k++) {
+                double[] pk = b.pts[k];
+                double dx = pi[0] - pk[0];
+                double dz = pi[1] - pk[1];
+                if (dx * dx + dz * dz > reach * reach) {
+                    continue;
+                }
+                if (pi[2] * pk[2] + pi[3] * pk[3] > 0.7D) {
+                    continue;
+                }
+                if (Math.abs(a.t[i] - b.t[k]) > gap) {
+                    continue;
+                }
+                if (rectOverlap(pi[0], pi[1], pi[2], pi[3], hlA, hwA, pk[0], pk[1], pk[2], pk[3], hlB, hwB)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private static boolean isPublic(Vehicle x) {
+        return x instanceof Transport;
+    }
+
+    /** Ранг знака приоритета: чем больше, тем выше приоритет. */
+    private static int signRank(Vehicle x) {
+        com.rinventor.ptm2.core.properties.SignTypes s = x.prioritySign;
+        if (s == com.rinventor.ptm2.core.properties.SignTypes.STOP) {
+            return 0;
+        }
+        if (s == com.rinventor.ptm2.core.properties.SignTypes.GIVE_WAY) {
+            return 1;
+        }
+        if (s == com.rinventor.ptm2.core.properties.SignTypes.MAIN_ROAD) {
+            return 3;
+        }
+        return 2;
+    }
+
+    /** Время до входа в зону перекрёстка (0, если уже внутри). */
+    private static double etaIn(Pred p) {
+        return p.inside || p.in < 0 ? 0.0D : p.t[p.in];
+    }
+
+    /**
+     * Должна ли машина v уступить машине o (их прогнозы пересекаются)? Возвращает причину или null, если v проезжает первой.
+     * Правила одинаковы для обеих машин, поэтому они приходят к согласованному решению.
+     */
+    private static String yieldReason(Vehicle v, Drv d, Pred me, Vehicle o, Drv od, Pred po, boolean leftTraffic, long now) {
+        if (o.requiresTracks || o.vehicleType == VehicleTypes.TRAM) {
+            return "трамвай";
+        }
+        if (po.inside && !me.inside) {
+            return "уже на перекрёстке";
+        }
+        if (me.inside && !po.inside) {
+            return null;
+        }
+        boolean oGrant = od != null && od.planGrantUntil > now;
+        boolean meGrant = d.planGrantUntil > now;
+        if (oGrant != meGrant) {
+            return oGrant ? "ему уже дан проезд" : null;
+        }
+        int sm = signRank(v);
+        int so = signRank(o);
+        if (sm != so) {
+            return sm < so ? "знак приоритета" : null;
+        }
+        double opp = me.hx * po.hx + me.hz * po.hz;
+        boolean mAcross = leftTraffic ? me.turn > 35.0D : me.turn < -35.0D;
+        boolean oAcross = leftTraffic ? po.turn > 35.0D : po.turn < -35.0D;
+        if (opp < -0.7D && mAcross != oAcross) {
+            return mAcross ? "поворот через встречный поток" : null;
+        }
+        double tMe = etaIn(me) - (isPublic(v) ? PLAN_PUBLIC_BONUS : 0.0D);
+        double tO = etaIn(po) - (isPublic(o) ? PLAN_PUBLIC_BONUS : 0.0D);
+        if (Math.abs(tMe - tO) > 1.2D) {
+            return tMe > tO ? "он приедет раньше" : null;
+        }
+        if (Math.abs(opp) < 0.7D) {
+            double yaw = Math.toRadians(PTMEntity.getYaw(v));
+            double fx = -Math.sin(yaw);
+            double fz = Math.cos(yaw);
+            double dx = PTMEntity.getX(o) - PTMEntity.getX(v);
+            double dz = PTMEntity.getZ(o) - PTMEntity.getZ(v);
+            double side = dx * (-fz) + dz * fx;
+            if (leftTraffic) {
+                side = -side;
+            }
+            if (Math.abs(side) > 0.5D) {
+                return side > 0.0D ? "помеха справа" : null;
+            }
+        }
+        return System.identityHashCode(o) < System.identityHashCode(v) ? "очередность" : null;
+    }
+
+    /**
+     * Планировщик: true - машине нужно ждать (тормозить и стоять у границы перекрёстка), чтобы пропустить другую машину.
+     * Решение пересчитывается раз в PLAN_PERIOD_MS, между пересчётами действует прежнее.
+     */
+    private static boolean planHold(Vehicle v, Drv d, Level level, long now) {
+        if (!PLAN_ENABLED) {
+            return false;
+        }
+        try {
+            if (v.requiresTracks || v.crashed || v.handBrake || !v.ai || (v instanceof Transport && ((Transport) v).doorsOpen)) {
+                d.planHold = false;
+                d.planHoldSince = 0L;
+                return false;
+            }
+            if (now < d.planFreeUntil) {
+                return false;
+            }
+            if (now - d.planAt < PLAN_PERIOD_MS) {
+                if (d.planHold && d.planStop >= 0.0D) {
+                    v.intersectionStopProgress = d.planStop;
+                }
+                return d.planHold;
+            }
+            d.planAt = now;
+            boolean wasHold = d.planHold;
+            d.planHold = false;
+            d.planHoldFor = 0;
+            d.planStop = -1.0D;
+            if (VDUtils.enteringRoundabout(v)) {
+                d.planHoldSince = 0L;
+                return false;
+            }
+            Pred me = makePred(v, level, wasHold);
+            if (me == null || me.in < 0) {
+                d.planHoldSince = 0L;
+                return false;
+            }
+            boolean leftTraffic = ((WorldSavedData) PTM.DATA.get(level)).LEFT_TRAFFIC;
+            Vehicle winner = null;
+            String reason = null;
+            double winnerEta = 1.0E9D;
+            for (Vehicle o : PTMEntity.getDifferentVehicles(70.0D, v)) {
+                if (o.sectionID != 0) {
+                    continue;
+                }
+                Drv od = DRV.get(System.identityHashCode(o));
+                boolean known = od != null && now - od.seen < 2000L;
+                boolean oInside = inIntersectionAt(level, PTMEntity.getX(o), PTMEntity.getZ(o));
+                if (known) {
+                    if (od.planHold) {
+                        continue;
+                    }
+                    if (!od.lastOrig && !od.forced && !oInside) {
+                        continue;
+                    }
+                } else if (Math.abs(o.speed) < 1.0F && !oInside) {
+                    continue;
+                }
+                Pred po = predOf(o, level, now);
+                if (po == null || po.in < 0) {
+                    continue;
+                }
+                if (!pathsConflict(me, po, v, o)) {
+                    continue;
+                }
+                String r = yieldReason(v, d, me, o, od, po, leftTraffic, now);
+                if (r != null) {
+                    double e = etaIn(po);
+                    if (winner == null || e < winnerEta) {
+                        winner = o;
+                        reason = r;
+                        winnerEta = e;
+                    }
+                }
+            }
+            double vms = Math.abs(v.speed) * 0.2778D;
+            double bd = Math.max(1.5D, v.maxBrakeDeceleration * 0.8D);
+            double stopDist = vms * vms / (2.0D * bd) + 2.0D;
+            double line = me.inside ? 0.0D : Math.max(0.0D, me.in * PLAN_STEP - v.length / 2.0D - 1.2D);
+            if (winner == null || me.inside) {
+                // Проезжаем первыми: закрепляем право, когда подъехали близко
+                if (me.inside || line < 16.0D) {
+                    d.planGrantUntil = now + 5000L;
+                }
+                d.planHoldSince = 0L;
+                return false;
+            }
+            if (!wasHold && line < stopDist - 1.0D) {
+                // Остановиться до перекрёстка уже нельзя: проезжаем, остальные пропустят
+                d.planGrantUntil = now + 5000L;
+                d.planHoldSince = 0L;
+                return false;
+            }
+            if (!wasHold && line > stopDist * 1.6D + 3.0D) {
+                // Решение принято, но тормозить ещё рано: едем дальше, пока конфликт не пропадёт или не придёт время тормозить
+                return false;
+            }
+            if (d.planHoldSince == 0L) {
+                d.planHoldSince = now;
+                drvLog(d, now, "планировщик: уступает (" + reason + ") " + (int) PTMEntity.getX(v) + " " + (int) PTMEntity.getZ(v)
+                    + (isPublic(v) ? " (транспорт)" : ""));
+            } else if (now - d.planHoldSince > PLAN_MAX_HOLD_MS) {
+                d.planFreeUntil = now + 8000L;
+                d.planHoldSince = 0L;
+                drvLog(d, now, "планировщик: ждал слишком долго, отпускаю " + (int) PTMEntity.getX(v) + " " + (int) PTMEntity.getZ(v));
+                return false;
+            }
+            d.planHold = true;
+            d.planHoldFor = System.identityHashCode(winner);
+            d.planStop = v.pathProgress + line;
+            v.intersectionStopProgress = d.planStop;
+            return true;
+        } catch (Throwable t) {
+            PTMLogger.warn("PTM2 fixes: ошибка планировщика перекрёстка: " + t);
+            d.planHold = false;
+            return false;
         }
     }
 
@@ -2715,7 +3177,7 @@ public final class PtmFixes {
         }
     }
 
-    /** Просит машины, стоящие вплотную позади, отъехать назад первыми (цепочка отъезда). */
+    /** Просит машины, стоящие вплотную позади (в том же направлении), отъехать назад первыми (цепочка отъезда). */
     private static void markBehind(Vehicle v, long now) {
         double yaw = Math.toRadians(PTMEntity.getYaw(v));
         double fx = -Math.sin(yaw);
@@ -2727,7 +3189,8 @@ public final class PtmFixes {
             double dz = PTMEntity.getZ(o) - z;
             double along = dx * fx + dz * fz;
             double lat = Math.abs(-dx * fz + dz * fx);
-            if (along < 0.0D && along > -(v.length / 2.0D + o.length / 2.0D + 2.0D) && lat < v.width / 2.0D + o.width / 2.0D + 0.8D) {
+            if (along < 0.0D && along > -(v.length / 2.0D + o.length / 2.0D + 4.0D) && lat < v.width / 2.0D + o.width / 2.0D + 0.8D
+                && Math.abs(wrap180(PTMEntity.getYaw(v) - PTMEntity.getYaw(o))) <= 50.0D) {
                 Drv od = DRV.get(System.identityHashCode(o));
                 if (od != null) {
                     od.chainUntil = now + 4000L;
@@ -2834,6 +3297,10 @@ public final class PtmFixes {
         boolean iLose = me > he || (me == he && System.identityHashCode(v) > System.identityHashCode(b));
         boolean canBack = spaceBehind(v, level);
         if (iLose) {
+            if (!canBack) {
+                // отъехать некуда: просим стоящих позади освободить место
+                markBehind(v, System.currentTimeMillis());
+            }
             return canBack;
         }
         return canBack && !spaceBehind(b, level);

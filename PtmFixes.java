@@ -2046,6 +2046,9 @@ public final class PtmFixes {
         double planStop = -1.0D;
         Pred pred;
         long predAt;
+        boolean planCreep;
+        boolean planCreepOn;
+        float planSavedTarget;
     }
 
     static final Map<Integer, Drv> DRV = new ConcurrentHashMap<>();
@@ -2302,7 +2305,8 @@ public final class PtmFixes {
                 d.firstBlocked = 0L;
                 d.forced = false;
                 d.candidate = false;
-                return false;
+                // подползаем к линии на малой скорости или стоим у неё
+                return d.planCreep;
             }
             if (orig) {
                 d.blockedSince = 0L;
@@ -2662,6 +2666,71 @@ public final class PtmFixes {
      * Решение пересчитывается раз в PLAN_PERIOD_MS, между пересчётами действует прежнее.
      */
     private static boolean planHold(Vehicle v, Drv d, Level level, long now) {
+        boolean r = planHold0(v, d, level, now);
+        if (!r) {
+            d.planCreep = false;
+            if (d.planCreepOn) {
+                // удержание снято: возвращаем целевую скорость, чтобы машина сразу поехала
+                if (d.planSavedTarget > v.targetSpeed) {
+                    v.targetSpeed = d.planSavedTarget;
+                }
+                d.planCreepOn = false;
+            }
+        }
+        return r;
+    }
+
+    /** Подъезд к линии: на малой скорости машина подползает к стоп-линии (canMove=true с ограниченной целевой скоростью), а у линии встаёт. */
+    private static void planApply(Vehicle v, Drv d) {
+        double rem = d.planStop - v.pathProgress;
+        double vms = Math.abs(v.speed) * 0.2778D;
+        if (rem > 1.0D && vms < 3.5D) {
+            double tgt = Math.max(5.0D, Math.min(12.0D, 3.6D * Math.sqrt(2.4D * (rem - 1.0D))));
+            if (!d.planCreepOn) {
+                d.planSavedTarget = v.targetSpeed;
+                d.planCreepOn = true;
+            }
+            if (v.targetSpeed > tgt) {
+                v.targetSpeed = (float) tgt;
+            }
+            d.planCreep = true;
+        } else {
+            d.planCreep = false;
+            v.intersectionStopProgress = d.planStop;
+        }
+    }
+
+    /**
+     * Расстояние (блоков вдоль пути от центра машины) до стоп-линии или зебры, лежащей на пути до входа в перекрёсток;
+     * -1, если разметки нет. Как и в оригинале, машина останавливается так, чтобы перед линией был запас в 1 блок.
+     */
+    private static double markingStop(Vehicle v, Level level, Pred me) {
+        try {
+            initRefl();
+            if (!reflOk || me.in < 0) {
+                return -1.0D;
+            }
+            int y = (int) Math.floor(PTMEntity.getY(v));
+            int last = Math.min(me.pts.length - 1, me.in + 1);
+            boolean moving = Math.abs(v.speed) > 0.5F;
+            for (int i = moving ? 1 : 0; i <= last; i++) {
+                double[] pt = me.pts[i];
+                double sx = -pt[3];
+                double sz = pt[2];
+                for (int k = -2; k <= 2; k++) {
+                    RoadMarkingTypes t = markingAt(level, (int) Math.floor(pt[0] + sx * k), y, (int) Math.floor(pt[1] + sz * k));
+                    if (t == RoadMarkingTypes.STOP || t == RoadMarkingTypes.CROSSING) {
+                        return i * PLAN_STEP;
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            // нет разметки - остановимся у границы зоны
+        }
+        return -1.0D;
+    }
+
+    private static boolean planHold0(Vehicle v, Drv d, Level level, long now) {
         if (!PLAN_ENABLED) {
             return false;
         }
@@ -2676,7 +2745,7 @@ public final class PtmFixes {
             }
             if (now - d.planAt < PLAN_PERIOD_MS) {
                 if (d.planHold && d.planStop >= 0.0D) {
-                    v.intersectionStopProgress = d.planStop;
+                    planApply(v, d);
                 }
                 return d.planHold;
             }
@@ -2736,6 +2805,13 @@ public final class PtmFixes {
             double bd = Math.max(1.5D, v.maxBrakeDeceleration * 0.8D);
             double stopDist = vms * vms / (2.0D * bd) + 2.0D;
             double line = me.inside ? 0.0D : Math.max(0.0D, me.in * PLAN_STEP - v.length / 2.0D - 1.2D);
+            if (winner != null && !me.inside) {
+                // Останавливаемся перед стоп-линией/зеброй, а не просто у границы зоны
+                double mk = markingStop(v, level, me);
+                if (mk >= 0.0D) {
+                    line = Math.min(line, Math.max(0.0D, mk - v.length / 2.0D - 1.0D));
+                }
+            }
             if (winner == null || me.inside) {
                 // Проезжаем первыми: закрепляем право, когда подъехали близко
                 if (me.inside || line < 16.0D) {
@@ -2767,12 +2843,175 @@ public final class PtmFixes {
             d.planHold = true;
             d.planHoldFor = System.identityHashCode(winner);
             d.planStop = v.pathProgress + line;
-            v.intersectionStopProgress = d.planStop;
+            planApply(v, d);
             return true;
         } catch (Throwable t) {
             PTMLogger.warn("PTM2 fixes: ошибка планировщика перекрёстка: " + t);
             d.planHold = false;
             return false;
+        }
+    }
+
+    // ======================================================================
+    //  Окно предпросмотра расписания: больше трёх дней (по одному на день недели)
+    //  Показываются три дня, начиная с сегодняшнего; нажатие на расписание листает дальше по три дня.
+    // ======================================================================
+
+    private static final java.util.Map<Integer, List<Object>> PREV_ALL = new java.util.concurrent.ConcurrentHashMap<>();
+    private static final java.util.Map<Integer, Integer> PREV_OFF = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** Находит поле (в том числе унаследованное) по имени. */
+    private static Object fieldValue(Object o, String name) {
+        try {
+            for (Class<?> c = o.getClass(); c != null; c = c.getSuperclass()) {
+                try {
+                    java.lang.reflect.Field f = c.getDeclaredField(name);
+                    f.setAccessible(true);
+                    return f.get(o);
+                } catch (NoSuchFieldException e) {
+                    // ищем выше
+                }
+            }
+        } catch (Throwable t) {
+            // нет доступа
+        }
+        return null;
+    }
+
+    private static Level levelOfScreen(Object screen) {
+        Object l = screen == null ? null : fieldValue(screen, "level");
+        return l instanceof Level ? (Level) l : null;
+    }
+
+    /** Индекс сегодняшнего дня (понедельник = 0) в списке из семи дней, иначе 0. */
+    public static int todayIndex(Object comboBox, Object screen) {
+        try {
+            int count = ((com.rinventor.ptm2.engine.component.ComboBox) comboBox).count();
+            Level level = levelOfScreen(screen);
+            if (count == 7 && level != null) {
+                return Math.floorMod(TimeHelper.weekday(level) - 1, 7);
+            }
+        } catch (Throwable t) {
+            // по умолчанию первый вариант
+        }
+        return 0;
+    }
+
+    /** SchedulePreviewBox.setColumns: если дней больше трёх, показываем окно из трёх колонок, начиная с сегодняшнего дня. */
+    public static List<?> previewColumns(List<?> cols, Object box) {
+        try {
+            int id = System.identityHashCode(box);
+            if (cols == null || cols.size() <= 3) {
+                PREV_ALL.remove(id);
+                return cols;
+            }
+            List<Object> all = new ArrayList<>(cols);
+            if (all.size() == 7 && !PREV_ALL.containsKey(id)) {
+                Level level = levelOfScreen(fieldValue(box, "this$0"));
+                if (level != null) {
+                    java.util.Collections.rotate(all, -Math.floorMod(TimeHelper.weekday(level) - 1, 7));
+                }
+            } else if (PREV_ALL.containsKey(id) && PREV_ALL.get(id).size() == all.size()) {
+                all = new ArrayList<>(PREV_ALL.get(id));
+            }
+            PREV_ALL.put(id, all);
+            int off = PREV_OFF.getOrDefault(id, 0) % all.size();
+            return previewWindow(all, off);
+        } catch (Throwable t) {
+            return cols;
+        }
+    }
+
+    private static List<Object> previewWindow(List<Object> all, int off) {
+        List<Object> r = new ArrayList<>();
+        for (int i = 0; i < 3; i++) {
+            r.add(all.get((off + i) % all.size()));
+        }
+        return r;
+    }
+
+    /** Нажатие на окно предпросмотра: следующие три дня. */
+    public static void previewClick(Object box) {
+        try {
+            int id = System.identityHashCode(box);
+            List<Object> all = PREV_ALL.get(id);
+            if (all == null || all.size() <= 3) {
+                return;
+            }
+            int off = (PREV_OFF.getOrDefault(id, 0) + 3) % all.size();
+            PREV_OFF.put(id, off);
+            java.lang.reflect.Field f = box.getClass().getDeclaredField("columns");
+            f.setAccessible(true);
+            f.set(box, new ArrayList<>(previewWindow(all, off)));
+        } catch (Throwable t) {
+            // не критично
+        }
+    }
+
+    // ======================================================================
+    //  Остановки: автобус должен заезжать в карман (полосу с разметкой «зигзаг»), а не вставать на соседней полосе
+    // ======================================================================
+
+    /** Есть ли у точки (Vec3) рядом разметка «зигзаг» остановочного кармана. */
+    private static boolean isPocketPoint(Level level, Object p) throws ReflectiveOperationException {
+        int x = (int) Math.floor(vc(p, 0));
+        int y = (int) Math.floor(vc(p, 1));
+        int z = (int) Math.floor(vc(p, 2));
+        for (int dx = -1; dx <= 1; dx++) {
+            for (int dz = -1; dz <= 1; dz++) {
+                if (markingAt(level, x + dx, y, z + dz) == RoadMarkingTypes.ZIG_ZAG) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * RoadPath.getBestEndCandidate: при пути к платформе (endPlatform) оставляем только полосы кармана (зигзаг),
+     * достижимые по графу, если такие есть неподалёку от лучшего кандидата. Иначе список не меняется.
+     */
+    public static List<?> pocketCandidates(Object self, List<?> cands, java.util.Map<?, ?> dist, boolean tram) {
+        try {
+            if (tram || cands == null || cands.size() < 2 || dist == null) {
+                return cands;
+            }
+            if (((com.rinventor.ptm2.dimension.virtual.util.RoadPath) self).endPlatform == null) {
+                return cands;
+            }
+            Object lv = fieldValue(self, "level");
+            if (!(lv instanceof Level)) {
+                return cands;
+            }
+            initRefl();
+            if (!reflOk) {
+                return cands;
+            }
+            Level level = (Level) lv;
+            double min = Double.MAX_VALUE;
+            for (Object o : cands) {
+                min = Math.min(min, (Double) ((com.rinventor.ptm2.engine.computing.Triad<?, ?, ?>) o).getFirst());
+            }
+            List<Object> pocket = new ArrayList<>();
+            for (Object o : cands) {
+                com.rinventor.ptm2.engine.computing.Triad<?, ?, ?> t = (com.rinventor.ptm2.engine.computing.Triad<?, ?, ?>) o;
+                if ((Double) t.getFirst() > min + 10.0D) {
+                    continue;
+                }
+                Object node = t.getSecond();
+                Object reach = node == null ? null : dist.get(node);
+                if (!(reach instanceof Double) || ((Double) reach).isInfinite()) {
+                    continue;
+                }
+                Object third = t.getThird();
+                Object p = third instanceof VDTrafficLane ? ((VDTrafficLane) third).getEnd() : node;
+                if (p != null && isPocketPoint(level, p)) {
+                    pocket.add(o);
+                }
+            }
+            return pocket.isEmpty() ? cands : pocket;
+        } catch (Throwable t) {
+            return cands;
         }
     }
 
@@ -3379,6 +3618,9 @@ public final class PtmFixes {
     public static boolean mergeBlocked(Vehicle v, VDTrafficLane lane, boolean orig, Level level) {
         if (orig) {
             return true;
+        }
+        if (PTMWorld.isClient(v)) {
+            return orig;
         }
         try {
             if (lane == null || lane.getStart() == null || lane.getEnd() == null) {
@@ -4719,7 +4961,7 @@ public final class PtmFixes {
 
     /** Внутри депо транспорт не считает другой транспорт препятствием. */
     public static Vehicle clearance(Vehicle v, double distance, Vehicle orig, Level level) {
-        if (v instanceof Transport) {
+        if (v instanceof Transport && !PTMWorld.isClient(v)) {
             int ok = System.identityHashCode(v);
             standLog((Transport) v, ok);
             if (orig != null) {

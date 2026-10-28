@@ -136,7 +136,7 @@ public class Patcher implements Opcodes {
         if (mismatch) {
             System.exit(1);
         }
-        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay", "gate-bankcard", "boarding-fare", "gate-exit-radius", "gate-exit-auto", "gate-in-radius", "terminal-cap", "arrival-reach", "arrival-inside", "lamp-cap", "red-commit", "patience", "bypass-still", "merge-check", "player-ahead", "merge-width", "parallel-width", "auto-links", "link-revision", "bus-priority", "validator", "wheel-filter", "hull", "depot-ui", "depot-select", "schedule-toggle", "schedule-edit", "editor-updateOptions", "editor-updateRouteList1", "editor-updateRouteList2", "editor-createRow1", "editor-createRow2", "editor-add", "editor-tick", "day-options", "day-loops", "board-arriving", "schedule-screen", "schedule-real", "schedule-cache", "depot-order", "depot-spawn", "depot-spawn2", "garage-fleet", "depot-park", "depot-return", "terminal-pax", "depot-clear", "depot-crash", "gravity-reset"};
+        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay", "gate-bankcard", "boarding-fare", "gate-exit-radius", "gate-exit-auto", "gate-in-radius", "terminal-cap", "arrival-reach", "arrival-inside", "lamp-cap", "red-commit", "patience", "bypass-still", "merge-check", "player-ahead", "merge-width", "parallel-width", "auto-links", "link-revision", "bus-priority", "validator", "wheel-filter", "hull", "depot-ui", "depot-select", "schedule-toggle", "schedule-edit", "editor-updateOptions", "editor-updateRouteList1", "editor-updateRouteList2", "editor-createRow1", "editor-createRow2", "editor-add", "editor-tick", "day-options", "day-loops", "day-today", "preview-columns", "preview-click", "stop-pocket", "board-arriving", "schedule-screen", "schedule-real", "schedule-cache", "depot-order", "depot-spawn", "depot-spawn2", "garage-fleet", "depot-park", "depot-return", "terminal-pax", "depot-clear", "depot-crash", "gravity-reset"};
         for (String r : required) {
             if (!done.contains(r)) {
                 System.err.println("ERROR: patch not applied: " + r);
@@ -158,7 +158,7 @@ public class Patcher implements Opcodes {
     }
 
     static byte[] patchClass(String name, byte[] data) {
-        boolean target = name.equals(OPD) || name.equals(ATM) || name.equals(VU) || name.equals(VSH) || name.equals(PTE) || name.equals(TRN) || name.equals(GATE_IN) || name.equals(VEH) || name.equals(GATE_EXIT) || name.equals(TM) || name.equals(TBM) || name.equals(VUT) || name.equals(TLU) || name.equals(RPATH) || name.equals(LES) || name.equals("com/rinventor/ptm2/dimension/virtual/util/ScheduleUtils") || name.equals("com/rinventor/ptm2/dimension/digital/screens/ScheduleEditScreen") || name.equals("com/rinventor/ptm2/dimension/virtual/util/Departures") || name.equals("com/rinventor/ptm2/dimension/digital/screens/LineViewScreen") || name.equals("com/rinventor/ptm2/dimension/digital/panels/PlatformSchedulePanel") || name.equals("com/rinventor/ptm2/dimension/digital/screens/SchedulePreviewScreen");
+        boolean target = name.equals(OPD) || name.equals(ATM) || name.equals(VU) || name.equals(VSH) || name.equals(PTE) || name.equals(TRN) || name.equals(GATE_IN) || name.equals(VEH) || name.equals(GATE_EXIT) || name.equals(TM) || name.equals(TBM) || name.equals(VUT) || name.equals(TLU) || name.equals(RPATH) || name.equals(LES) || name.equals("com/rinventor/ptm2/dimension/virtual/util/ScheduleUtils") || name.equals("com/rinventor/ptm2/dimension/digital/screens/ScheduleEditScreen") || name.equals("com/rinventor/ptm2/dimension/virtual/util/Departures") || name.equals("com/rinventor/ptm2/dimension/digital/screens/LineViewScreen") || name.equals("com/rinventor/ptm2/dimension/digital/panels/PlatformSchedulePanel") || name.equals("com/rinventor/ptm2/dimension/digital/screens/SchedulePreviewScreen") || name.equals("com/rinventor/ptm2/dimension/digital/screens/SchedulePreviewScreen$SchedulePreviewBox");
         boolean flags = contains(data, "INDEFINITE_BANK_ACCOUNT") || contains(data, "INDEFINITE_TRANSPORT_CARD");
         if (!target && !flags) {
             return data;
@@ -474,6 +474,49 @@ public class Patcher implements Opcodes {
                     }
                 }
             }
+        }
+        if (name.equals("com/rinventor/ptm2/dimension/digital/screens/LineViewScreen")
+            || name.equals("com/rinventor/ptm2/dimension/digital/panels/PlatformSchedulePanel")) {
+            // Выбор дня по умолчанию: сегодняшний (если доступны все семь дней), а не понедельник
+            for (MethodNode m : cn.methods) {
+                AbstractInsnNode[] all = m.instructions.toArray();
+                for (int i = 2; i < all.length; i++) {
+                    if (all[i] instanceof MethodInsnNode && ((MethodInsnNode) all[i]).name.equals("setSelectedIndex")
+                        && all[i - 1].getOpcode() == ICONST_0
+                        && all[i - 2] instanceof org.objectweb.asm.tree.FieldInsnNode
+                        && ((org.objectweb.asm.tree.FieldInsnNode) all[i - 2]).name.equals("dayBox")) {
+                        InsnList repl = new InsnList();
+                        repl.add(new InsnNode(DUP));
+                        repl.add(new VarInsnNode(ALOAD, 0));
+                        repl.add(new MethodInsnNode(INVOKESTATIC, FIXES, "todayIndex", "(Ljava/lang/Object;Ljava/lang/Object;)I", false));
+                        m.instructions.insertBefore(all[i - 1], repl);
+                        m.instructions.remove(all[i - 1]);
+                        done.add("day-today");
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if (name.equals("com/rinventor/ptm2/dimension/digital/screens/SchedulePreviewScreen$SchedulePreviewBox")) {
+            // Окно предпросмотра: три колонки из семи дней, начиная с сегодняшнего; нажатие листает дальше
+            InsnList cols = new InsnList();
+            cols.add(new VarInsnNode(ALOAD, 1));
+            cols.add(new VarInsnNode(ALOAD, 0));
+            cols.add(new MethodInsnNode(INVOKESTATIC, FIXES, "previewColumns", "(Ljava/util/List;Ljava/lang/Object;)Ljava/util/List;", false));
+            cols.add(new VarInsnNode(ASTORE, 1));
+            if (insertAtStart(cn, "setColumns", "(Ljava/util/List;)V", cols)) {
+                done.add("preview-columns");
+                changed = true;
+            }
+            MethodNode click = new MethodNode(ACC_PUBLIC, "componentClicked", "(DD)V", null, null);
+            click.instructions.add(new VarInsnNode(ALOAD, 0));
+            click.instructions.add(new MethodInsnNode(INVOKESTATIC, FIXES, "previewClick", "(Ljava/lang/Object;)V", false));
+            click.instructions.add(new InsnNode(RETURN));
+            click.maxStack = 1;
+            click.maxLocals = 5;
+            cn.methods.add(click);
+            done.add("preview-click");
+            changed = true;
         }
         if (name.equals("com/rinventor/ptm2/dimension/digital/screens/ScheduleEditScreen")) {
             for (MethodNode m : cn.methods) {
@@ -961,6 +1004,18 @@ public class Patcher implements Opcodes {
                 w.maxLocals = 2;
                 cn.methods.add(w);
                 done.add("link-revision");
+                changed = true;
+            }
+            // Остановка у платформы: конечная полоса пути - карман (зигзаг), а не соседняя полоса
+            InsnList pocket = new InsnList();
+            pocket.add(new VarInsnNode(ALOAD, 0));
+            pocket.add(new VarInsnNode(ALOAD, 1));
+            pocket.add(new VarInsnNode(ALOAD, 2));
+            pocket.add(new VarInsnNode(ILOAD, 4));
+            pocket.add(new MethodInsnNode(INVOKESTATIC, FIXES, "pocketCandidates", "(Ljava/lang/Object;Ljava/util/List;Ljava/util/Map;Z)Ljava/util/List;", false));
+            pocket.add(new VarInsnNode(ASTORE, 1));
+            if (insertAtStart(cn, "getBestEndCandidate", "(Ljava/util/List;Ljava/util/Map;Ljava/util/Map;Z)Lcom/rinventor/ptm2/engine/computing/Triad;", pocket)) {
+                done.add("stop-pocket");
                 changed = true;
             }
         }

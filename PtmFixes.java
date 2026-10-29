@@ -3302,9 +3302,25 @@ public final class PtmFixes {
         }
     }
 
-    /** Панель зоны парковки: список «Тип зоны». */
+    /**
+     * Панель зоны парковки: список «Тип зоны». Весь клиентский код вынесен во вложенный класс Ui: на выделенном сервере класс PtmFixes
+     * тоже загружается и проверяется, а ссылки на клиентские виджеты (ComboBox, ScaledLabel) заставляют проверку загрузить клиентские
+     * классы, что на сервере приводит к падению.
+     */
     public static void addZoneTypeBox(Object panel, Object level, Object entry, int id) {
         try {
+            Ui.addZoneTypeBox(panel, level, entry, id);
+        } catch (Throwable t) {
+            PTMLogger.warn("PTM2 fixes: не удалось добавить выбор типа зоны: " + t);
+        }
+    }
+
+    /** Клиентский интерфейс: загружается только на клиенте и только при вызове. */
+    static final class Ui {
+        private Ui() {
+        }
+
+        static void addZoneTypeBox(Object panel, Object level, Object entry, int id) {
             com.rinventor.ptm2.dimension.digital.panels.ParkingZonePanel p = (com.rinventor.ptm2.dimension.digital.panels.ParkingZonePanel) panel;
             Level lv = (Level) level;
             final int[] cur = {zoneType(entry)};
@@ -3319,8 +3335,6 @@ public final class PtmFixes {
             });
             cb.setSelectedIndex(Math.max(0, Math.min(2, cur[0])));
             p.addWidget(cb, new com.rinventor.ptm2.engine.screen.Fragment(cb));
-        } catch (Throwable t) {
-            PTMLogger.warn("PTM2 fixes: не удалось добавить выбор типа зоны: " + t);
         }
     }
 

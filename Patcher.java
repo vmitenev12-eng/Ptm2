@@ -136,7 +136,7 @@ public class Patcher implements Opcodes {
         if (mismatch) {
             System.exit(1);
         }
-        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay", "gate-bankcard", "boarding-fare", "gate-exit-radius", "gate-exit-auto", "gate-in-radius", "terminal-cap", "arrival-reach", "arrival-inside", "lamp-cap", "red-commit", "patience", "bypass-still", "merge-check", "player-ahead", "merge-width", "parallel-width", "auto-links", "link-revision", "bus-priority", "validator", "wheel-filter", "hull", "depot-ui", "depot-select", "schedule-toggle", "schedule-edit", "editor-updateOptions", "editor-updateRouteList1", "editor-updateRouteList2", "editor-createRow1", "editor-createRow2", "editor-add", "editor-tick", "day-options", "day-loops", "day-today", "preview-columns", "preview-click", "stop-pocket", "board-arriving", "schedule-screen", "schedule-real", "schedule-cache", "depot-order", "depot-spawn", "depot-spawn2", "garage-fleet", "depot-park", "depot-return", "terminal-pax", "depot-clear", "depot-crash", "gravity-reset"};
+        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay", "gate-bankcard", "boarding-fare", "gate-exit-radius", "gate-exit-auto", "gate-in-radius", "terminal-cap", "arrival-reach", "arrival-inside", "lamp-cap", "red-commit", "patience", "bypass-still", "merge-check", "player-ahead", "merge-width", "parallel-width", "auto-links", "link-revision", "bus-priority", "validator", "wheel-filter", "hull", "depot-ui", "depot-select", "schedule-toggle", "schedule-edit", "editor-updateOptions", "editor-updateRouteList1", "editor-updateRouteList2", "editor-createRow1", "editor-createRow2", "editor-add", "editor-tick", "day-options", "day-loops", "day-today", "preview-columns", "preview-click", "stop-pocket", "range-transportRange", "range-trafficRange", "range-near", "range-track", "zone-save", "zone-prop", "zone-load", "zone-ui", "board-arriving", "schedule-screen", "schedule-real", "schedule-cache", "depot-order", "depot-spawn", "depot-spawn2", "garage-fleet", "depot-park", "depot-return", "terminal-pax", "depot-clear", "depot-crash", "gravity-reset"};
         for (String r : required) {
             if (!done.contains(r)) {
                 System.err.println("ERROR: patch not applied: " + r);
@@ -158,7 +158,7 @@ public class Patcher implements Opcodes {
     }
 
     static byte[] patchClass(String name, byte[] data) {
-        boolean target = name.equals(OPD) || name.equals(ATM) || name.equals(VU) || name.equals(VSH) || name.equals(PTE) || name.equals(TRN) || name.equals(GATE_IN) || name.equals(VEH) || name.equals(GATE_EXIT) || name.equals(TM) || name.equals(TBM) || name.equals(VUT) || name.equals(TLU) || name.equals(RPATH) || name.equals(LES) || name.equals("com/rinventor/ptm2/dimension/virtual/util/ScheduleUtils") || name.equals("com/rinventor/ptm2/dimension/digital/screens/ScheduleEditScreen") || name.equals("com/rinventor/ptm2/dimension/virtual/util/Departures") || name.equals("com/rinventor/ptm2/dimension/digital/screens/LineViewScreen") || name.equals("com/rinventor/ptm2/dimension/digital/panels/PlatformSchedulePanel") || name.equals("com/rinventor/ptm2/dimension/digital/screens/SchedulePreviewScreen") || name.equals("com/rinventor/ptm2/dimension/digital/screens/SchedulePreviewScreen$SchedulePreviewBox");
+        boolean target = name.equals(OPD) || name.equals(ATM) || name.equals(VU) || name.equals(VSH) || name.equals(PTE) || name.equals(TRN) || name.equals(GATE_IN) || name.equals(VEH) || name.equals(GATE_EXIT) || name.equals(TM) || name.equals(TBM) || name.equals(VUT) || name.equals(TLU) || name.equals(RPATH) || name.equals(LES) || name.equals("com/rinventor/ptm2/dimension/virtual/util/ScheduleUtils") || name.equals("com/rinventor/ptm2/dimension/digital/screens/ScheduleEditScreen") || name.equals("com/rinventor/ptm2/dimension/virtual/util/Departures") || name.equals("com/rinventor/ptm2/dimension/digital/screens/LineViewScreen") || name.equals("com/rinventor/ptm2/dimension/digital/panels/PlatformSchedulePanel") || name.equals("com/rinventor/ptm2/dimension/digital/screens/SchedulePreviewScreen") || name.equals("com/rinventor/ptm2/dimension/digital/screens/SchedulePreviewScreen$SchedulePreviewBox") || name.equals("com/rinventor/ptm2/dimension/virtual/systems/PlayerTracker") || name.equals("com/rinventor/ptm2/dimension/virtual/types/VDParkingZone") || name.equals("com/rinventor/ptm2/dimension/digital/panels/ParkingZonePanel");
         boolean flags = contains(data, "INDEFINITE_BANK_ACCOUNT") || contains(data, "INDEFINITE_TRANSPORT_CARD");
         if (!target && !flags) {
             return data;
@@ -495,6 +495,128 @@ public class Patcher implements Opcodes {
                         changed = true;
                     }
                 }
+            }
+        }
+        if (name.equals("com/rinventor/ptm2/dimension/virtual/types/VDParkingZone")) {
+            // Тип зоны: поле zoneType, сохранение (zt=), чтение и свойство 12 для редактора
+            final String ZC = "com/rinventor/ptm2/dimension/virtual/types/VDParkingZone";
+            cn.fields.add(new org.objectweb.asm.tree.FieldNode(ACC_PUBLIC, "zoneType", "I", null, null));
+            for (MethodNode m : new java.util.ArrayList<>(cn.methods)) {
+                if (m.name.equals("toString") && m.desc.equals("()Ljava/lang/String;")) {
+                    m.name = "ptmToString";
+                    MethodNode w = new MethodNode(ACC_PUBLIC, "toString", "()Ljava/lang/String;", null, null);
+                    w.instructions.add(new VarInsnNode(ALOAD, 0));
+                    w.instructions.add(new MethodInsnNode(INVOKEVIRTUAL, ZC, "ptmToString", "()Ljava/lang/String;", false));
+                    w.instructions.add(new VarInsnNode(ALOAD, 0));
+                    w.instructions.add(new org.objectweb.asm.tree.FieldInsnNode(GETFIELD, ZC, "zoneType", "I"));
+                    w.instructions.add(new MethodInsnNode(INVOKESTATIC, FIXES, "withZoneType", "(Ljava/lang/String;I)Ljava/lang/String;", false));
+                    w.instructions.add(new InsnNode(ARETURN));
+                    w.maxStack = 2;
+                    w.maxLocals = 1;
+                    cn.methods.add(w);
+                    done.add("zone-save");
+                    changed = true;
+                } else if (m.name.equals("setProperty") && m.desc.equals("(ILjava/lang/String;)V")) {
+                    m.name = "ptmSetProperty";
+                    MethodNode w = new MethodNode(ACC_PUBLIC, "setProperty", "(ILjava/lang/String;)V", null, null);
+                    w.instructions.add(new VarInsnNode(ALOAD, 0));
+                    w.instructions.add(new VarInsnNode(ILOAD, 1));
+                    w.instructions.add(new VarInsnNode(ALOAD, 2));
+                    w.instructions.add(new MethodInsnNode(INVOKESTATIC, FIXES, "setZoneProp", "(Ljava/lang/Object;ILjava/lang/String;)V", false));
+                    w.instructions.add(new VarInsnNode(ALOAD, 0));
+                    w.instructions.add(new VarInsnNode(ILOAD, 1));
+                    w.instructions.add(new VarInsnNode(ALOAD, 2));
+                    w.instructions.add(new MethodInsnNode(INVOKEVIRTUAL, ZC, "ptmSetProperty", "(ILjava/lang/String;)V", false));
+                    w.instructions.add(new InsnNode(RETURN));
+                    w.maxStack = 3;
+                    w.maxLocals = 3;
+                    cn.methods.add(w);
+                    done.add("zone-prop");
+                    changed = true;
+                } else if (m.name.equals("<init>") && m.desc.equals("(Ljava/lang/String;)V")) {
+                    for (AbstractInsnNode in : m.instructions.toArray()) {
+                        if (in.getOpcode() == RETURN) {
+                            InsnList rd = new InsnList();
+                            rd.add(new VarInsnNode(ALOAD, 0));
+                            rd.add(new VarInsnNode(ALOAD, 1));
+                            rd.add(new MethodInsnNode(INVOKESTATIC, FIXES, "zoneTypeOfData", "(Ljava/lang/String;)I", false));
+                            rd.add(new org.objectweb.asm.tree.FieldInsnNode(PUTFIELD, ZC, "zoneType", "I"));
+                            m.instructions.insertBefore(in, rd);
+                            done.add("zone-load");
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        if (name.equals("com/rinventor/ptm2/dimension/digital/panels/ParkingZonePanel")) {
+            // В панели зоны парковки добавляем выбор типа зоны
+            for (MethodNode m : cn.methods) {
+                if (m.name.equals("<init>")) {
+                    for (AbstractInsnNode in : m.instructions.toArray()) {
+                        if (in.getOpcode() == RETURN) {
+                            InsnList ui = new InsnList();
+                            ui.add(new VarInsnNode(ALOAD, 0));
+                            ui.add(new VarInsnNode(ALOAD, 1));
+                            ui.add(new VarInsnNode(ALOAD, 7));
+                            ui.add(new VarInsnNode(ILOAD, 8));
+                            ui.add(new MethodInsnNode(INVOKESTATIC, FIXES, "addZoneTypeBox", "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;I)V", false));
+                            m.instructions.insertBefore(in, ui);
+                            done.add("zone-ui");
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        if (name.equals("com/rinventor/ptm2/dimension/virtual/systems/PlayerTracker")) {
+            // У каждого игрока своя дальность (а не наименьшая на всех)
+            final String LV = "Lnet/minecraft/world/level/Level;";
+            for (String[] spec : new String[][] {{"physicalTransportRange", "transportRange"}, {"physicalTrafficRange", "trafficRange"}}) {
+                MethodNode orig = null;
+                for (MethodNode m : cn.methods) {
+                    if (m.name.equals(spec[0]) && m.desc.equals("(" + LV + ")I")) {
+                        orig = m;
+                    }
+                }
+                if (orig != null) {
+                    orig.name = "ptmOrig_" + spec[0];
+                    MethodNode w = new MethodNode(ACC_PUBLIC | ACC_STATIC, spec[0], "(" + LV + ")I", null, null);
+                    w.instructions.add(new VarInsnNode(ALOAD, 0));
+                    w.instructions.add(new MethodInsnNode(INVOKESTATIC, FIXES, spec[1], "(Ljava/lang/Object;)I", false));
+                    w.instructions.add(new InsnNode(IRETURN));
+                    w.maxStack = 1;
+                    w.maxLocals = 1;
+                    cn.methods.add(w);
+                    done.add("range-" + spec[1]);
+                    changed = true;
+                }
+            }
+            MethodNode near = null;
+            for (MethodNode m : cn.methods) {
+                if (m.name.equals("anyPlayerNear") && m.desc.equals("(Lnet/minecraft/world/phys/Vec3;I)Z")) {
+                    near = m;
+                }
+            }
+            if (near != null) {
+                near.name = "ptmOrig_anyPlayerNear";
+                MethodNode w = new MethodNode(ACC_PUBLIC | ACC_STATIC, "anyPlayerNear", "(Lnet/minecraft/world/phys/Vec3;I)Z", null, null);
+                w.instructions.add(new VarInsnNode(ALOAD, 0));
+                w.instructions.add(new VarInsnNode(ILOAD, 1));
+                w.instructions.add(new MethodInsnNode(INVOKESTATIC, FIXES, "anyNear", "(Ljava/lang/Object;I)Z", false));
+                w.instructions.add(new InsnNode(IRETURN));
+                w.maxStack = 2;
+                w.maxLocals = 2;
+                cn.methods.add(w);
+                done.add("range-near");
+                changed = true;
+            }
+            InsnList track = new InsnList();
+            track.add(new VarInsnNode(ALOAD, 0));
+            track.add(new MethodInsnNode(INVOKESTATIC, FIXES, "trackPositions", "(Ljava/util/Map;)V", false));
+            if (insertAtStart(cn, "setTrackedPlayerPositions", "(Ljava/util/Map;)V", track)) {
+                done.add("range-track");
+                changed = true;
             }
         }
         if (name.equals("com/rinventor/ptm2/dimension/digital/screens/SchedulePreviewScreen$SchedulePreviewBox")) {

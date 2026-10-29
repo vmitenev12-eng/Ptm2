@@ -86,7 +86,7 @@ public final class PtmFixes {
      * 1) даёт название станциям, у которых его нет;
      * 2) привязывает каждую платформу к станции, в зоне которой она находится.
      */
-    public static final String BUILD = "fixes-2026-10-28-plan2-pocket";
+    public static final String BUILD = "fixes-2026-10-29-zones";
     private static boolean announced = false;
 
     public static void tick(Level level) {
@@ -2451,7 +2451,7 @@ public final class PtmFixes {
     /** Как часто машина пересчитывает прогноз. */
     static final long PLAN_PERIOD_MS = 200L;
     /** Дольше этого планировщик не держит машину подряд (дальше решает обычный ИИ). */
-    static final long PLAN_MAX_HOLD_MS = 7000L;
+    static final long PLAN_MAX_HOLD_MS = 4500L;
     static final double PLAN_STEP = 1.5D;
     static final int PLAN_POINTS = 26;
     /** Запас времени общественному транспорту при определении очереди проезда, секунд. */
@@ -2751,6 +2751,12 @@ public final class PtmFixes {
             }
             d.planAt = now;
             boolean wasHold = d.planHold;
+            if (!wasHold && Math.abs(v.speed) < 3.0F) {
+                // Стоим или ползём: подъезд к перекрёстку здесь решает обычный ИИ
+                d.planHoldSince = 0L;
+                d.planAt = now;
+                return false;
+            }
             d.planHold = false;
             d.planHoldFor = 0;
             d.planStop = -1.0D;
@@ -2772,21 +2778,17 @@ public final class PtmFixes {
                     continue;
                 }
                 Drv od = DRV.get(System.identityHashCode(o));
-                boolean known = od != null && now - od.seen < 2000L;
-                boolean oSlow = Math.abs(o.speed) < 3.0F;
-                if (known) {
+                // Планировщик работает на подъезде: стоящих и ползущих в очереди решает обычный ИИ (иначе машины держат друг друга)
+                if (Math.abs(o.speed) < 5.0F) {
+                    continue;
+                }
+                if (od != null && now - od.seen < 2000L) {
                     if (od.planHold) {
                         continue;
                     }
-                    // Не уступаем тем, кто сам стоит или ждёт: иначе (особенно на перекрёстке) машины держат друг друга
-                    if (!od.lastOrig && !od.forced && oSlow) {
+                    if (!od.lastOrig && !od.forced) {
                         continue;
                     }
-                    if (Math.abs(o.speed) < 1.0F && od.stillSince > 0L && now - od.stillSince > 1500L) {
-                        continue;
-                    }
-                } else if (Math.abs(o.speed) < 1.0F) {
-                    continue;
                 }
                 Pred po = predOf(o, level, now);
                 if (po == null || po.in < 0) {
@@ -2839,7 +2841,7 @@ public final class PtmFixes {
                 drvLog(d, now, "планировщик: уступает (" + reason + ") " + (int) PTMEntity.getX(v) + " " + (int) PTMEntity.getZ(v)
                     + (isPublic(v) ? " (транспорт)" : ""));
             } else if (now - d.planHoldSince > PLAN_MAX_HOLD_MS) {
-                d.planFreeUntil = now + 12000L;
+                d.planFreeUntil = now + 15000L;
                 d.planHoldSince = 0L;
                 drvLog(d, now, "планировщик: ждал слишком долго, отпускаю " + (int) PTMEntity.getX(v) + " " + (int) PTMEntity.getZ(v));
                 return false;
@@ -2980,19 +2982,24 @@ public final class PtmFixes {
         }
     }
 
-    /** Есть ли у точки (Vec3) рядом разметка «зигзаг» остановочного кармана. */
-    private static boolean isPocketPoint(Level level, Object p) throws ReflectiveOperationException {
-        int x = (int) Math.floor(vc(p, 0));
+    /** Расстояние от точки (Vec3) до ближайшей клетки разметки «зигзаг» в радиусе 3 блока; 99, если рядом её нет. */
+    private static double zigzagDist(Level level, Object p) throws ReflectiveOperationException {
+        double px = vc(p, 0);
         int y = (int) Math.floor(vc(p, 1));
-        int z = (int) Math.floor(vc(p, 2));
-        for (int dx = -1; dx <= 1; dx++) {
-            for (int dz = -1; dz <= 1; dz++) {
+        double pz = vc(p, 2);
+        int x = (int) Math.floor(px);
+        int z = (int) Math.floor(pz);
+        double best = 99.0D;
+        for (int dx = -3; dx <= 3; dx++) {
+            for (int dz = -3; dz <= 3; dz++) {
                 if (markingAt(level, x + dx, y, z + dz) == RoadMarkingTypes.ZIG_ZAG) {
-                    return true;
+                    double cx = x + dx + 0.5D - px;
+                    double cz = z + dz + 0.5D - pz;
+                    best = Math.min(best, Math.sqrt(cx * cx + cz * cz));
                 }
             }
         }
-        return false;
+        return best;
     }
 
     /**
@@ -3026,7 +3033,10 @@ public final class PtmFixes {
                     bestPoint = th instanceof VDTrafficLane ? ((VDTrafficLane) th).getEnd() : t0.getSecond();
                 }
             }
-            List<Object> pocket = new ArrayList<>();
+            // Среди достижимых полос выбираем ту, под которой (ближе всего к центру полосы) лежит зигзаг: это и есть карман
+            List<Object> reachable = new ArrayList<>();
+            List<Double> scores = new ArrayList<>();
+            double bestScore = 99.0D;
             for (Object o : cands) {
                 com.rinventor.ptm2.engine.computing.Triad<?, ?, ?> t = (com.rinventor.ptm2.engine.computing.Triad<?, ?, ?>) o;
                 if ((Double) t.getFirst() > min + 10.0D) {
@@ -3038,9 +3048,18 @@ public final class PtmFixes {
                     continue;
                 }
                 Object third = t.getThird();
-                Object p = third instanceof VDTrafficLane ? ((VDTrafficLane) third).getEnd() : node;
-                if (p != null && isPocketPoint(level, p)) {
-                    pocket.add(o);
+                Object pt = third instanceof VDTrafficLane ? ((VDTrafficLane) third).getEnd() : node;
+                double sc = pt == null ? 99.0D : zigzagDist(level, pt);
+                reachable.add(o);
+                scores.add(sc);
+                bestScore = Math.min(bestScore, sc);
+            }
+            List<Object> pocket = new ArrayList<>();
+            if (bestScore <= 2.5D) {
+                for (int k = 0; k < reachable.size(); k++) {
+                    if (scores.get(k) <= bestScore + 0.75D) {
+                        pocket.add(reachable.get(k));
+                    }
                 }
             }
             try {
@@ -3051,7 +3070,7 @@ public final class PtmFixes {
                 if (last == null || now - last > 60000L) {
                     POCKET_LOG.put(key, now);
                     PTMLogger.info("PTM2 остановка: платформа " + plat.getCenterX() + " " + plat.getCenterZ() + ": полос-кандидатов " + cands.size()
-                        + ", с зигзагом достижимых " + pocket.size() + (pocket.isEmpty() ? ", разметка у лучшей полосы " + (bestPoint == null ? "?" : markingsAround(level, bestPoint)) : ", карман выбран"));
+                        + ", достижимых " + reachable.size() + ", лучший зигзаг на расстоянии " + String.format("%.1f", bestScore) + ", выбрано " + pocket.size() + (pocket.isEmpty() ? ", разметка у лучшей полосы " + (bestPoint == null ? "?" : markingsAround(level, bestPoint)) : ", карман выбран"));
                 }
             } catch (Throwable t) {
                 // диагностика не критична
@@ -3059,6 +3078,249 @@ public final class PtmFixes {
             return pocket.isEmpty() ? cands : pocket;
         } catch (Throwable t) {
             return cands;
+        }
+    }
+
+    // ======================================================================
+    //  Дальности игроков: у каждого игрока своя, а не минимальная на всех
+    //  Оригинал берёт наименьшую дальность прорисовки среди всех игроков и применяет её ко всем: пока рядом игрок
+    //  с маленькой дальностью, у остальных транспорт пропадает (уходит в виртуальный режим) слишком близко.
+    //  Теперь машина существует, если хотя бы для одного игрока она в пределах ЕГО дальности.
+    //  Всё считает сервер; клиент только рисует то, что сервер ему передал.
+    // ======================================================================
+
+    private static volatile Map<java.util.UUID, Object> PV_POS = new java.util.HashMap<>();
+    private static volatile int LAST_T;
+    private static volatile int LAST_F;
+    private static volatile Object LAST_LEVEL;
+    private static java.lang.reflect.Field vdField;
+    private static volatile long limitsAt;
+    private static volatile int limSim = -1;
+    private static volatile int limView = 32;
+    private static volatile boolean rangeWarned;
+
+    /** PlayerTracker.setTrackedPlayerPositions: запоминаем позиции игроков вместе с их UUID. */
+    public static void trackPositions(Map<?, ?> m) {
+        Map<java.util.UUID, Object> copy = new java.util.HashMap<>();
+        try {
+            for (Map.Entry<?, ?> e : m.entrySet()) {
+                copy.put((java.util.UUID) e.getKey(), e.getValue());
+            }
+        } catch (Throwable t) {
+            // не критично
+        }
+        PV_POS = copy;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<java.util.UUID, Integer> viewDistances() {
+        try {
+            if (vdField == null) {
+                vdField = com.rinventor.ptm2.dimension.virtual.systems.PlayerTracker.class.getDeclaredField("playerViewDistances");
+                vdField.setAccessible(true);
+            }
+            return (Map<java.util.UUID, Integer>) vdField.get(null);
+        } catch (Throwable t) {
+            return java.util.Collections.emptyMap();
+        }
+    }
+
+    /** Серверные пределы (кэшируются на 2 секунды): дальность симуляции в блоках минус 16 и дальность прорисовки в чанках. */
+    private static void refreshLimits(Object level) {
+        long now = System.currentTimeMillis();
+        if (now - limitsAt < 2000L) {
+            return;
+        }
+        limitsAt = now;
+        try {
+            Object server = level == null ? null : srg(level, "m_7654_");
+            Object list = server == null ? null : srg(server, "m_6846_");
+            if (list != null) {
+                limSim = ((Number) srg(list, "m_184213_")).intValue() * 16 - 16;
+                limView = ((Number) srg(list, "m_11312_")).intValue();
+            }
+        } catch (Throwable t) {
+            // остаются прежние значения
+        }
+    }
+
+    private static int clampRange(Object level, int r) {
+        refreshLimits(level);
+        return limSim <= 0 ? r : Math.max(16, Math.min(r, limSim));
+    }
+
+    private static int transportRangeOf(Object level, java.util.UUID id) {
+        Integer vd = viewDistances().get(id);
+        return clampRange(level, vd == null ? 96 : vd - 10);
+    }
+
+    private static int trafficRangeOf(Object level, java.util.UUID id) {
+        Integer vd = viewDistances().get(id);
+        refreshLimits(level);
+        return clampRange(level, (vd == null ? limView * 16 : vd) - 16);
+    }
+
+    /** PlayerTracker.physicalTransportRange: наибольшая дальность среди игроков (проверка «рядом ли игрок» делается по каждому отдельно). */
+    public static int transportRange(Object level) {
+        LAST_LEVEL = level;
+        int r = 0;
+        Map<java.util.UUID, Object> pm = PV_POS;
+        if (pm.isEmpty()) {
+            r = clampRange(level, 96);
+        } else {
+            for (java.util.UUID id : pm.keySet()) {
+                r = Math.max(r, transportRangeOf(level, id));
+            }
+        }
+        LAST_T = r;
+        return r;
+    }
+
+    /** PlayerTracker.physicalTrafficRange: то же для легкового транспорта. */
+    public static int trafficRange(Object level) {
+        LAST_LEVEL = level;
+        int r = 0;
+        Map<java.util.UUID, Object> pm = PV_POS;
+        if (pm.isEmpty()) {
+            refreshLimits(level);
+            r = clampRange(level, limView * 16 - 16);
+        } else {
+            for (java.util.UUID id : pm.keySet()) {
+                r = Math.max(r, trafficRangeOf(level, id));
+            }
+        }
+        LAST_F = r;
+        return r;
+    }
+
+    /**
+     * PlayerTracker.anyPlayerNear(Vec3, int): если радиус получен из дальностей транспорта или легковых (оригинал вызывает
+     * physicalTransportRange / physicalTrafficRange, а при возрождении вычитает 4), то для каждого игрока берём его собственную дальность.
+     * Для остальных вызовов (часы, объекты) работает прежний круг заданного радиуса.
+     */
+    public static boolean anyNear(Object pos, int radius) {
+        try {
+            double px = vc(pos, 0);
+            double py = vc(pos, 1);
+            double pz = vc(pos, 2);
+            Map<java.util.UUID, Object> pm = PV_POS;
+            int offT = LAST_T - radius;
+            boolean tKind = LAST_T > 0 && (offT == 0 || offT == 4);
+            int offF = LAST_F - radius;
+            boolean fKind = !tKind && LAST_F > 0 && offF == 0;
+            if (pm.isEmpty() || (!tKind && !fKind) || LAST_LEVEL == null) {
+                double rr = (double) radius * (double) radius;
+                for (Object pp : com.rinventor.ptm2.dimension.virtual.systems.PlayerTracker.getPlayerPositions()) {
+                    double dx = vc(pp, 0) - px;
+                    double dy = vc(pp, 1) - py;
+                    double dz = vc(pp, 2) - pz;
+                    if (dx * dx + dy * dy + dz * dz < rr) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+            for (Map.Entry<java.util.UUID, Object> e : pm.entrySet()) {
+                int r = tKind ? transportRangeOf(LAST_LEVEL, e.getKey()) - offT : trafficRangeOf(LAST_LEVEL, e.getKey()) - offF;
+                double dx = vc(e.getValue(), 0) - px;
+                double dy = vc(e.getValue(), 1) - py;
+                double dz = vc(e.getValue(), 2) - pz;
+                if (dx * dx + dy * dy + dz * dz < (double) r * (double) r) {
+                    return true;
+                }
+            }
+            return false;
+        } catch (Throwable t) {
+            if (!rangeWarned) {
+                rangeWarned = true;
+                PTMLogger.warn("PTM2 fixes: ошибка проверки дальности игроков: " + t);
+            }
+            return true;
+        }
+    }
+
+    // ======================================================================
+    //  Типы зон парковки: «стоянка», «спавн и удаление», «оба»
+    //  Тип хранится в данных зоны как поле zt (0 = стоянка, 1 = спавн и удаление, 2 = и то и другое);
+    //  в редакторе карты он выбирается списком в панели зоны. Зоны разных типов могут лежать друг в друге.
+    // ======================================================================
+
+    public static final int ZONE_PARK = 0;
+    public static final int ZONE_SPAWN = 1;
+    public static final int ZONE_BOTH = 2;
+    private static final String[] ZONE_TYPE_NAMES = {"Стоянка", "Спавн и удаление", "Стоянка и спавн/удаление"};
+    private static java.lang.reflect.Field zoneTypeField;
+
+    /** VDParkingZone.toString: дописывает тип зоны (0 - по умолчанию, не пишется). */
+    public static String withZoneType(String s, int t) {
+        if (s == null || t == 0) {
+            return s;
+        }
+        int i = s.lastIndexOf(']');
+        return i < 0 ? s : s.substring(0, i) + ",zt=" + t + s.substring(i);
+    }
+
+    /** VDParkingZone(String): читает тип зоны из данных. */
+    public static int zoneTypeOfData(String data) {
+        try {
+            if (data == null) {
+                return 0;
+            }
+            String v = VDUtils.getValue(data, "zt");
+            return v == null ? 0 : Math.max(0, Math.min(2, Integer.parseInt(v.trim())));
+        } catch (Throwable t) {
+            return 0;
+        }
+    }
+
+    private static java.lang.reflect.Field zoneField() throws ReflectiveOperationException {
+        if (zoneTypeField == null) {
+            zoneTypeField = com.rinventor.ptm2.dimension.virtual.types.VDParkingZone.class.getDeclaredField("zoneType");
+            zoneTypeField.setAccessible(true);
+        }
+        return zoneTypeField;
+    }
+
+    /** Тип зоны парковки (0, если поле недоступно). */
+    public static int zoneType(Object zone) {
+        try {
+            return zoneField().getInt(zone);
+        } catch (Throwable t) {
+            return 0;
+        }
+    }
+
+    /** VDParkingZone.setProperty: свойство 12 = тип зоны. */
+    public static void setZoneProp(Object zone, int id, String value) {
+        if (id != 12) {
+            return;
+        }
+        try {
+            zoneField().setInt(zone, Math.max(0, Math.min(2, Integer.parseInt(value.trim()))));
+        } catch (Throwable t) {
+            // не критично
+        }
+    }
+
+    /** Панель зоны парковки: список «Тип зоны». */
+    public static void addZoneTypeBox(Object panel, Object level, Object entry, int id) {
+        try {
+            com.rinventor.ptm2.dimension.digital.panels.ParkingZonePanel p = (com.rinventor.ptm2.dimension.digital.panels.ParkingZonePanel) panel;
+            Level lv = (Level) level;
+            final int[] cur = {zoneType(entry)};
+            com.rinventor.ptm2.engine.component.ScaledLabel lbl = new com.rinventor.ptm2.engine.component.ScaledLabel(0, 0, 100, 12, "Тип зоны", com.rinventor.ptm2.engine.graphics.Colors.text(), true, false, false);
+            p.addWidget(lbl, new com.rinventor.ptm2.engine.screen.Fragment(lbl));
+            ComboBox cb = new ComboBox(0, 0, 100, 20, java.util.Arrays.asList(ZONE_TYPE_NAMES), (c) -> {
+                int v = ((ComboBox) c).getSelectedIndex();
+                if (v >= 0 && v != cur[0]) {
+                    cur[0] = v;
+                    com.rinventor.ptm2.dimension.virtual.storage.VDStorageHandler.updateVal(lv, VDMemoryIDs.PARKING_ZONE, id, 12, String.valueOf(v));
+                }
+            });
+            cb.setSelectedIndex(Math.max(0, Math.min(2, cur[0])));
+            p.addWidget(cb, new com.rinventor.ptm2.engine.screen.Fragment(cb));
+        } catch (Throwable t) {
+            PTMLogger.warn("PTM2 fixes: не удалось добавить выбор типа зоны: " + t);
         }
     }
 
@@ -4098,6 +4360,7 @@ public final class PtmFixes {
         double wy;
         double wz;
         long msgAt;
+        long rideAt;
     }
 
     static final Map<String, Rec> RECS = new ConcurrentHashMap<>();
@@ -4166,6 +4429,21 @@ public final class PtmFixes {
                     }
                     EXEMPT.remove(name);
                 }
+                // Игрок сидит (или садится) на сиденье: место может лежать вне габарита корпуса, возвращать игрока нельзя
+                boolean riding = false;
+                try {
+                    riding = srg(p, "m_20202_") != null;
+                } catch (Throwable t) {
+                    // не критично
+                }
+                if (riding) {
+                    Rec rr = RECS.get(rk);
+                    if (rr != null) {
+                        rr.inside = true;
+                        rr.rideAt = now;
+                    }
+                    continue;
+                }
                 int insideIdx = -1;
                 Vehicle insideSec = null;
                 for (int i = 0; i < v.totalSections; i++) {
@@ -4189,6 +4467,12 @@ public final class PtmFixes {
                     continue;
                 }
                 if (r.inside == now0) {
+                    track(r, p, insideSec, insideIdx);
+                    continue;
+                }
+                if (!allowed && now - r.rideAt < 1500L) {
+                    // только что встал с сиденья: границу корпуса не считаем нарушением
+                    r.inside = now0;
                     track(r, p, insideSec, insideIdx);
                     continue;
                 }

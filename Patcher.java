@@ -136,7 +136,7 @@ public class Patcher implements Opcodes {
         if (mismatch) {
             System.exit(1);
         }
-        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay", "gate-bankcard", "boarding-fare", "gate-exit-radius", "gate-exit-auto", "gate-in-radius", "terminal-cap", "arrival-reach", "arrival-inside", "lamp-cap", "red-commit", "patience", "bypass-still", "merge-check", "player-ahead", "merge-width", "parallel-width", "auto-links", "link-revision", "bus-priority", "validator", "wheel-filter", "hull", "depot-ui", "depot-select", "schedule-toggle", "schedule-edit", "editor-updateOptions", "editor-updateRouteList1", "editor-updateRouteList2", "editor-createRow1", "editor-createRow2", "editor-add", "editor-tick", "day-options", "day-loops", "day-today", "preview-columns", "preview-click", "stop-pocket", "range-transportRange", "range-trafficRange", "range-near", "range-track", "zone-save", "zone-prop", "zone-load", "zone-ui", "board-arriving", "schedule-screen", "schedule-real", "schedule-cache", "depot-order", "depot-spawn", "depot-spawn2", "garage-fleet", "depot-park", "depot-return", "terminal-pax", "depot-clear", "depot-crash", "gravity-reset"};
+        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay", "gate-bankcard", "boarding-fare", "gate-exit-radius", "gate-exit-auto", "gate-in-radius", "terminal-cap", "arrival-reach", "arrival-inside", "lamp-cap", "red-commit", "patience", "bypass-still", "merge-check", "player-ahead", "merge-width", "parallel-width", "auto-links", "link-revision", "bus-priority", "validator", "wheel-filter", "hull", "depot-ui", "depot-select", "schedule-toggle", "schedule-edit", "editor-updateOptions", "editor-updateRouteList1", "editor-updateRouteList2", "editor-createRow1", "editor-createRow2", "editor-add", "editor-tick", "day-options", "day-loops", "day-today", "preview-columns", "preview-click", "stop-pocket", "range-transportRange", "range-trafficRange", "range-near", "range-track", "zone-save", "zone-prop", "zone-load", "zone-ui", "zone-spawn", "zone-spawnlog", "zone-keep", "zone-despawn", "board-arriving", "schedule-screen", "schedule-real", "schedule-cache", "depot-order", "depot-spawn", "depot-spawn2", "garage-fleet", "depot-park", "depot-return", "terminal-pax", "depot-clear", "depot-crash", "gravity-reset"};
         for (String r : required) {
             if (!done.contains(r)) {
                 System.err.println("ERROR: patch not applied: " + r);
@@ -158,7 +158,7 @@ public class Patcher implements Opcodes {
     }
 
     static byte[] patchClass(String name, byte[] data) {
-        boolean target = name.equals(OPD) || name.equals(ATM) || name.equals(VU) || name.equals(VSH) || name.equals(PTE) || name.equals(TRN) || name.equals(GATE_IN) || name.equals(VEH) || name.equals(GATE_EXIT) || name.equals(TM) || name.equals(TBM) || name.equals(VUT) || name.equals(TLU) || name.equals(RPATH) || name.equals(LES) || name.equals("com/rinventor/ptm2/dimension/virtual/util/ScheduleUtils") || name.equals("com/rinventor/ptm2/dimension/digital/screens/ScheduleEditScreen") || name.equals("com/rinventor/ptm2/dimension/virtual/util/Departures") || name.equals("com/rinventor/ptm2/dimension/digital/screens/LineViewScreen") || name.equals("com/rinventor/ptm2/dimension/digital/panels/PlatformSchedulePanel") || name.equals("com/rinventor/ptm2/dimension/digital/screens/SchedulePreviewScreen") || name.equals("com/rinventor/ptm2/dimension/digital/screens/SchedulePreviewScreen$SchedulePreviewBox") || name.equals("com/rinventor/ptm2/dimension/virtual/systems/PlayerTracker") || name.equals("com/rinventor/ptm2/dimension/virtual/types/VDParkingZone") || name.equals("com/rinventor/ptm2/dimension/digital/panels/ParkingZonePanel");
+        boolean target = name.equals(OPD) || name.equals(ATM) || name.equals(VU) || name.equals(VSH) || name.equals(PTE) || name.equals(TRN) || name.equals(GATE_IN) || name.equals(VEH) || name.equals(GATE_EXIT) || name.equals(TM) || name.equals(TBM) || name.equals(VUT) || name.equals(TLU) || name.equals(RPATH) || name.equals(LES) || name.equals("com/rinventor/ptm2/dimension/virtual/util/ScheduleUtils") || name.equals("com/rinventor/ptm2/dimension/digital/screens/ScheduleEditScreen") || name.equals("com/rinventor/ptm2/dimension/virtual/util/Departures") || name.equals("com/rinventor/ptm2/dimension/digital/screens/LineViewScreen") || name.equals("com/rinventor/ptm2/dimension/digital/panels/PlatformSchedulePanel") || name.equals("com/rinventor/ptm2/dimension/digital/screens/SchedulePreviewScreen") || name.equals("com/rinventor/ptm2/dimension/digital/screens/SchedulePreviewScreen$SchedulePreviewBox") || name.equals("com/rinventor/ptm2/dimension/virtual/systems/PlayerTracker") || name.equals("com/rinventor/ptm2/dimension/virtual/types/VDParkingZone") || name.equals("com/rinventor/ptm2/dimension/digital/panels/ParkingZonePanel") || name.equals("com/rinventor/ptm2/dimension/physical/TrafficManager");
         boolean flags = contains(data, "INDEFINITE_BANK_ACCOUNT") || contains(data, "INDEFINITE_TRANSPORT_CARD");
         if (!target && !flags) {
             return data;
@@ -495,6 +495,78 @@ public class Patcher implements Opcodes {
                         changed = true;
                     }
                 }
+            }
+        }
+        if (name.equals("com/rinventor/ptm2/dimension/physical/TrafficManager")) {
+            // Места появления машин: полосы в зонах спавна, только вне поля зрения
+            final String TRAFM = "com/rinventor/ptm2/dimension/physical/TrafficManager";
+            final String SD = "(Lnet/minecraft/world/level/Level;IIII)Ljava/util/List;";
+            for (MethodNode m : new java.util.ArrayList<>(cn.methods)) {
+                if (m.name.equals("spawnLocations") && m.desc.equals(SD)) {
+                    m.name = "ptmOrig_spawnLocations";
+                    MethodNode w = new MethodNode(ACC_PUBLIC | ACC_STATIC, "spawnLocations", SD, null, null);
+                    w.instructions.add(new VarInsnNode(ALOAD, 0));
+                    w.instructions.add(new VarInsnNode(ILOAD, 1));
+                    w.instructions.add(new VarInsnNode(ILOAD, 2));
+                    w.instructions.add(new VarInsnNode(ILOAD, 3));
+                    w.instructions.add(new VarInsnNode(ILOAD, 4));
+                    w.instructions.add(new VarInsnNode(ALOAD, 0));
+                    w.instructions.add(new VarInsnNode(ILOAD, 1));
+                    w.instructions.add(new VarInsnNode(ILOAD, 2));
+                    w.instructions.add(new VarInsnNode(ILOAD, 3));
+                    w.instructions.add(new VarInsnNode(ILOAD, 4));
+                    w.instructions.add(new MethodInsnNode(INVOKESTATIC, TRAFM, "ptmOrig_spawnLocations", SD, false));
+                    w.instructions.add(new MethodInsnNode(INVOKESTATIC, FIXES, "zoneSpawn", "(Ljava/lang/Object;IIIILjava/util/List;)Ljava/util/List;", false));
+                    w.instructions.add(new InsnNode(ARETURN));
+                    w.maxStack = 10;
+                    w.maxLocals = 5;
+                    cn.methods.add(w);
+                    done.add("zone-spawn");
+                    changed = true;
+                }
+            }
+            InsnList lg = new InsnList();
+            lg.add(new VarInsnNode(ALOAD, 0));
+            lg.add(new VarInsnNode(DLOAD, 1));
+            lg.add(new VarInsnNode(DLOAD, 3));
+            lg.add(new VarInsnNode(DLOAD, 5));
+            lg.add(new MethodInsnNode(INVOKESTATIC, FIXES, "logSpawn", "(Ljava/lang/Object;DDD)V", false));
+            if (insertAtStart(cn, "spawnCar", "(Lnet/minecraft/world/level/Level;DDDF)V", lg)) {
+                done.add("zone-spawnlog");
+                changed = true;
+            }
+        }
+        if (name.equals("com/rinventor/ptm2/objects/entities/vehicle/Vehicle")) {
+            // Машина не исчезает, пока её видит игрок
+            final String VC = "com/rinventor/ptm2/objects/entities/vehicle/Vehicle";
+            for (MethodNode m : new java.util.ArrayList<>(cn.methods)) {
+                if (m.name.equals("m_6785_") && m.desc.equals("(D)Z")) {
+                    m.name = "ptmOrig_m_6785_";
+                    MethodNode w = new MethodNode(ACC_PUBLIC, "m_6785_", "(D)Z", null, null);
+                    w.instructions.add(new VarInsnNode(ALOAD, 0));
+                    w.instructions.add(new VarInsnNode(DLOAD, 1));
+                    w.instructions.add(new MethodInsnNode(INVOKEVIRTUAL, VC, "ptmOrig_m_6785_", "(D)Z", false));
+                    w.instructions.add(new VarInsnNode(ALOAD, 0));
+                    w.instructions.add(new MethodInsnNode(INVOKESTATIC, FIXES, "keepIfSeen", "(ZLjava/lang/Object;)Z", false));
+                    w.instructions.add(new InsnNode(IRETURN));
+                    w.maxStack = 3;
+                    w.maxLocals = 3;
+                    cn.methods.add(w);
+                    done.add("zone-keep");
+                    changed = true;
+                }
+            }
+        }
+        if (name.equals("com/rinventor/ptm2/dimension/physical/VehicleUtils")) {
+            // Удаление далёкой машины откладывается, пока её видит игрок
+            InsnList dr = new InsnList();
+            dr.add(new VarInsnNode(ALOAD, 0));
+            dr.add(new VarInsnNode(ILOAD, 1));
+            dr.add(new MethodInsnNode(INVOKESTATIC, FIXES, "despawnRange", "(Ljava/lang/Object;I)I", false));
+            dr.add(new VarInsnNode(ISTORE, 1));
+            if (insertAtStart(cn, "despawn", "(Lnet/minecraft/world/entity/Entity;I)V", dr)) {
+                done.add("zone-despawn");
+                changed = true;
             }
         }
         if (name.equals("com/rinventor/ptm2/dimension/virtual/types/VDParkingZone")) {

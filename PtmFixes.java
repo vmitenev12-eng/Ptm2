@@ -86,7 +86,7 @@ public final class PtmFixes {
      * 1) даёт название станциям, у которых его нет;
      * 2) привязывает каждую платформу к станции, в зоне которой она находится.
      */
-    public static final String BUILD = "fixes-2026-10-29-zones";
+    public static final String BUILD = "fixes-2026-10-30-spawnzones";
     private static boolean announced = false;
 
     public static void tick(Level level) {
@@ -98,6 +98,7 @@ public final class PtmFixes {
                 announced = true;
                 PTMLogger.info("PTM2 fixes loaded: " + BUILD);
             }
+            zoneTick(level);
             linkStationsAndPlatforms(level);
             watchVehicles(level);
             summaryLog(level);
@@ -3335,6 +3336,498 @@ public final class PtmFixes {
             });
             cb.setSelectedIndex(Math.max(0, Math.min(2, cur[0])));
             p.addWidget(cb, new com.rinventor.ptm2.engine.screen.Fragment(cb));
+        }
+    }
+
+    // ======================================================================
+    //  Зоны спавна и удаления машин (тип зоны парковки «Спавн и удаление» / «Стоянка и спавн/удаление»)
+    //  - Новые машины появляются на полосах внутри таких зон, а не в случайных точках дорог.
+    //  - Ни появление, ни исчезновение не происходит на глазах у игрока: нужна прямая видимость (в конусе взгляда,
+    //    в пределах дальности игрока и без непрозрачных блоков на луче). За стеной, за холмом или сзади - можно.
+    //  - Излишек машин (больше нужной плотности) убирается в зонах, тоже только вне поля зрения.
+    //  Настройки лежат в config/ptm2-fixes.properties на сервере (создаётся при первом запуске).
+    // ======================================================================
+
+    private static final String DEFAULT_CFG = "# Настройки исправлений PTM2\n"
+        + "# Случайный спавн машин на дорогах: auto - выключен, если на карте есть зоны спавна; true - всегда включён; false - всегда выключен\n"
+        + "randomRoadSpawn=auto\n"
+        + "# Не создавать и не удалять машины в прямой видимости игроков (true/false)\n"
+        + "hiddenSpawn=true\n"
+        + "# Угол обзора игрока для проверки видимости, градусов\n"
+        + "viewAngle=130\n";
+    private static final java.util.Properties FIXCFG = new java.util.Properties();
+    private static volatile long cfgLoadedAt;
+    private static final java.util.Map<Long, long[]> SEEN = new java.util.concurrent.ConcurrentHashMap<>();
+    private static final java.util.Map<Integer, Object[]> ZONE_CACHE = new java.util.concurrent.ConcurrentHashMap<>();
+    private static final java.util.Map<Integer, Long> ZONE_AGE = new java.util.concurrent.ConcurrentHashMap<>();
+    private static volatile long zoneTickAt;
+    private static volatile boolean seenWarned;
+    private static final java.util.concurrent.atomic.AtomicInteger C_CAND = new java.util.concurrent.atomic.AtomicInteger();
+    private static final java.util.concurrent.atomic.AtomicInteger C_SEENCAND = new java.util.concurrent.atomic.AtomicInteger();
+    private static final java.util.concurrent.atomic.AtomicInteger C_SPAWN = new java.util.concurrent.atomic.AtomicInteger();
+    private static final java.util.concurrent.atomic.AtomicInteger C_FAR = new java.util.concurrent.atomic.AtomicInteger();
+    private static final java.util.concurrent.atomic.AtomicInteger C_DEFER = new java.util.concurrent.atomic.AtomicInteger();
+    private static final java.util.concurrent.atomic.AtomicInteger C_ZONE = new java.util.concurrent.atomic.AtomicInteger();
+    private static volatile long trafficSummaryAt;
+    private static volatile long trafficLogWindow;
+    private static volatile int trafficLogCount;
+    private static final java.util.Map<Integer, Long> DEFER_LOG = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** Журнал появления и удаления машин: не больше 40 строк в минуту. */
+    private static void trafficLog(String msg) {
+        long now = System.currentTimeMillis();
+        if (now - trafficLogWindow > 60000L) {
+            trafficLogWindow = now;
+            trafficLogCount = 0;
+        }
+        if (trafficLogCount++ < 40) {
+            PTMLogger.info("PTM2 трафик: " + msg);
+        }
+    }
+
+    private static String at(double x, double y, double z) {
+        return (int) x + " " + (int) y + " " + (int) z;
+    }
+
+    /** TrafficManager.spawnCar: попытка появления машины (занятость места проверит игра). */
+    public static void logSpawn(Object lv, double x, double y, double z) {
+        try {
+            C_SPAWN.incrementAndGet();
+            Level level = (Level) lv;
+            Object[] zd = zoneData(level);
+            boolean inZone = false;
+            for (Object zo : (List<?>) zd[0]) {
+                if (((com.rinventor.ptm2.dimension.virtual.types.VDParkingZone) zo).isInside(x, z)) {
+                    inZone = true;
+                    break;
+                }
+            }
+            trafficLog("попытка появления машины " + at(x, y, z) + (inZone ? " (зона спавна)" : " (случайная точка дороги)")
+                + ", в поле зрения игроков: " + (seenByPlayers(level, x, y, z) ? "ДА" : "нет"));
+        } catch (Throwable t) {
+            // журнал не критичен
+        }
+    }
+
+    private static String cfg(String key, String def) {
+        long now = System.currentTimeMillis();
+        if (now - cfgLoadedAt > 10000L) {
+            cfgLoadedAt = now;
+            try {
+                java.nio.file.Path p = java.nio.file.Paths.get("config", "ptm2-fixes.properties");
+                if (!java.nio.file.Files.exists(p)) {
+                    java.nio.file.Files.createDirectories(p.getParent());
+                    java.nio.file.Files.write(p, DEFAULT_CFG.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                }
+                java.util.Properties np = new java.util.Properties();
+                try (java.io.Reader r = java.nio.file.Files.newBufferedReader(p, java.nio.charset.StandardCharsets.UTF_8)) {
+                    np.load(r);
+                }
+                synchronized (FIXCFG) {
+                    FIXCFG.clear();
+                    FIXCFG.putAll(np);
+                }
+            } catch (Throwable t) {
+                // остаются значения по умолчанию
+            }
+        }
+        String v;
+        synchronized (FIXCFG) {
+            v = FIXCFG.getProperty(key);
+        }
+        return v == null ? def : v.trim().toLowerCase();
+    }
+
+    private static boolean cfgBool(String key, boolean def) {
+        String v = cfg(key, def ? "true" : "false");
+        return !"false".equals(v);
+    }
+
+    private static double cfgNum(String key, double def) {
+        try {
+            return Double.parseDouble(cfg(key, String.valueOf(def)));
+        } catch (Throwable t) {
+            return def;
+        }
+    }
+
+    /** Есть ли непрозрачный блок на луче от глаз игрока до точки (взгляд как в игре: стекло не мешает). */
+    private static boolean rayBlocked(Object level, Object eye, double tx, double ty, double tz) throws ReflectiveOperationException {
+        Class<?> vec3 = eye.getClass();
+        Object target = vec3.getConstructor(double.class, double.class, double.class).newInstance(tx, ty, tz);
+        Class<?> clipC = Class.forName("net.minecraft.world.level.ClipContext");
+        Object visual = Class.forName("net.minecraft.world.level.ClipContext$Block").getEnumConstants()[2];
+        Object none = Class.forName("net.minecraft.world.level.ClipContext$Fluid").getEnumConstants()[0];
+        Object ctx = clipC.getConstructor(vec3, vec3, visual.getClass(), none.getClass(), Class.forName("net.minecraft.world.entity.Entity"))
+            .newInstance(eye, target, visual, none, null);
+        Object hit = srg(level, "m_45547_", ctx);
+        Object type = srg(hit, "m_6662_");
+        if (((Enum<?>) type).ordinal() == 0) {
+            return false;
+        }
+        Object loc = srg(hit, "m_82450_");
+        double dx = vc(loc, 0) - vc(eye, 0);
+        double dy = vc(loc, 1) - vc(eye, 1);
+        double dz = vc(loc, 2) - vc(eye, 2);
+        double hitDist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        double ex = tx - vc(eye, 0);
+        double ey = ty - vc(eye, 1);
+        double ez = tz - vc(eye, 2);
+        return hitDist < Math.sqrt(ex * ex + ey * ey + ez * ez) - 0.8D;
+    }
+
+    private static boolean seenCompute(Level level, double x, double y, double z) {
+        try {
+            double cos = Math.cos(Math.toRadians(cfgNum("viewangle", 130.0D) / 2.0D));
+            for (Player p : PTMWorld.getPlayers(level)) {
+                Object eye = srg(p, "m_146892_");
+                Object look = srg(p, "m_20154_");
+                double ex = vc(eye, 0);
+                double ey = vc(eye, 1);
+                double ez = vc(eye, 2);
+                Integer vd = viewDistances().get((java.util.UUID) srg(p, "m_20148_"));
+                double limit = vd == null ? 160.0D : vd;
+                for (double h : new double[] {1.0D, 2.2D}) {
+                    double dx = x - ex;
+                    double dy = y + h - ey;
+                    double dz = z - ez;
+                    double dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+                    if (dist > limit) {
+                        continue;
+                    }
+                    if (dist < 8.0D) {
+                        return true;
+                    }
+                    double dot = (dx * vc(look, 0) + dy * vc(look, 1) + dz * vc(look, 2)) / dist;
+                    if (dot < cos) {
+                        continue;
+                    }
+                    if (!rayBlocked(level, eye, x, y + h, z)) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        } catch (Throwable t) {
+            if (!seenWarned) {
+                seenWarned = true;
+                PTMLogger.warn("PTM2 fixes: ошибка проверки видимости, считаю точку видимой: " + t);
+            }
+            return true;
+        }
+    }
+
+    /** Видна ли точка хотя бы одному игроку (результат кэшируется на секунду для клеток 2x2x2). */
+    public static boolean seenByPlayers(Level level, double x, double y, double z) {
+        long key = ((long) Math.floor(x / 2.0D) * 73856093L) ^ ((long) Math.floor(y / 2.0D) * 19349663L) ^ ((long) Math.floor(z / 2.0D) * 83492791L);
+        long now = System.currentTimeMillis();
+        long[] c = SEEN.get(key);
+        if (c != null && now - c[0] < 1000L) {
+            return c[1] == 1L;
+        }
+        boolean r = seenCompute(level, x, y, z);
+        if (SEEN.size() > 5000) {
+            SEEN.clear();
+        }
+        SEEN.put(key, new long[] {now, r ? 1L : 0L});
+        return r;
+    }
+
+    /** Зоны спавна и полосы внутри них: {List<VDParkingZone>, List<DirectionalPos>}, обновляется раз в 15 секунд. */
+    private static Object[] zoneData(Level level) {
+        int lk = System.identityHashCode(level);
+        long now = System.currentTimeMillis();
+        Object[] c = ZONE_CACHE.get(lk);
+        if (c != null && now - (Long) c[2] < 15000L) {
+            return c;
+        }
+        List<com.rinventor.ptm2.dimension.virtual.types.VDParkingZone> zones = new ArrayList<>();
+        List<com.rinventor.ptm2.engine.computing.DirectionalPos> lanes = new ArrayList<>();
+        try {
+            for (String data : com.rinventor.ptm2.dimension.virtual.storage.VDStorageHandler.getAll(level, VDMemoryIDs.PARKING_ZONE).values()) {
+                int t = zoneTypeOfData(data);
+                if (t == ZONE_SPAWN || t == ZONE_BOTH) {
+                    zones.add(new com.rinventor.ptm2.dimension.virtual.types.VDParkingZone(data));
+                }
+            }
+            if (!zones.isEmpty()) {
+                for (String data : new ArrayList<>(com.rinventor.ptm2.dimension.virtual.storage.VDStorageHandler.getAll(level, VDMemoryIDs.TRAFFIC_LANE).values())) {
+                    VDTrafficLane lane = new VDTrafficLane(data);
+                    if (lane.transport || lane.isCurve() || lane.length() < 6) {
+                        continue;
+                    }
+                    Object center = lane.center();
+                    double cx = vc(center, 0);
+                    double cz = vc(center, 2);
+                    for (com.rinventor.ptm2.dimension.virtual.types.VDParkingZone z : zones) {
+                        if (z.isInside(cx, cz)) {
+                            lanes.add(new com.rinventor.ptm2.engine.computing.DirectionalPos(cx + 0.5D, vc(center, 1), cz + 0.5D, (float) (lane.rot8 * 45)));
+                            break;
+                        }
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            PTMLogger.warn("PTM2 fixes: ошибка чтения зон спавна: " + t);
+        }
+        Object[] r = new Object[] {zones, lanes, now};
+        ZONE_CACHE.put(lk, r);
+        return r;
+    }
+
+    /** Дальность спавна для игрока в точке (x, y, z): его собственная дальность легкового транспорта. */
+    private static int spawnRangeAt(Level level, int x, int y, int z, int range) {
+        int best = range;
+        try {
+            for (Map.Entry<java.util.UUID, Object> e : PV_POS.entrySet()) {
+                double dx = vc(e.getValue(), 0) - x;
+                double dz = vc(e.getValue(), 2) - z;
+                if (dx * dx + dz * dz < 4.0D) {
+                    best = Math.min(range, Math.max(48, trafficRangeOf(level, e.getKey()) - 8));
+                    break;
+                }
+            }
+        } catch (Throwable t) {
+            // остаётся стандартная дальность
+        }
+        return best;
+    }
+
+    /**
+     * TrafficManager.spawnLocations: места появления машин рядом с игроком.
+     * Если на карте есть зоны спавна, берутся полосы внутри них (случайные точки дорог выключены, пока randomRoadSpawn не true);
+     * в любом случае отбрасываются точки, которые видит игрок.
+     */
+    public static List<?> zoneSpawn(Object lv, int range, int x, int y, int z, List<?> orig) {
+        try {
+            Level level = (Level) lv;
+            if (PTMWorld.isClient(level)) {
+                return orig;
+            }
+            Object[] zd = zoneData(level);
+            boolean hasZones = !((List<?>) zd[0]).isEmpty();
+            String mode = cfg("randomroadspawn", "auto");
+            boolean useRandom = "true".equals(mode) || (!hasZones && !"false".equals(mode));
+            boolean hidden = cfgBool("hiddenspawn", true);
+            if (!hasZones && useRandom && !hidden) {
+                return orig;
+            }
+            int r = spawnRangeAt(level, x, y, z, range);
+            double rr = (double) r * (double) r;
+            List<Object> out = new ArrayList<>();
+            if (hasZones) {
+                for (Object o : (List<?>) zd[1]) {
+                    com.rinventor.ptm2.engine.computing.DirectionalPos p = (com.rinventor.ptm2.engine.computing.DirectionalPos) o;
+                    double dx = p.getX() - x;
+                    double dy = p.getY() - y;
+                    double dz = p.getZ() - z;
+                    if (dx * dx + dy * dy + dz * dz <= rr) {
+                        C_CAND.incrementAndGet();
+                        if (!hidden || !seenByPlayers(level, p.getX(), p.getY(), p.getZ())) {
+                            out.add(o);
+                        } else {
+                            C_SEENCAND.incrementAndGet();
+                        }
+                    }
+                }
+            }
+            if (useRandom) {
+                for (Object o : orig) {
+                    com.rinventor.ptm2.engine.computing.DirectionalPos p = (com.rinventor.ptm2.engine.computing.DirectionalPos) o;
+                    double dx = p.getX() - x;
+                    double dy = p.getY() - y;
+                    double dz = p.getZ() - z;
+                    if (dx * dx + dy * dy + dz * dz <= rr) {
+                        C_CAND.incrementAndGet();
+                        if (!hidden || !seenByPlayers(level, p.getX(), p.getY(), p.getZ())) {
+                            out.add(o);
+                        } else {
+                            C_SEENCAND.incrementAndGet();
+                        }
+                    }
+                }
+            }
+            return out;
+        } catch (Throwable t) {
+            return orig;
+        }
+    }
+
+    /** Vehicle.removeWhenFarAway: машину не удаляем, пока её видит игрок и она ещё в зоне симуляции. */
+    public static boolean keepIfSeen(boolean far, Object vehicle) {
+        if (!far) {
+            return false;
+        }
+        try {
+            Level level = (Level) srg(vehicle, "m_9236_");
+            if (PTMWorld.isClient(level) || !cfgBool("hiddenspawn", true)) {
+                return true;
+            }
+            refreshLimits(level);
+            double x = PTMEntity.getX((Vehicle) vehicle);
+            double y = PTMEntity.getY((Vehicle) vehicle);
+            double z = PTMEntity.getZ((Vehicle) vehicle);
+            // за пределом симуляции машина всё равно не движется: тут оставлять нельзя
+            if (limSim > 0) {
+                boolean inSim = false;
+                for (Object pos : PV_POS.values()) {
+                    double dx = vc(pos, 0) - x;
+                    double dz = vc(pos, 2) - z;
+                    if (dx * dx + dz * dz < (double) limSim * limSim) {
+                        inSim = true;
+                        break;
+                    }
+                }
+                if (!inSim) {
+                    return true;
+                }
+            }
+            boolean seen = seenByPlayers(level, x, y, z);
+            if (seen) {
+                C_DEFER.incrementAndGet();
+                Long last = DEFER_LOG.get(System.identityHashCode(vehicle));
+                long now = System.currentTimeMillis();
+                if (last == null || now - last > 30000L) {
+                    DEFER_LOG.put(System.identityHashCode(vehicle), now);
+                    if (DEFER_LOG.size() > 500) {
+                        DEFER_LOG.clear();
+                    }
+                    trafficLog("удаление машины " + at(x, y, z) + " отложено: её видит игрок (машина ещё в зоне симуляции)");
+                }
+            } else {
+                C_FAR.incrementAndGet();
+                trafficLog("машина " + at(x, y, z) + " удалена вдали от игроков, в поле зрения: нет");
+            }
+            return !seen;
+        } catch (Throwable t) {
+            return true;
+        }
+    }
+
+    /** VehicleUtils.despawn: радиус, за которым машина удаляется; если машину видит игрок, удаление откладывается. */
+    public static int despawnRange(Object entity, int range) {
+        try {
+            Level level = (Level) srg(entity, "m_9236_");
+            if (PTMWorld.isClient(level) || !cfgBool("hiddenspawn", true)) {
+                return range;
+            }
+            double x = PTMEntity.getX((Entity) entity);
+            double y = PTMEntity.getY((Entity) entity);
+            double z = PTMEntity.getZ((Entity) entity);
+            for (Object pos : PV_POS.values()) {
+                double dx = vc(pos, 0) - x;
+                double dy = vc(pos, 1) - y;
+                double dz = vc(pos, 2) - z;
+                if (dx * dx + dy * dy + dz * dz <= (double) range * range) {
+                    return range;
+                }
+            }
+            if (seenByPlayers(level, x, y, z)) {
+                C_DEFER.incrementAndGet();
+                return 100000;
+            }
+            C_FAR.incrementAndGet();
+            trafficLog("машина " + at(x, y, z) + " удалена вдали от игроков (despawn), в поле зрения: нет");
+            return range;
+        } catch (Throwable t) {
+            return range;
+        }
+    }
+
+    /** Раз в секунду: лишние машины (больше нужной плотности) в зонах спавна и удаления убираются вне поля зрения. */
+    private static void zoneTick(Level level) {
+        if (PTMWorld.isClient(level)) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (now - zoneTickAt < 1000L) {
+            return;
+        }
+        zoneTickAt = now;
+        try {
+            Object[] zd = zoneData(level);
+            List<?> zones = (List<?>) zd[0];
+            if (now - trafficSummaryAt > 60000L) {
+                trafficSummaryAt = now;
+                int cand = C_CAND.getAndSet(0);
+                int seenCand = C_SEENCAND.getAndSet(0);
+                int sp = C_SPAWN.getAndSet(0);
+                int far = C_FAR.getAndSet(0);
+                int defer = C_DEFER.getAndSet(0);
+                int zr = C_ZONE.getAndSet(0);
+                if (cand + sp + far + defer + zr > 0) {
+                    PTMLogger.info("PTM2 трафик за минуту: зон спавна " + zones.size() + ", мест для появления " + cand + " (отброшено как видимые " + seenCand
+                        + "), попыток появления " + sp + ", удалено вдали " + far + ", удаление отложено из-за видимости " + defer + " раз, убрано в зонах " + zr);
+                }
+            }
+            if (zones.isEmpty() || PV_POS.isEmpty()) {
+                return;
+            }
+            boolean hidden = cfgBool("hiddenspawn", true);
+            java.lang.reflect.Method req = com.rinventor.ptm2.dimension.physical.TrafficManager.class.getDeclaredMethod("requiredCars", Level.class, int.class, int.class, int.class);
+            req.setAccessible(true);
+            java.util.Set<Integer> present = new java.util.HashSet<>();
+            int removed = 0;
+            for (Object zo : zones) {
+                com.rinventor.ptm2.dimension.virtual.types.VDParkingZone zone = (com.rinventor.ptm2.dimension.virtual.types.VDParkingZone) zo;
+                double cx = zone.getCenterX();
+                double cz = zone.getCenterZ();
+                // ближайший игрок
+                double bestD = 1.0E18D;
+                Object bestPos = null;
+                for (Object pos : PV_POS.values()) {
+                    double dx = vc(pos, 0) - cx;
+                    double dz = vc(pos, 2) - cz;
+                    double d = dx * dx + dz * dz;
+                    if (d < bestD) {
+                        bestD = d;
+                        bestPos = pos;
+                    }
+                }
+                if (bestPos == null || bestD > 160.0D * 160.0D) {
+                    continue;
+                }
+                int px = (int) vc(bestPos, 0);
+                int pz = (int) vc(bestPos, 2);
+                int required = (Integer) req.invoke(null, level, 144, px, pz);
+                int count = PTMEntity.count(com.rinventor.ptm2.objects.entities.vehicle.car.Car.class, 144.0D, level, px, vc(bestPos, 1), pz);
+                double half = Math.max(Math.abs(zone.fbX - zone.sbX), Math.abs(zone.fbZ - zone.sbZ)) / 2.0D + 8.0D;
+                Object box = Class.forName("net.minecraft.world.phys.AABB").getMethod("m_165882_", Class.forName("net.minecraft.world.phys.Vec3"), double.class, double.class, double.class)
+                    .invoke(null, Class.forName("net.minecraft.world.phys.Vec3").getConstructor(double.class, double.class, double.class).newInstance(cx, vc(bestPos, 1), cz), half * 2.0D, 512.0D, half * 2.0D);
+                java.util.function.Predicate<Object> all = (e) -> true;
+                for (Object e : (List<?>) srg(level, "m_6443_", com.rinventor.ptm2.objects.entities.vehicle.car.Car.class, box, all)) {
+                    Vehicle car = (Vehicle) e;
+                    double x = PTMEntity.getX(car);
+                    double z = PTMEntity.getZ(car);
+                    if (!zone.isInside(x, z) || !car.ai || car.crashed) {
+                        continue;
+                    }
+                    Object tags = srg(car, "m_19880_");
+                    if (!(tags instanceof java.util.Collection) || !((java.util.Collection<?>) tags).contains("traffic")) {
+                        continue;
+                    }
+                    int id = System.identityHashCode(car);
+                    present.add(id);
+                    Long first = ZONE_AGE.putIfAbsent(id, now);
+                    if (first == null) {
+                        first = now;
+                    }
+                    if (now - first < 25000L || count - removed <= required || removed >= 2) {
+                        continue;
+                    }
+                    if (hidden && seenByPlayers(level, x, PTMEntity.getY(car), z)) {
+                        continue;
+                    }
+                    trafficLog("лишняя машина " + at(x, PTMEntity.getY(car), z) + " удалена в зоне спавна/удаления; нужно " + required + ", есть " + (count - removed)
+                        + ", в поле зрения: " + (hidden ? "нет" : "не проверялось"));
+                    PTMEntity.syncedDespawn("Traffic spawn zone exit", car);
+                    C_ZONE.incrementAndGet();
+                    removed++;
+                }
+            }
+            ZONE_AGE.keySet().retainAll(present);
+        } catch (Throwable t) {
+            PTMLogger.warn("PTM2 fixes: ошибка обработки зон спавна: " + t);
         }
     }
 

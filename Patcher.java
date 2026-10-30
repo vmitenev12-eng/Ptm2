@@ -136,7 +136,7 @@ public class Patcher implements Opcodes {
         if (mismatch) {
             System.exit(1);
         }
-        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay", "gate-bankcard", "boarding-fare", "gate-exit-radius", "gate-exit-auto", "gate-in-radius", "terminal-cap", "arrival-reach", "arrival-inside", "lamp-cap", "red-commit", "patience", "bypass-still", "merge-check", "player-ahead", "merge-width", "parallel-width", "auto-links", "link-revision", "bus-priority", "validator", "wheel-filter", "hull", "depot-ui", "depot-select", "schedule-toggle", "schedule-edit", "editor-updateOptions", "editor-updateRouteList1", "editor-updateRouteList2", "editor-createRow1", "editor-createRow2", "editor-add", "editor-tick", "day-options", "day-loops", "day-today", "preview-columns", "preview-click", "stop-pocket", "range-transportRange", "range-trafficRange", "range-near", "range-track", "zone-save", "zone-prop", "zone-load", "zone-ui", "zone-spawn", "zone-spawnlog", "zone-keep", "zone-despawn", "board-arriving", "schedule-screen", "schedule-real", "schedule-cache", "depot-order", "depot-spawn", "depot-spawn2", "garage-fleet", "depot-park", "depot-return", "terminal-pax", "depot-clear", "depot-crash", "gravity-reset"};
+        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay", "gate-bankcard", "boarding-fare", "gate-exit-radius", "gate-exit-auto", "gate-in-radius", "terminal-cap", "arrival-reach", "arrival-inside", "lamp-cap", "red-commit", "patience", "bypass-still", "merge-check", "player-ahead", "merge-width", "parallel-width", "auto-links", "link-revision", "bus-priority", "validator", "wheel-filter", "hull", "depot-ui", "depot-select", "schedule-toggle", "schedule-edit", "editor-updateOptions", "editor-updateRouteList1", "editor-updateRouteList2", "editor-createRow1", "editor-createRow2", "editor-add", "editor-tick", "day-options", "day-loops", "day-today", "preview-columns", "preview-click", "stop-pocket", "range-transportRange", "range-trafficRange", "range-near", "range-track", "zone-save", "zone-prop", "zone-load", "zone-ui", "zone-spawn", "zone-spawnlog", "zone-spawned", "zone-keep", "zone-despawn", "board-arriving", "schedule-screen", "schedule-real", "schedule-cache", "depot-order", "depot-spawn", "depot-spawn2", "garage-fleet", "depot-park", "depot-return", "terminal-pax", "depot-clear", "depot-crash", "gravity-reset"};
         for (String r : required) {
             if (!done.contains(r)) {
                 System.err.println("ERROR: patch not applied: " + r);
@@ -534,6 +534,20 @@ public class Patcher implements Opcodes {
             if (insertAtStart(cn, "spawnCar", "(Lnet/minecraft/world/level/Level;DDDF)V", lg)) {
                 done.add("zone-spawnlog");
                 changed = true;
+            }
+            for (MethodNode m : cn.methods) {
+                if (m.name.equals("spawnCar")) {
+                    for (AbstractInsnNode in : m.instructions.toArray()) {
+                        if (in instanceof MethodInsnNode && ((MethodInsnNode) in).name.equals("startAI")) {
+                            InsnList ok = new InsnList();
+                            ok.add(new InsnNode(DUP));
+                            ok.add(new MethodInsnNode(INVOKESTATIC, FIXES, "spawned", "(Ljava/lang/Object;)V", false));
+                            m.instructions.insertBefore(in, ok);
+                            done.add("zone-spawned");
+                            changed = true;
+                        }
+                    }
+                }
             }
         }
         if (name.equals("com/rinventor/ptm2/objects/entities/vehicle/Vehicle")) {

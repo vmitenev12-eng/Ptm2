@@ -86,7 +86,7 @@ public final class PtmFixes {
      * 1) даёт название станциям, у которых его нет;
      * 2) привязывает каждую платформу к станции, в зоне которой она находится.
      */
-    public static final String BUILD = "fixes-2026-10-30-spawnzones";
+    public static final String BUILD = "fixes-2026-10-30-spawnzones2";
     private static boolean announced = false;
 
     public static void tick(Level level) {
@@ -2050,6 +2050,9 @@ public final class PtmFixes {
         boolean planCreep;
         boolean planCreepOn;
         float planSavedTarget;
+        long airAt;
+        long airLog;
+        long redLog;
     }
 
     static final Map<Integer, Drv> DRV = new ConcurrentHashMap<>();
@@ -2128,6 +2131,19 @@ public final class PtmFixes {
             }
             if (Double.isNaN(d.zoneEntry)) {
                 d.zoneEntry = v.pathProgress;
+                // Въехала в зону на зелёный на ходу: проезд закреплён, светофор нового направления после поворота не смотрим
+                if (!red && Math.abs(v.speed) >= 2.0F) {
+                    d.committed = true;
+                    return false;
+                }
+            }
+            if (red && Math.abs(v.speed) < 1.0F) {
+                long nowL = System.currentTimeMillis();
+                if (nowL - d.redLog > 30000L) {
+                    d.redLog = nowL;
+                    drvLog(d, nowL, v.getClass().getSimpleName() + " стоит внутри перекрёстка на красный " + (long) PTMEntity.getX(v) + " " + (long) PTMEntity.getZ(v)
+                        + ": прошла после входа " + (int) (v.pathProgress - d.zoneEntry) + " бл., проезд не закреплён");
+                }
             }
             // «Прошла стоп-линию» = проехала не менее 1.5 блока внутри зоны перекрёстка при зелёном
             if (!red && Math.abs(v.speed) >= 1.0F && v.pathProgress - d.zoneEntry >= 1.5D) {
@@ -2222,6 +2238,50 @@ public final class PtmFixes {
      *    При нескольких претендентах едет тот, кто ждёт дольше.
      * 2) Если проезд разрешён, но машины физически упёрлись друг в друга, та, что ждала меньше, отъезжает назад.
      */
+    private static java.lang.reflect.Constructor<?> blockPosCtor;
+
+    /** Сколько блоков воздуха прямо под точкой (не больше max). */
+    private static int airBelow(Level level, double x, double y, double z, int max) throws ReflectiveOperationException {
+        if (blockPosCtor == null) {
+            blockPosCtor = Class.forName("net.minecraft.core.BlockPos").getConstructor(int.class, int.class, int.class);
+        }
+        int bx = (int) Math.floor(x);
+        int bz = (int) Math.floor(z);
+        int by = (int) Math.floor(y) - 1;
+        int n = 0;
+        for (int k = 0; k < max; k++) {
+            Object st = srg(level, "m_8055_", blockPosCtor.newInstance(bx, by - k, bz));
+            if (Boolean.TRUE.equals(srg(st, "m_60795_"))) {
+                n++;
+            } else {
+                break;
+            }
+        }
+        return n;
+    }
+
+    /** Раз в 2 секунды: автобус, под которым 4 и больше блоков воздуха, попадает в журнал (поиск «летающих» автобусов). */
+    private static void airCheck(Vehicle v, Drv d, Level level, long now) {
+        if (now - d.airAt < 2000L || !(v instanceof Transport)) {
+            return;
+        }
+        d.airAt = now;
+        try {
+            double x = PTMEntity.getX(v);
+            double y = PTMEntity.getY(v);
+            double z = PTMEntity.getZ(v);
+            int air = airBelow(level, x, y, z, 6);
+            if (air >= 4 && now - d.airLog > 30000L) {
+                d.airLog = now;
+                Transport t = (Transport) v;
+                trafficLog("автобус в воздухе: линия " + t.getLineID() + " рейс " + t.getRouteID() + " на " + at(x, y, z) + ", под ним воздуха " + (air >= 6 ? "6+" : String.valueOf(air))
+                    + " бл., v=" + v.speed + ", ai=" + (v.ai ? "да" : "нет") + ", пройдено=" + (int) v.pathProgress);
+            }
+        } catch (Throwable t) {
+            // не критично
+        }
+    }
+
     public static boolean canMove(Vehicle v, boolean orig, Level level) {
         try {
             if (PTMWorld.isClient(v)) {
@@ -2232,6 +2292,7 @@ public final class PtmFixes {
             Drv d = drv(v);
             d.seen = now;
             d.lastOrig = orig;
+            airCheck(v, d, level, now);
             fareTick(v, level, now, d);
             if (v instanceof Transport && v.ai && !v.requiresTracks && inAnyDepot(level, PTMEntity.getX(v), PTMEntity.getZ(v))) {
                 return depotMove(v, d, level, now);
@@ -3368,6 +3429,9 @@ public final class PtmFixes {
     private static final java.util.concurrent.atomic.AtomicInteger C_FAR = new java.util.concurrent.atomic.AtomicInteger();
     private static final java.util.concurrent.atomic.AtomicInteger C_DEFER = new java.util.concurrent.atomic.AtomicInteger();
     private static final java.util.concurrent.atomic.AtomicInteger C_ZONE = new java.util.concurrent.atomic.AtomicInteger();
+    private static final java.util.concurrent.atomic.AtomicInteger C_OCC = new java.util.concurrent.atomic.AtomicInteger();
+    private static final java.util.concurrent.atomic.AtomicInteger C_OK = new java.util.concurrent.atomic.AtomicInteger();
+    private static final java.util.Map<Integer, Object[]> SPAWNED = new java.util.concurrent.ConcurrentHashMap<>();
     private static volatile long trafficSummaryAt;
     private static volatile long trafficLogWindow;
     private static volatile int trafficLogCount;
@@ -3389,6 +3453,78 @@ public final class PtmFixes {
         return (int) x + " " + (int) y + " " + (int) z;
     }
 
+    /** Занято ли место появления: другая машина ближе 4.5 блока по горизонтали. */
+    private static boolean occupied(Level level, double x, double y, double z) {
+        try {
+            for (Entity e : PTMEntity.getAll(Vehicle.class, 6.0D, level, x, y, z)) {
+                double dx = PTMEntity.getX(e) - x;
+                double dz = PTMEntity.getZ(e) - z;
+                if (dx * dx + dz * dz < 4.5D * 4.5D && Math.abs(PTMEntity.getY(e) - y) < 3.0D) {
+                    return true;
+                }
+            }
+        } catch (Throwable t) {
+            // считаем свободным
+        }
+        return false;
+    }
+
+    /** Почему игра может отказать в появлении машины в этой точке (для журнала). */
+    private static String spawnBlockReason(Level level, double x, double y, double z) {
+        StringBuilder sb = new StringBuilder();
+        try {
+            if (PTMEntity.exists(Player.class, 3.0D, level, x, y, z)) {
+                sb.append("; рядом (3 бл.) игрок");
+            }
+            Entity best = null;
+            double bd = 1.0E9D;
+            for (Entity e : PTMEntity.getAll(Vehicle.class, 8.0D, level, x, y, z)) {
+                double dx = PTMEntity.getX(e) - x;
+                double dz = PTMEntity.getZ(e) - z;
+                double d = Math.sqrt(dx * dx + dz * dz);
+                if (d < bd) {
+                    bd = d;
+                    best = e;
+                }
+            }
+            if (best != null) {
+                Vehicle bv = (Vehicle) best;
+                sb.append("; рядом ").append(bv.getClass().getSimpleName()).append(" в ").append(String.format("%.1f", bd)).append(" бл., v=").append(bv.speed)
+                    .append(bv.ai ? ", ai=да" : ", ai=нет");
+            }
+            java.lang.reflect.Method rz = com.rinventor.ptm2.dimension.physical.TrafficManager.class.getDeclaredMethod("carRestrictionZones", Level.class);
+            rz.setAccessible(true);
+            for (Object zo : (List<?>) rz.invoke(null, level)) {
+                com.rinventor.ptm2.dimension.virtual.types.VDRestrictionZone rzn = (com.rinventor.ptm2.dimension.virtual.types.VDRestrictionZone) zo;
+                if (VDUtils.inZone(x, z, rzn.sbX, rzn.sbZ, rzn.fbX, rzn.fbZ)) {
+                    sb.append("; точка в зоне ограничения движения");
+                    break;
+                }
+            }
+        } catch (Throwable t) {
+            // диагностика не критична
+        }
+        return sb.toString();
+    }
+
+    /** Перед запуском ИИ у только что появившейся машины (успешное появление). */
+    public static void spawned(Object vehicle) {
+        try {
+            C_OK.incrementAndGet();
+            Vehicle v = (Vehicle) vehicle;
+            double x = PTMEntity.getX(v);
+            double y = PTMEntity.getY(v);
+            double z = PTMEntity.getZ(v);
+            SPAWNED.put(System.identityHashCode(v), new Object[] {new java.lang.ref.WeakReference<Object>(v), x, z, System.currentTimeMillis()});
+            if (SPAWNED.size() > 200) {
+                SPAWNED.clear();
+            }
+            trafficLog("машина появилась " + at(x, y, z) + " (" + v.getClass().getSimpleName() + ")");
+        } catch (Throwable t) {
+            // журнал не критичен
+        }
+    }
+
     /** TrafficManager.spawnCar: попытка появления машины (занятость места проверит игра). */
     public static void logSpawn(Object lv, double x, double y, double z) {
         try {
@@ -3403,7 +3539,7 @@ public final class PtmFixes {
                 }
             }
             trafficLog("попытка появления машины " + at(x, y, z) + (inZone ? " (зона спавна)" : " (случайная точка дороги)")
-                + ", в поле зрения игроков: " + (seenByPlayers(level, x, y, z) ? "ДА" : "нет"));
+                + ", в поле зрения игроков: " + (seenByPlayers(level, x, y, z) ? "ДА" : "нет") + spawnBlockReason(level, x, y, z));
         } catch (Throwable t) {
             // журнал не критичен
         }
@@ -3556,13 +3692,18 @@ public final class PtmFixes {
                     if (lane.transport || lane.isCurve() || lane.length() < 6) {
                         continue;
                     }
-                    Object center = lane.center();
-                    double cx = vc(center, 0);
-                    double cz = vc(center, 2);
-                    for (com.rinventor.ptm2.dimension.virtual.types.VDParkingZone z : zones) {
-                        if (z.isInside(cx, cz)) {
-                            lanes.add(new com.rinventor.ptm2.engine.computing.DirectionalPos(cx + 0.5D, vc(center, 1), cz + 0.5D, (float) (lane.rot8 * 45)));
-                            break;
+                    Object st = lane.getStart();
+                    Object en = lane.getEnd();
+                    double[] fr = lane.length() >= 14 ? new double[] {0.25D, 0.5D, 0.75D} : new double[] {0.5D};
+                    for (double f : fr) {
+                        double cx = vc(st, 0) + (vc(en, 0) - vc(st, 0)) * f;
+                        double cy = vc(st, 1) + (vc(en, 1) - vc(st, 1)) * f;
+                        double cz = vc(st, 2) + (vc(en, 2) - vc(st, 2)) * f;
+                        for (com.rinventor.ptm2.dimension.virtual.types.VDParkingZone z : zones) {
+                            if (z.isInside(cx, cz)) {
+                                lanes.add(new com.rinventor.ptm2.engine.computing.DirectionalPos(cx + 0.5D, cy, cz + 0.5D, (float) (lane.rot8 * 45)));
+                                break;
+                            }
                         }
                     }
                 }
@@ -3623,10 +3764,12 @@ public final class PtmFixes {
                     double dz = p.getZ() - z;
                     if (dx * dx + dy * dy + dz * dz <= rr) {
                         C_CAND.incrementAndGet();
-                        if (!hidden || !seenByPlayers(level, p.getX(), p.getY(), p.getZ())) {
-                            out.add(o);
-                        } else {
+                        if (hidden && seenByPlayers(level, p.getX(), p.getY(), p.getZ())) {
                             C_SEENCAND.incrementAndGet();
+                        } else if (occupied(level, p.getX(), p.getY(), p.getZ())) {
+                            C_OCC.incrementAndGet();
+                        } else {
+                            out.add(o);
                         }
                     }
                 }
@@ -3755,9 +3898,23 @@ public final class PtmFixes {
                 int far = C_FAR.getAndSet(0);
                 int defer = C_DEFER.getAndSet(0);
                 int zr = C_ZONE.getAndSet(0);
+                int occ = C_OCC.getAndSet(0);
+                int ok = C_OK.getAndSet(0);
                 if (cand + sp + far + defer + zr > 0) {
                     PTMLogger.info("PTM2 трафик за минуту: зон спавна " + zones.size() + ", мест для появления " + cand + " (отброшено как видимые " + seenCand
-                        + "), попыток появления " + sp + ", удалено вдали " + far + ", удаление отложено из-за видимости " + defer + " раз, убрано в зонах " + zr);
+                        + ", занято " + occ + "), попыток появления " + sp + ", появилось " + ok + ", удалено вдали " + far + ", удаление отложено из-за видимости " + defer + " раз, убрано в зонах " + zr);
+                }
+            }
+            for (java.util.Iterator<Map.Entry<Integer, Object[]>> it = SPAWNED.entrySet().iterator(); it.hasNext();) {
+                Object[] rec = it.next().getValue();
+                Object e = ((java.lang.ref.WeakReference<?>) rec[0]).get();
+                long age = (System.currentTimeMillis() - (Long) rec[3]) / 1000L;
+                boolean gone = e == null || Boolean.TRUE.equals(srg(e, "m_213877_"));
+                if (gone) {
+                    trafficLog("появившаяся машина исчезла через " + age + " с (появилась " + (int) (double) (Double) rec[1] + " " + (int) (double) (Double) rec[2] + ")");
+                    it.remove();
+                } else if (age > 120L) {
+                    it.remove();
                 }
             }
             if (zones.isEmpty() || PV_POS.isEmpty()) {

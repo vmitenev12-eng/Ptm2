@@ -86,7 +86,7 @@ public final class PtmFixes {
      * 1) даёт название станциям, у которых его нет;
      * 2) привязывает каждую платформу к станции, в зоне которой она находится.
      */
-    public static final String BUILD = "fixes-2026-10-30-spawnzones3";
+    public static final String BUILD = "fixes-2026-10-31-spawnzones4";
     private static boolean announced = false;
 
     public static void tick(Level level) {
@@ -3426,7 +3426,9 @@ public final class PtmFixes {
         + "# Не создавать и не удалять машины в прямой видимости игроков (true/false)\n"
         + "hiddenSpawn=true\n"
         + "# Угол обзора игрока для проверки видимости, градусов\n"
-        + "viewAngle=130\n";
+        + "viewAngle=130\n"
+        + "# Минимальный промежуток между появлениями машин из зон, секунд\n"
+        + "zoneSpawnGap=4\n";
     private static final java.util.Properties FIXCFG = new java.util.Properties();
     private static volatile long cfgLoadedAt;
     private static final java.util.Map<Long, long[]> SEEN = new java.util.concurrent.ConcurrentHashMap<>();
@@ -3443,6 +3445,7 @@ public final class PtmFixes {
     private static final java.util.concurrent.atomic.AtomicInteger C_OCC = new java.util.concurrent.atomic.AtomicInteger();
     private static final java.util.concurrent.atomic.AtomicInteger C_OK = new java.util.concurrent.atomic.AtomicInteger();
     private static final java.util.Map<Integer, Object[]> SPAWNED = new java.util.concurrent.ConcurrentHashMap<>();
+    private static volatile long lastZoneSpawn;
     private static volatile long trafficSummaryAt;
     private static volatile long trafficLogWindow;
     private static volatile int trafficLogCount;
@@ -3467,10 +3470,10 @@ public final class PtmFixes {
     /** Занято ли место появления: другая машина ближе 4.5 блока по горизонтали. */
     private static boolean occupied(Level level, double x, double y, double z) {
         try {
-            for (Entity e : PTMEntity.getAll(Vehicle.class, 6.0D, level, x, y, z)) {
+            for (Entity e : PTMEntity.getAll(Vehicle.class, 11.0D, level, x, y, z)) {
                 double dx = PTMEntity.getX(e) - x;
                 double dz = PTMEntity.getZ(e) - z;
-                if (dx * dx + dz * dz < 4.5D * 4.5D && Math.abs(PTMEntity.getY(e) - y) < 3.0D) {
+                if (dx * dx + dz * dz < 9.0D * 9.0D && Math.abs(PTMEntity.getY(e) - y) < 3.0D) {
                     return true;
                 }
             }
@@ -3522,7 +3525,20 @@ public final class PtmFixes {
     public static void despawnReason(String reason, Object entity) {
         try {
             if (entity != null && SPAWNED.containsKey(System.identityHashCode(entity))) {
-                trafficLog("появившаяся в зоне машина удаляется: причина «" + reason + "» на " + at(PTMEntity.getX((Entity) entity), PTMEntity.getY((Entity) entity), PTMEntity.getZ((Entity) entity)));
+                StringBuilder who = new StringBuilder();
+                int n = 0;
+                for (StackTraceElement el : new Throwable().getStackTrace()) {
+                    String cn = el.getClassName();
+                    if (cn.startsWith("com.rinventor.ptm2.fixes.") || cn.endsWith("PTMEntity") || !cn.startsWith("com.rinventor")) {
+                        continue;
+                    }
+                    who.append(n == 0 ? "" : " <- ").append(cn.substring(cn.lastIndexOf('.') + 1)).append('.').append(el.getMethodName()).append(':').append(el.getLineNumber());
+                    if (++n >= 5) {
+                        break;
+                    }
+                }
+                trafficLog("появившаяся в зоне машина удаляется: причина «" + reason + "» на " + at(PTMEntity.getX((Entity) entity), PTMEntity.getY((Entity) entity), PTMEntity.getZ((Entity) entity))
+                    + "; вызвал: " + (n == 0 ? "не из кода мода" : who.toString()));
             }
         } catch (Throwable t) {
             // журнал не критичен
@@ -3835,6 +3851,7 @@ public final class PtmFixes {
             int r = spawnRangeAt(level, x, y, z, range);
             double rr = (double) r * (double) r;
             List<Object> out = new ArrayList<>();
+            List<Object> zoneOut = new ArrayList<>();
             if (hasZones) {
                 for (Object o : (List<?>) zd[1]) {
                     com.rinventor.ptm2.engine.computing.DirectionalPos p = (com.rinventor.ptm2.engine.computing.DirectionalPos) o;
@@ -3848,9 +3865,18 @@ public final class PtmFixes {
                         } else if (occupied(level, p.getX(), p.getY(), p.getZ())) {
                             C_OCC.incrementAndGet();
                         } else {
-                            out.add(o);
+                            zoneOut.add(o);
                         }
                     }
+                }
+            }
+            if (!zoneOut.isEmpty()) {
+                // Из зон машины выпускаются по одной за раз и с запасом места, иначе выезд с парковки сразу забивается
+                java.util.Collections.shuffle(zoneOut);
+                long nowMs = System.currentTimeMillis();
+                if (nowMs - lastZoneSpawn >= (long) (cfgNum("zonespawngap", 4.0D) * 1000.0D)) {
+                    out.add(zoneOut.get(0));
+                    lastZoneSpawn = nowMs;
                 }
             }
             if (useRandom) {

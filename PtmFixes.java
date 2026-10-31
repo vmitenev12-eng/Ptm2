@@ -86,7 +86,7 @@ public final class PtmFixes {
      * 1) даёт название станциям, у которых его нет;
      * 2) привязывает каждую платформу к станции, в зоне которой она находится.
      */
-    public static final String BUILD = "fixes-2026-10-30-spawnzones2";
+    public static final String BUILD = "fixes-2026-10-30-spawnzones3";
     private static boolean announced = false;
 
     public static void tick(Level level) {
@@ -2270,6 +2270,17 @@ public final class PtmFixes {
             double x = PTMEntity.getX(v);
             double y = PTMEntity.getY(v);
             double z = PTMEntity.getZ(v);
+            if (blockPosCtor == null) {
+                blockPosCtor = Class.forName("net.minecraft.core.BlockPos").getConstructor(int.class, int.class, int.class);
+            }
+            Object lo = srg(level, "m_8055_", blockPosCtor.newInstance((int) Math.floor(x), (int) Math.floor(y + 0.5D), (int) Math.floor(z)));
+            Object hi = srg(level, "m_8055_", blockPosCtor.newInstance((int) Math.floor(x), (int) Math.floor(y + 1.5D), (int) Math.floor(z)));
+            if (!Boolean.TRUE.equals(srg(lo, "m_60795_")) && !Boolean.TRUE.equals(srg(hi, "m_60795_")) && now - d.airLog > 30000L) {
+                d.airLog = now;
+                Transport tb = (Transport) v;
+                trafficLog("автобус В ЗЕМЛЕ: линия " + tb.getLineID() + " рейс " + tb.getRouteID() + " на " + at(x, y, z) + ", блоки на высоте центра и выше твёрдые, v=" + v.speed
+                    + ", ai=" + (v.ai ? "да" : "нет") + ", пройдено=" + (int) v.pathProgress);
+            }
             int air = airBelow(level, x, y, z, 6);
             if (air >= 4 && now - d.airLog > 30000L) {
                 d.airLog = now;
@@ -3507,6 +3518,17 @@ public final class PtmFixes {
         return sb.toString();
     }
 
+    /** PTMEntity.syncedDespawn: причина удаления машин, появившихся в зоне (для журнала). */
+    public static void despawnReason(String reason, Object entity) {
+        try {
+            if (entity != null && SPAWNED.containsKey(System.identityHashCode(entity))) {
+                trafficLog("появившаяся в зоне машина удаляется: причина «" + reason + "» на " + at(PTMEntity.getX((Entity) entity), PTMEntity.getY((Entity) entity), PTMEntity.getZ((Entity) entity)));
+            }
+        } catch (Throwable t) {
+            // журнал не критичен
+        }
+    }
+
     /** Перед запуском ИИ у только что появившейся машины (успешное появление). */
     public static void spawned(Object vehicle) {
         try {
@@ -3669,6 +3691,43 @@ public final class PtmFixes {
         return r;
     }
 
+    private static boolean insideAnyZone(List<com.rinventor.ptm2.dimension.virtual.types.VDParkingZone> zones, double x, double z) {
+        for (com.rinventor.ptm2.dimension.virtual.types.VDParkingZone zn : zones) {
+            if (zn.isInside(x, z)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Ведёт ли полоса дальше по сети в полосу вне зон спавна (а не в тупик, где машина не найдёт путь и удалится). */
+    private static boolean leadsOut(Level level, VDTrafficLane first, List<com.rinventor.ptm2.dimension.virtual.types.VDParkingZone> zones) {
+        java.util.ArrayDeque<VDTrafficLane> queue = new java.util.ArrayDeque<>();
+        java.util.Set<String> seen = new java.util.HashSet<>();
+        queue.add(first);
+        int steps = 0;
+        while (!queue.isEmpty() && steps++ < 120) {
+            VDTrafficLane l = queue.poll();
+            for (VDTrafficLane n : VDUtils.getLanesByStart(level, com.rinventor.ptm2.engine.computing.Converter.toPos(l.getEnd()))) {
+                if (n.transport) {
+                    continue;
+                }
+                Object c = n.center();
+                try {
+                    if (!insideAnyZone(zones, vc(c, 0), vc(c, 2))) {
+                        return true;
+                    }
+                } catch (ReflectiveOperationException e) {
+                    return true;
+                }
+                if (seen.add(n.getStart() + "|" + n.getEnd())) {
+                    queue.add(n);
+                }
+            }
+        }
+        return false;
+    }
+
     /** Зоны спавна и полосы внутри них: {List<VDParkingZone>, List<DirectionalPos>}, обновляется раз в 15 секунд. */
     private static Object[] zoneData(Level level) {
         int lk = System.identityHashCode(level);
@@ -3687,26 +3746,46 @@ public final class PtmFixes {
                 }
             }
             if (!zones.isEmpty()) {
+                int[] stat = new int[6];   // всего в зонах, кривых, коротких, тупиковых, пригодных мест, транспортных
                 for (String data : new ArrayList<>(com.rinventor.ptm2.dimension.virtual.storage.VDStorageHandler.getAll(level, VDMemoryIDs.TRAFFIC_LANE).values())) {
                     VDTrafficLane lane = new VDTrafficLane(data);
-                    if (lane.transport || lane.isCurve() || lane.length() < 6) {
-                        continue;
-                    }
                     Object st = lane.getStart();
                     Object en = lane.getEnd();
+                    double mx = (vc(st, 0) + vc(en, 0)) / 2.0D;
+                    double mz = (vc(st, 2) + vc(en, 2)) / 2.0D;
+                    if (!insideAnyZone(zones, mx, mz)) {
+                        continue;
+                    }
+                    stat[0]++;
+                    if (lane.transport) {
+                        stat[5]++;
+                        continue;
+                    }
+                    if (lane.isCurve()) {
+                        stat[1]++;
+                        continue;
+                    }
+                    if (lane.length() < 6) {
+                        stat[2]++;
+                        continue;
+                    }
+                    if (!leadsOut(level, lane, zones)) {
+                        stat[3]++;
+                        continue;
+                    }
                     double[] fr = lane.length() >= 14 ? new double[] {0.25D, 0.5D, 0.75D} : new double[] {0.5D};
                     for (double f : fr) {
                         double cx = vc(st, 0) + (vc(en, 0) - vc(st, 0)) * f;
                         double cy = vc(st, 1) + (vc(en, 1) - vc(st, 1)) * f;
                         double cz = vc(st, 2) + (vc(en, 2) - vc(st, 2)) * f;
-                        for (com.rinventor.ptm2.dimension.virtual.types.VDParkingZone z : zones) {
-                            if (z.isInside(cx, cz)) {
-                                lanes.add(new com.rinventor.ptm2.engine.computing.DirectionalPos(cx + 0.5D, cy, cz + 0.5D, (float) (lane.rot8 * 45)));
-                                break;
-                            }
+                        if (insideAnyZone(zones, cx, cz)) {
+                            lanes.add(new com.rinventor.ptm2.engine.computing.DirectionalPos(cx + 0.5D, cy, cz + 0.5D, (float) (lane.rot8 * 45)));
+                            stat[4]++;
                         }
                     }
                 }
+                PTMLogger.info("PTM2 трафик: зон спавна " + zones.size() + ": полос внутри " + stat[0] + ", кривых (не подходят) " + stat[1] + ", коротких " + stat[2]
+                    + ", тупиковых (не ведут из зоны на дорогу) " + stat[3] + ", транспортных " + stat[5] + ", мест для появления " + stat[4]);
             }
         } catch (Throwable t) {
             PTMLogger.warn("PTM2 fixes: ошибка чтения зон спавна: " + t);

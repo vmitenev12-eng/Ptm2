@@ -86,7 +86,7 @@ public final class PtmFixes {
      * 1) даёт название станциям, у которых его нет;
      * 2) привязывает каждую платформу к станции, в зоне которой она находится.
      */
-    public static final String BUILD = "fixes-2026-11-01-lanegap";
+    public static final String BUILD = "fixes-2026-11-02-lanegap2";
     private static boolean announced = false;
 
     public static void tick(Level level) {
@@ -3485,6 +3485,8 @@ public final class PtmFixes {
     private static final java.util.concurrent.atomic.AtomicInteger C_OK = new java.util.concurrent.atomic.AtomicInteger();
     private static final java.util.Map<Integer, Object[]> SPAWNED = new java.util.concurrent.ConcurrentHashMap<>();
     private static volatile long lastZoneSpawn;
+    private static volatile String lastZoneSig = "";
+    private static volatile long lastZoneSigAt;
     private static volatile long trafficSummaryAt;
     private static volatile long trafficLogWindow;
     private static volatile int trafficLogCount;
@@ -3936,7 +3938,14 @@ public final class PtmFixes {
                         }
                     }
                 }
-                for (VDTrafficLane ex : examples) {
+                String sig = zones.size() + java.util.Arrays.toString(stat);
+                long nowLog = System.currentTimeMillis();
+                boolean logStat = !sig.equals(lastZoneSig) || nowLog - lastZoneSigAt > 300000L;
+                if (logStat) {
+                    lastZoneSig = sig;
+                    lastZoneSigAt = nowLog;
+                }
+                for (VDTrafficLane ex : logStat ? examples : new ArrayList<VDTrafficLane>()) {
                     double best = 1.0E9D;
                     Object bs = null;
                     for (VDTrafficLane o : allLanes) {
@@ -3953,7 +3962,7 @@ public final class PtmFixes {
                     PTMLogger.info("PTM2 трафик: пример тупика: полоса заканчивается в " + at(vc(ee, 0), vc(ee, 1), vc(ee, 2)) + ", ближайшее начало другой полосы в "
                         + String.format("%.2f", best) + " бл." + (bs == null ? "" : " (" + at(vc(bs, 0), vc(bs, 1), vc(bs, 2)) + ")"));
                 }
-                PTMLogger.info("PTM2 трафик: зон спавна " + zones.size() + ": полос внутри " + stat[0] + ", кривых (не подходят) " + stat[1] + ", коротких " + stat[2]
+                if (logStat) PTMLogger.info("PTM2 трафик: зон спавна " + zones.size() + ": полос внутри " + stat[0] + ", кривых (не подходят) " + stat[1] + ", коротких " + stat[2]
                     + ", тупиковых (не ведут из зоны на дорогу) " + stat[3] + ", транспортных " + stat[5] + ", мест для появления " + stat[4]);
             }
         } catch (Throwable t) {

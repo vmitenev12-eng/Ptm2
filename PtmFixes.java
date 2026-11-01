@@ -86,7 +86,7 @@ public final class PtmFixes {
      * 1) даёт название станциям, у которых его нет;
      * 2) привязывает каждую платформу к станции, в зоне которой она находится.
      */
-    public static final String BUILD = "fixes-2026-11-01-deadends";
+    public static final String BUILD = "fixes-2026-11-01-lanegap";
     private static boolean announced = false;
 
     public static void tick(Level level) {
@@ -3747,6 +3747,27 @@ public final class PtmFixes {
     }
 
     private static final java.util.Map<String, Object[]> DEAD_CACHE = new java.util.concurrent.ConcurrentHashMap<>();
+    /** Допуск соединения полос: оригинал считает полосы связанными, только если начало следующей в 0.5 блока от конца текущей. */
+    private static final double LANE_GAP_TOL = 1.3D;
+    private static final java.util.Set<String> GAP_LOGGED = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    /** Следующие полосы с тем же правилом, что в Car.connectedRegularLanes, но с настраиваемым допуском зазора. */
+    private static List<VDTrafficLane> nextLanes(Level level, VDTrafficLane lane, double tol) {
+        List<VDTrafficLane> res = new ArrayList<>();
+        for (VDTrafficLane n : VDUtils.getLanesByStart(level, com.rinventor.ptm2.engine.computing.Converter.toPos(lane.getEnd()))) {
+            if (n.transport) {
+                continue;
+            }
+            if (com.rinventor.ptm2.engine.util.Maths.simpleDistance(n.getEnd(), lane.getStart()) <= 0.5D) {
+                continue;
+            }
+            if (com.rinventor.ptm2.engine.util.Maths.simpleDistance(n.getStart(), lane.getEnd()) > tol) {
+                continue;
+            }
+            res.add(n);
+        }
+        return res;
+    }
 
     /** Тупиковая ли полоса: после неё нет полос, ведущих дальше (в пределах 3 шагов). Результат кэшируется на 15 секунд. */
     private static boolean deadEnd(Level level, VDTrafficLane lane, int depth) {
@@ -3756,12 +3777,7 @@ public final class PtmFixes {
         if (c != null && now - (Long) c[1] < 15000L) {
             return (Boolean) c[0];
         }
-        List<VDTrafficLane> next = new ArrayList<>();
-        for (VDTrafficLane n : VDUtils.getLanesByStart(level, com.rinventor.ptm2.engine.computing.Converter.toPos(lane.getEnd()))) {
-            if (!n.transport) {
-                next.add(n);
-            }
-        }
+        List<VDTrafficLane> next = nextLanes(level, lane, LANE_GAP_TOL);
         boolean dead;
         if (next.isEmpty()) {
             dead = true;
@@ -3784,27 +3800,43 @@ public final class PtmFixes {
     }
 
     /**
-     * Car.connectedRegularLanes: при выборе следующей полосы случайный выбор не заводит машину в тупик (карманы парковки, обрывы),
-     * если есть другие варианты. Иначе машина доезжает до конца пути и сама удаляется («Pathfinding»: нет продолжения).
+     * Car.connectedRegularLanes: (1) если оригинал не нашёл продолжения из-за зазора между полосами от 0.5 до 1.3 блока
+     * (ручное рисование), соединяем такие полосы, иначе машина доезжает до «обрыва» и сама удаляется;
+     * (2) случайный выбор не заводит машину в тупик, если есть другие варианты.
      */
-    public static List<?> noDeadEnds(Object car, List<?> lanes) {
+    public static List<?> connectedFix(Object car, List<?> orig, Object posObj, Object endObj, Object laneObj) {
         try {
-            if (lanes == null || lanes.size() < 2) {
-                return lanes;
-            }
             Level level = (Level) srg(car, "m_9236_");
-            if (PTMWorld.isClient(level)) {
-                return lanes;
+            if (PTMWorld.isClient(level) || laneObj == null) {
+                return orig;
+            }
+            List<?> list = orig;
+            VDTrafficLane lane = (VDTrafficLane) laneObj;
+            if (list == null || list.isEmpty()) {
+                List<VDTrafficLane> res = nextLanes(level, lane, LANE_GAP_TOL);
+                if (!res.isEmpty()) {
+                    list = res;
+                    String key = String.valueOf(lane.getEnd());
+                    if (GAP_LOGGED.size() > 2000) {
+                        GAP_LOGGED.clear();
+                    }
+                    if (GAP_LOGGED.add(key)) {
+                        PTMLogger.info("PTM2 трафик: полосы соединены с зазором (больше 0.5 блока) в точке " + at(vc(endObj, 0), vc(endObj, 1), vc(endObj, 2)) + ": иначе машина считала бы это концом дороги");
+                    }
+                }
+            }
+            if (list == null || list.size() < 2) {
+                return list;
             }
             List<Object> keep = new ArrayList<>();
-            for (Object o : lanes) {
+            for (Object o : list) {
                 if (!deadEnd(level, (VDTrafficLane) o, 0)) {
                     keep.add(o);
                 }
             }
-            return keep.isEmpty() || keep.size() == lanes.size() ? lanes : keep;
+            return keep.isEmpty() || keep.size() == list.size() ? list : keep;
         } catch (Throwable t) {
-            return lanes;
+            return orig;
         }
     }
 
@@ -3825,10 +3857,7 @@ public final class PtmFixes {
         int steps = 0;
         while (!queue.isEmpty() && steps++ < 120) {
             VDTrafficLane l = queue.poll();
-            for (VDTrafficLane n : VDUtils.getLanesByStart(level, com.rinventor.ptm2.engine.computing.Converter.toPos(l.getEnd()))) {
-                if (n.transport) {
-                    continue;
-                }
+            for (VDTrafficLane n : nextLanes(level, l, LANE_GAP_TOL)) {
                 Object c = n.center();
                 try {
                     if (!insideAnyZone(zones, vc(c, 0), vc(c, 2))) {
@@ -3864,8 +3893,11 @@ public final class PtmFixes {
             }
             if (!zones.isEmpty()) {
                 int[] stat = new int[6];   // всего в зонах, кривых, коротких, тупиковых, пригодных мест, транспортных
+                List<VDTrafficLane> examples = new ArrayList<>();
+                List<VDTrafficLane> allLanes = new ArrayList<>();
                 for (String data : new ArrayList<>(com.rinventor.ptm2.dimension.virtual.storage.VDStorageHandler.getAll(level, VDMemoryIDs.TRAFFIC_LANE).values())) {
                     VDTrafficLane lane = new VDTrafficLane(data);
+                    allLanes.add(lane);
                     Object st = lane.getStart();
                     Object en = lane.getEnd();
                     double mx = (vc(st, 0) + vc(en, 0)) / 2.0D;
@@ -3888,6 +3920,9 @@ public final class PtmFixes {
                     }
                     if (!leadsOut(level, lane, zones)) {
                         stat[3]++;
+                        if (examples.size() < 3) {
+                            examples.add(lane);
+                        }
                         continue;
                     }
                     double[] fr = lane.length() >= 14 ? new double[] {0.25D, 0.5D, 0.75D} : new double[] {0.5D};
@@ -3900,6 +3935,23 @@ public final class PtmFixes {
                             stat[4]++;
                         }
                     }
+                }
+                for (VDTrafficLane ex : examples) {
+                    double best = 1.0E9D;
+                    Object bs = null;
+                    for (VDTrafficLane o : allLanes) {
+                        if (o == ex) {
+                            continue;
+                        }
+                        double dd = com.rinventor.ptm2.engine.util.Maths.simpleDistance(o.getStart(), ex.getEnd());
+                        if (dd < best) {
+                            best = dd;
+                            bs = o.getStart();
+                        }
+                    }
+                    Object ee = ex.getEnd();
+                    PTMLogger.info("PTM2 трафик: пример тупика: полоса заканчивается в " + at(vc(ee, 0), vc(ee, 1), vc(ee, 2)) + ", ближайшее начало другой полосы в "
+                        + String.format("%.2f", best) + " бл." + (bs == null ? "" : " (" + at(vc(bs, 0), vc(bs, 1), vc(bs, 2)) + ")"));
                 }
                 PTMLogger.info("PTM2 трафик: зон спавна " + zones.size() + ": полос внутри " + stat[0] + ", кривых (не подходят) " + stat[1] + ", коротких " + stat[2]
                     + ", тупиковых (не ведут из зоны на дорогу) " + stat[3] + ", транспортных " + stat[5] + ", мест для появления " + stat[4]);

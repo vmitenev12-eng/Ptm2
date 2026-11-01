@@ -565,9 +565,12 @@ public class Patcher implements Opcodes {
                     w.instructions.add(new VarInsnNode(ALOAD, 2));
                     w.instructions.add(new VarInsnNode(ALOAD, 3));
                     w.instructions.add(new MethodInsnNode(INVOKEVIRTUAL, CARC, "ptmOrig_connectedRegularLanes", CD, false));
-                    w.instructions.add(new MethodInsnNode(INVOKESTATIC, FIXES, "noDeadEnds", "(Ljava/lang/Object;Ljava/util/List;)Ljava/util/List;", false));
+                    w.instructions.add(new VarInsnNode(ALOAD, 1));
+                    w.instructions.add(new VarInsnNode(ALOAD, 2));
+                    w.instructions.add(new VarInsnNode(ALOAD, 3));
+                    w.instructions.add(new MethodInsnNode(INVOKESTATIC, FIXES, "connectedFix", "(Ljava/lang/Object;Ljava/util/List;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/List;", false));
                     w.instructions.add(new InsnNode(ARETURN));
-                    w.maxStack = 5;
+                    w.maxStack = 8;
                     w.maxLocals = 4;
                     cn.methods.add(w);
                     done.add("car-deadends");

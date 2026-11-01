@@ -86,7 +86,7 @@ public final class PtmFixes {
      * 1) даёт название станциям, у которых его нет;
      * 2) привязывает каждую платформу к станции, в зоне которой она находится.
      */
-    public static final String BUILD = "fixes-2026-10-31-spawnzones4";
+    public static final String BUILD = "fixes-2026-11-01-deadends";
     private static boolean announced = false;
 
     public static void tick(Level level) {
@@ -1765,8 +1765,47 @@ public final class PtmFixes {
             }
             return ", \u043f\u043e\u0432\u043e\u0440\u043e\u0442\u043d\u0438\u043a=" + t.getIndicators() + ", ai=" + (t.ai ? "\u0434\u0430" : "\u043d\u0435\u0442")
                 + ", \u0446\u0435\u043b\u0435\u0432\u0430\u044f \u0441\u043a\u043e\u0440\u043e\u0441\u0442\u044c=" + t.targetSpeed + ", \u043f\u043e\u043b\u043e\u0441 \u0432 \u043f\u0443\u0442\u0438=" + lanes
-                + ", \u043f\u0440\u043e\u0439\u0434\u0435\u043d\u043e=" + (int) t.pathProgress + ", \u0430\u0432\u0430\u0440\u0438\u044f=" + (t.crashed ? "\u0434\u0430" : "\u043d\u0435\u0442");
+                + ", \u043f\u0440\u043e\u0439\u0434\u0435\u043d\u043e=" + (int) t.pathProgress + ", \u0430\u0432\u0430\u0440\u0438\u044f=" + (t.crashed ? "\u0434\u0430" : "\u043d\u0435\u0442") + whyInfo(ve);
         } catch (Throwable th) {
+            return "";
+        }
+    }
+
+    /** Почему автобус стоит: состояние оригинального ИИ и моих механизмов (для журнала). */
+    private static String whyInfo(Vehicle ve) {
+        try {
+            Drv d = DRV.get(System.identityHashCode(ve));
+            if (d == null) {
+                return "";
+            }
+            StringBuilder sb = new StringBuilder(", причины: оригинал ").append(d.lastOrig ? "разрешает ехать" : "запрещает ехать");
+            if (d.planHold) {
+                sb.append(", планировщик держит");
+            }
+            if (d.backing) {
+                sb.append(", отъезд назад");
+            }
+            if (System.currentTimeMillis() < d.holdUntil) {
+                sb.append(", пауза после отъезда");
+            }
+            if (d.committed) {
+                sb.append(", проезд закреплён");
+            }
+            if (d.boxSince > 0L) {
+                sb.append(", ждёт место за перекрёстком");
+            }
+            if (d.forced) {
+                sb.append(", принудительный проезд");
+            }
+            try {
+                if (VehicleUtils.forbiddingTrafficLightAhead(ve)) {
+                    sb.append(", красный впереди");
+                }
+            } catch (Throwable t) {
+                // не критично
+            }
+            return sb.toString();
+        } catch (Throwable t) {
             return "";
         }
     }
@@ -3705,6 +3744,68 @@ public final class PtmFixes {
         }
         SEEN.put(key, new long[] {now, r ? 1L : 0L});
         return r;
+    }
+
+    private static final java.util.Map<String, Object[]> DEAD_CACHE = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** Тупиковая ли полоса: после неё нет полос, ведущих дальше (в пределах 3 шагов). Результат кэшируется на 15 секунд. */
+    private static boolean deadEnd(Level level, VDTrafficLane lane, int depth) {
+        String key = lane.getStart() + "|" + lane.getEnd();
+        long now = System.currentTimeMillis();
+        Object[] c = DEAD_CACHE.get(key);
+        if (c != null && now - (Long) c[1] < 15000L) {
+            return (Boolean) c[0];
+        }
+        List<VDTrafficLane> next = new ArrayList<>();
+        for (VDTrafficLane n : VDUtils.getLanesByStart(level, com.rinventor.ptm2.engine.computing.Converter.toPos(lane.getEnd()))) {
+            if (!n.transport) {
+                next.add(n);
+            }
+        }
+        boolean dead;
+        if (next.isEmpty()) {
+            dead = true;
+        } else if (depth >= 3) {
+            dead = false;
+        } else {
+            dead = true;
+            for (VDTrafficLane n : next) {
+                if (!deadEnd(level, n, depth + 1)) {
+                    dead = false;
+                    break;
+                }
+            }
+        }
+        if (DEAD_CACHE.size() > 6000) {
+            DEAD_CACHE.clear();
+        }
+        DEAD_CACHE.put(key, new Object[] {dead, now});
+        return dead;
+    }
+
+    /**
+     * Car.connectedRegularLanes: при выборе следующей полосы случайный выбор не заводит машину в тупик (карманы парковки, обрывы),
+     * если есть другие варианты. Иначе машина доезжает до конца пути и сама удаляется («Pathfinding»: нет продолжения).
+     */
+    public static List<?> noDeadEnds(Object car, List<?> lanes) {
+        try {
+            if (lanes == null || lanes.size() < 2) {
+                return lanes;
+            }
+            Level level = (Level) srg(car, "m_9236_");
+            if (PTMWorld.isClient(level)) {
+                return lanes;
+            }
+            List<Object> keep = new ArrayList<>();
+            for (Object o : lanes) {
+                if (!deadEnd(level, (VDTrafficLane) o, 0)) {
+                    keep.add(o);
+                }
+            }
+            return keep.isEmpty() || keep.size() == lanes.size() ? lanes : keep;
+        } catch (Throwable t) {
+            return lanes;
+        }
     }
 
     private static boolean insideAnyZone(List<com.rinventor.ptm2.dimension.virtual.types.VDParkingZone> zones, double x, double z) {

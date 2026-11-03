@@ -542,7 +542,11 @@ public class Patcher implements Opcodes {
                             InsnList ok = new InsnList();
                             ok.add(new InsnNode(DUP));
                             ok.add(new MethodInsnNode(INVOKESTATIC, FIXES, "spawned", "(Ljava/lang/Object;)V", false));
+                            ok.add(new InsnNode(DUP));
                             m.instructions.insertBefore(in, ok);
+                            InsnList after = new InsnList();
+                            after.add(new MethodInsnNode(INVOKESTATIC, FIXES, "afterSpawn", "(Ljava/lang/Object;)V", false));
+                            m.instructions.insert(in, after);
                             done.add("zone-spawned");
                             changed = true;
                         }

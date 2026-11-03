@@ -86,7 +86,7 @@ public final class PtmFixes {
      * 1) даёт название станциям, у которых его нет;
      * 2) привязывает каждую платформу к станции, в зоне которой она находится.
      */
-    public static final String BUILD = "fixes-2026-11-03-virtualcars";
+    public static final String BUILD = "fixes-2026-11-04-parking";
     private static boolean announced = false;
 
     public static void tick(Level level) {
@@ -3472,7 +3472,11 @@ public final class PtmFixes {
         + "# Виртуальный слой машин: машины рождаются в зонах спавна и едут, даже когда рядом нет игроков (true/false)\n"
         + "virtualCars=true\n"
         + "# Потолок виртуальных (и материализованных из них) машин на мир\n"
-        + "maxVirtualCars=400\n";
+        + "maxVirtualCars=400\n"
+        + "# Стоянка машин: сколько минут стоят (реальных), сколько раз одна машина заезжает на парковки (от 0 до максимума)\n"
+        + "parkMinMinutes=1\n"
+        + "parkMaxMinutes=30\n"
+        + "parkVisitsMax=3\n";
     private static final java.util.Properties FIXCFG = new java.util.Properties();
     private static volatile long cfgLoadedAt;
     private static final java.util.Map<Long, long[]> SEEN = new java.util.concurrent.ConcurrentHashMap<>();
@@ -3865,6 +3869,19 @@ public final class PtmFixes {
         long cool;
         long bornAt = System.currentTimeMillis();
         int fails;
+        int visits;
+        List<VDTrafficLane> route;
+        int ridx = -1;
+        Spot goalSpot;
+        boolean exitGoal;
+        boolean exited;
+        long replanAt;
+        boolean parked;
+        Spot parkedAt;
+        long parkUntil;
+        String leaveAvoid;
+        double homeX = Double.NaN;
+        double homeZ;
     }
 
     private static final List<VCar> VCARS = new ArrayList<>();
@@ -4026,6 +4043,336 @@ public final class PtmFixes {
         }
     }
 
+    // ----- Парковки: места, маршруты, стоянка
+
+    private static final class Spot {
+        VDTrafficLane lane;
+        VDTrafficLane pred;
+        String key;
+        double[] pose;
+        double zx;
+        double zz;
+    }
+
+    private static volatile List<Spot> SPOTS = new ArrayList<>();
+    private static volatile long spotsAt;
+    private static final java.util.Map<String, VCar> SPOT_OCC = new java.util.concurrent.ConcurrentHashMap<>();
+    private static volatile VCar pendingPark;
+    private static final java.util.concurrent.atomic.AtomicInteger P_PLAN = new java.util.concurrent.atomic.AtomicInteger();
+    private static final java.util.concurrent.atomic.AtomicInteger P_PARK = new java.util.concurrent.atomic.AtomicInteger();
+    private static final java.util.concurrent.atomic.AtomicInteger P_LEAVE = new java.util.concurrent.atomic.AtomicInteger();
+    private static final java.util.concurrent.atomic.AtomicInteger P_EXIT = new java.util.concurrent.atomic.AtomicInteger();
+    private static final java.util.concurrent.atomic.AtomicInteger P_MAT = new java.util.concurrent.atomic.AtomicInteger();
+    private static final java.util.concurrent.atomic.AtomicInteger P_UNMAT = new java.util.concurrent.atomic.AtomicInteger();
+    private static final java.util.concurrent.atomic.AtomicInteger P_NOROUTE = new java.util.concurrent.atomic.AtomicInteger();
+
+    private static String laneKey(VDTrafficLane l) {
+        return l.getStart() + "|" + l.getEnd();
+    }
+
+    /**
+     * Места парковки: тупиковые полосы («карманы») внутри зон типа «Стоянка» или «Стоянка и спавн/удаление».
+     * У каждого есть позиция для стоящей машины (в конце полосы) и предыдущая полоса, с которой машина уезжает.
+     */
+    private static List<Spot> spots(Level level) {
+        long now = System.currentTimeMillis();
+        if (now - spotsAt < 20000L) {
+            return SPOTS;
+        }
+        spotsAt = now;
+        List<Spot> res = new ArrayList<>();
+        try {
+            List<com.rinventor.ptm2.dimension.virtual.types.VDParkingZone> pz = new ArrayList<>();
+            for (String data : com.rinventor.ptm2.dimension.virtual.storage.VDStorageHandler.getAll(level, VDMemoryIDs.PARKING_ZONE).values()) {
+                int t = zoneTypeOfData(data);
+                if (t == ZONE_PARK || t == ZONE_BOTH) {
+                    pz.add(new com.rinventor.ptm2.dimension.virtual.types.VDParkingZone(data));
+                }
+            }
+            if (!pz.isEmpty()) {
+                List<VDTrafficLane> all = new ArrayList<>();
+                for (String data : new ArrayList<>(com.rinventor.ptm2.dimension.virtual.storage.VDStorageHandler.getAll(level, VDMemoryIDs.TRAFFIC_LANE).values())) {
+                    all.add(new VDTrafficLane(data));
+                }
+                for (VDTrafficLane lane : all) {
+                    if (lane.transport || laneLen(lane) < 3.0D) {
+                        continue;
+                    }
+                    Object c = lane.center();
+                    com.rinventor.ptm2.dimension.virtual.types.VDParkingZone zone = null;
+                    for (com.rinventor.ptm2.dimension.virtual.types.VDParkingZone z : pz) {
+                        if (z.isInside(vc(c, 0), vc(c, 2))) {
+                            zone = z;
+                            break;
+                        }
+                    }
+                    if (zone == null || !deadEnd(level, lane, 0)) {
+                        continue;
+                    }
+                    VDTrafficLane pred = null;
+                    for (VDTrafficLane o : all) {
+                        if (o == lane || o.transport) {
+                            continue;
+                        }
+                        if (com.rinventor.ptm2.engine.util.Maths.simpleDistance(o.getEnd(), lane.getStart()) <= LANE_GAP_TOL
+                            && com.rinventor.ptm2.engine.util.Maths.simpleDistance(o.getStart(), lane.getEnd()) > 0.5D && !deadEnd(level, o, 0)) {
+                            pred = o;
+                            break;
+                        }
+                    }
+                    if (pred == null) {
+                        continue;
+                    }
+                    double len = laneLen(lane);
+                    double[] p1 = posOnLane(lane, Math.max(0.0D, len - 2.2D));
+                    double[] pa = posOnLane(lane, Math.max(0.0D, len - 3.5D));
+                    double[] pb = posOnLane(lane, Math.max(0.0D, len - 0.7D));
+                    double yaw = Math.toDegrees(Math.atan2(pb[0] - pa[0], -(pb[2] - pa[2])));
+                    if (yaw < 0.0D) {
+                        yaw += 360.0D;
+                    }
+                    Spot sp = new Spot();
+                    sp.lane = lane;
+                    sp.pred = pred;
+                    sp.key = laneKey(lane);
+                    sp.pose = new double[] {p1[0], p1[1], p1[2], yaw};
+                    sp.zx = zone.getCenterX();
+                    sp.zz = zone.getCenterZ();
+                    res.add(sp);
+                }
+            }
+        } catch (Throwable t) {
+            PTMLogger.warn("PTM2 fixes: ошибка чтения мест парковки: " + t);
+        }
+        SPOTS = res;
+        return res;
+    }
+
+    /** Кратчайший (по длине полос) маршрут от полосы from до полосы, удовлетворяющей goal; null, если не найден. */
+    private static List<VDTrafficLane> findRoute(Level level, VDTrafficLane from, java.util.function.Predicate<VDTrafficLane> goal, String avoidKey) {
+        java.util.PriorityQueue<Object[]> pq = new java.util.PriorityQueue<>((a, b) -> Double.compare((Double) a[0], (Double) b[0]));
+        java.util.Map<String, Object[]> best = new java.util.HashMap<>();
+        String fk = laneKey(from);
+        pq.add(new Object[] {0.0D, fk, from});
+        best.put(fk, new Object[] {0.0D, null, from});
+        int pops = 0;
+        while (!pq.isEmpty() && pops++ < 2500) {
+            Object[] cur = pq.poll();
+            double d = (Double) cur[0];
+            String lk = (String) cur[1];
+            VDTrafficLane l = (VDTrafficLane) cur[2];
+            Object[] b = best.get(lk);
+            if (b != null && d > (Double) b[0] + 1.0E-9D) {
+                continue;
+            }
+            if (!lk.equals(fk) && goal.test(l)) {
+                java.util.LinkedList<VDTrafficLane> path = new java.util.LinkedList<>();
+                String k = lk;
+                while (k != null && !k.equals(fk)) {
+                    Object[] e = best.get(k);
+                    path.addFirst((VDTrafficLane) e[2]);
+                    k = (String) e[1];
+                }
+                return new ArrayList<>(path);
+            }
+            for (VDTrafficLane n : nextLanes(level, l, LANE_GAP_TOL)) {
+                String nk = laneKey(n);
+                if (nk.equals(avoidKey)) {
+                    continue;
+                }
+                if (!goal.test(n) && deadEnd(level, n, 0)) {
+                    continue;
+                }
+                double nd = d + laneLen(n);
+                Object[] ob = best.get(nk);
+                if (ob == null || nd < (Double) ob[0]) {
+                    best.put(nk, new Object[] {nd, lk, n});
+                    pq.add(new Object[] {nd, nk, n});
+                }
+            }
+        }
+        return null;
+    }
+
+    private static void releaseSpot(VCar c) {
+        if (c.parkedAt != null) {
+            SPOT_OCC.remove(c.parkedAt.key, c);
+        }
+        if (c.goalSpot != null) {
+            SPOT_OCC.remove(c.goalSpot.key, c);
+        }
+    }
+
+    /** Планирует следующую цель: ещё одна парковка (если остались заезды) или зона удаления в другой зоне. */
+    private static void planNext(Level level, VCar c, long now, String avoidKey) throws ReflectiveOperationException {
+        double[] cp = posOnLane(c.lane, c.prog);
+        if (Double.isNaN(c.homeX)) {
+            c.homeX = cp[0];
+            c.homeZ = cp[2];
+        }
+        List<Spot> free = new ArrayList<>();
+        for (Spot sp : spots(level)) {
+            VCar occ = SPOT_OCC.get(sp.key);
+            if ((occ == null || occ == c) && !sp.key.equals(avoidKey)) {
+                free.add(sp);
+            }
+        }
+        if (c.visits > 0 && !free.isEmpty()) {
+            final double fx = cp[0];
+            final double fz = cp[2];
+            free.sort((a, b) -> Double.compare(Math.hypot(a.pose[0] - fx, a.pose[2] - fz), Math.hypot(b.pose[0] - fx, b.pose[2] - fz)));
+            for (int attempt = 0; attempt < 3 && !free.isEmpty(); attempt++) {
+                Spot sp = free.remove(VRND.nextInt(Math.min(free.size(), 8)));
+                final String gk = sp.key;
+                List<VDTrafficLane> route = findRoute(level, c.lane, l -> laneKey(l).equals(gk), avoidKey);
+                if (route != null) {
+                    c.route = route;
+                    c.ridx = -1;
+                    c.goalSpot = sp;
+                    c.exitGoal = false;
+                    c.visits--;
+                    SPOT_OCC.put(sp.key, c);
+                    P_PLAN.incrementAndGet();
+                    trafficLog("машина " + at(cp[0], cp[1], cp[2]) + " едет парковаться: место " + at(sp.pose[0], sp.pose[1], sp.pose[2]) + ", маршрут из " + route.size() + " полос, осталось заездов " + c.visits);
+                    return;
+                }
+            }
+            c.visits = 0;
+        }
+        // зона удаления в другой зоне
+        Object[] zd = zoneData(level);
+        java.util.Set<String> exitKeys = new java.util.HashSet<>();
+        java.util.Set<String> anyExit = new java.util.HashSet<>();
+        for (Object o : (List<?>) zd[3]) {
+            VDTrafficLane lane = (VDTrafficLane) ((Object[]) o)[0];
+            String k = laneKey(lane);
+            anyExit.add(k);
+            Object lc = lane.center();
+            if (Math.hypot(vc(lc, 0) - c.homeX, vc(lc, 2) - c.homeZ) > 40.0D) {
+                exitKeys.add(k);
+            }
+        }
+        java.util.Set<String> targets = exitKeys.isEmpty() ? anyExit : exitKeys;
+        if (!targets.isEmpty()) {
+            List<VDTrafficLane> route = findRoute(level, c.lane, l -> targets.contains(laneKey(l)), avoidKey);
+            if (route != null) {
+                c.route = route;
+                c.ridx = -1;
+                c.goalSpot = null;
+                c.exitGoal = true;
+                P_PLAN.incrementAndGet();
+                trafficLog("машина " + at(cp[0], cp[1], cp[2]) + " едет к зоне удаления, маршрут из " + route.size() + " полос");
+                return;
+            }
+        }
+        P_NOROUTE.incrementAndGet();
+        c.route = null;
+        c.replanAt = now + 20000L;
+    }
+
+    /** Машина доехала до конца маршрута: паркуется (стоит 1-30 минут) или покидает мир в зоне удаления. */
+    private static void arrive(Level level, VCar c, long now) {
+        if (c.goalSpot != null) {
+            Spot sp = c.goalSpot;
+            c.parked = true;
+            c.parkedAt = sp;
+            c.goalSpot = null;
+            c.route = null;
+            c.lane = sp.lane;
+            c.prog = laneLen(sp.lane);
+            double minM = cfgNum("parkminminutes", 1.0D);
+            double maxM = Math.max(minM, cfgNum("parkmaxminutes", 30.0D));
+            long ms = (long) ((minM + VRND.nextDouble() * (maxM - minM)) * 60000.0D);
+            c.parkUntil = now + ms;
+            SPOT_OCC.put(sp.key, c);
+            P_PARK.incrementAndGet();
+            trafficLog("виртуальная машина припарковалась " + at(sp.pose[0], sp.pose[1], sp.pose[2]) + " на " + (ms / 60000L) + " мин " + ((ms / 1000L) % 60L) + " с");
+        } else {
+            c.exited = true;
+            c.lane = null;
+            P_EXIT.incrementAndGet();
+        }
+    }
+
+    /** Время стоянки вышло: машина становится на предыдущую полосу и едет дальше. */
+    private static void departure(Level level, VCar c, long now) throws ReflectiveOperationException {
+        Spot sp = c.parkedAt;
+        releaseSpot(c);
+        c.parked = false;
+        c.parkedAt = null;
+        c.lane = sp.pred;
+        c.prog = laneLen(sp.pred);
+        c.slow = slowLane(level, sp.pred);
+        c.route = null;
+        c.ridx = -1;
+        c.goalSpot = null;
+        c.exitGoal = false;
+        c.replanAt = 0L;
+        c.leaveAvoid = sp.key;
+        P_LEAVE.incrementAndGet();
+        trafficLog("машина уезжает с парковки " + at(sp.pose[0], sp.pose[1], sp.pose[2]) + ", осталось заездов " + c.visits);
+    }
+
+    private static boolean anyPlayerWithinOwnRange(Level level, double x, double y, double z) {
+        try {
+            for (Map.Entry<java.util.UUID, Object> e : PV_POS.entrySet()) {
+                double range = Math.max(48, trafficRangeOf(level, e.getKey()) - 8);
+                double dx = vc(e.getValue(), 0) - x;
+                double dz = vc(e.getValue(), 2) - z;
+                if (dx * dx + dz * dz <= range * range) {
+                    return true;
+                }
+            }
+        } catch (Throwable t) {
+            return true;
+        }
+        return false;
+    }
+
+    /** Ставит стоящую машину на место парковки (привязка и флаги в afterSpawn). */
+    private static boolean tryMaterializeParked(Level level, VCar c) {
+        try {
+            Spot sp = c.parkedAt;
+            if (sp == null || occupied(level, sp.pose[0] + 0.5D, sp.pose[1], sp.pose[2] + 0.5D)) {
+                return false;
+            }
+            if (spawnCarMethod == null) {
+                spawnCarMethod = com.rinventor.ptm2.dimension.physical.TrafficManager.class.getDeclaredMethod("spawnCar", Level.class, double.class, double.class, double.class, float.class);
+                spawnCarMethod.setAccessible(true);
+            }
+            pendingPark = c;
+            spawnCarMethod.invoke(null, level, sp.pose[0] + 0.5D, sp.pose[1], sp.pose[2] + 0.5D, (float) sp.pose[3]);
+            boolean ok = c.physical;
+            pendingPark = null;
+            return ok;
+        } catch (Throwable t) {
+            pendingPark = null;
+            return false;
+        }
+    }
+
+    /** TrafficManager.spawnCar после запуска ИИ: если ставилась стоящая машина, выключаем ИИ и привязываем её к записи. */
+    public static void afterSpawn(Object vehicle) {
+        try {
+            VCar c = pendingPark;
+            if (c != null) {
+                Vehicle v = (Vehicle) vehicle;
+                v.parked = true;
+                v.handBrake = true;
+                v.locked = true;
+                v.ignition = false;
+                v.ai = false;
+                v.speed = 0.0F;
+                c.physical = true;
+                c.ent = new java.lang.ref.WeakReference<>(vehicle);
+                PHYS.put(System.identityHashCode(vehicle), c);
+                pendingPark = null;
+            }
+        } catch (Throwable t) {
+            pendingPark = null;
+        }
+    }
+
     private static void vcarAdvance(Level level, VCar c, double dt) throws ReflectiveOperationException {
         double speed = Math.max(3.0D, c.lane.speedLimit / 3.6D * 0.7D);
         if (c.slow) {
@@ -4034,7 +4381,21 @@ public final class PtmFixes {
         c.prog += speed * dt;
         double len = laneLen(c.lane);
         int guard = 0;
+        long now = System.currentTimeMillis();
         while (c.prog >= len && guard++ < 8) {
+            if (c.route != null) {
+                c.ridx++;
+                if (c.ridx >= c.route.size()) {
+                    c.prog = len;
+                    arrive(level, c, now);
+                    return;
+                }
+                c.prog -= len;
+                c.lane = c.route.get(c.ridx);
+                c.slow = slowLane(level, c.lane);
+                len = laneLen(c.lane);
+                continue;
+            }
             List<VDTrafficLane> next = nextLanes(level, c.lane, LANE_GAP_TOL);
             List<VDTrafficLane> good = new ArrayList<>();
             for (VDTrafficLane n : next) {
@@ -4108,6 +4469,17 @@ public final class PtmFixes {
                 c.physical = false;
                 c.ent = null;
                 c.fails = 0;
+                releaseSpot(c);
+                c.route = null;
+                c.ridx = -1;
+                c.goalSpot = null;
+                c.exitGoal = false;
+                c.parked = false;
+                c.parkedAt = null;
+                c.replanAt = 0L;
+                if (c.visits <= 0) {
+                    c.visits = VRND.nextInt((int) cfgNum("parkvisitsmax", 3.0D) + 1);
+                }
             }
             V_BACK.incrementAndGet();
             trafficLog("машина " + at(vc(pos, 0), vc(pos, 1), vc(pos, 2)) + " ушла из радиуса игроков и стала виртуальной (не исчезла)");
@@ -4129,6 +4501,10 @@ public final class PtmFixes {
                 spawnCarMethod.setAccessible(true);
             }
             pendingMat = c;
+            releaseSpot(c);
+            c.route = null;
+            c.ridx = -1;
+            c.goalSpot = null;
             spawnCarMethod.invoke(null, level, p[0] + 0.5D, p[1], p[2] + 0.5D, (float) (c.lane.rot8 * 45));
             boolean ok = pendingMat == null;
             pendingMat = null;
@@ -4139,7 +4515,7 @@ public final class PtmFixes {
         }
     }
 
-    /** Раз в секунду: рождение, движение, материализация и удаление излишков виртуальных машин. */
+    /** Раз в секунду: рождение, движение, маршруты, стоянка, материализация и удаление излишков виртуальных машин. */
     private static void vcarTick(Level level) {
         if (PTMWorld.isClient(level) || !cfgBool("virtualcars", true)) {
             return;
@@ -4158,22 +4534,57 @@ public final class PtmFixes {
             List<?> zones = (List<?>) zd[0];
             List<?> refs = (List<?>) zd[3];
             int cap = (int) cfgNum("maxvirtualcars", 400.0D);
+            int maxVisits = (int) cfgNum("parkvisitsmax", 3.0D);
             java.lang.reflect.Method req = com.rinventor.ptm2.dimension.physical.TrafficManager.class.getDeclaredMethod("requiredCars", Level.class, int.class, int.class, int.class);
             req.setAccessible(true);
             synchronized (VCARS) {
-                // 1. записи, чья машина исчезла, и движение
+                int plans = 0;
+                // 1. состояние: исчезнувшие машины, стоянка, движение
                 for (java.util.Iterator<VCar> it = VCARS.iterator(); it.hasNext();) {
                     VCar c = it.next();
                     if (c.physical) {
                         Object e = c.ent == null ? null : c.ent.get();
                         if (e == null || Boolean.TRUE.equals(srg(e, "m_213877_"))) {
+                            releaseSpot(c);
                             it.remove();
+                            continue;
+                        }
+                        if (c.parked) {
+                            double ex = PTMEntity.getX((Entity) e);
+                            double ey = PTMEntity.getY((Entity) e);
+                            double ez = PTMEntity.getZ((Entity) e);
+                            boolean near = anyPlayerWithinOwnRange(level, ex, ey, ez);
+                            if ((now >= c.parkUntil || !near) && !seenByPlayers(level, ex, ey, ez)) {
+                                PTMEntity.syncedDespawn("Parked car back to virtual", (Entity) e);
+                                PHYS.remove(System.identityHashCode(e));
+                                c.physical = false;
+                                c.ent = null;
+                                if (!near) {
+                                    P_UNMAT.incrementAndGet();
+                                }
+                            }
                         }
                         continue;
                     }
+                    if (c.parked) {
+                        if (now >= c.parkUntil) {
+                            departure(level, c, now);
+                        }
+                        continue;
+                    }
+                    if (c.route == null && c.replanAt <= now && plans < 3) {
+                        plans++;
+                        planNext(level, c, now, c.leaveAvoid);
+                        c.leaveAvoid = null;
+                    }
                     vcarAdvance(level, c, dt);
                     if (c.lane == null) {
-                        V_DEAD.incrementAndGet();
+                        if (c.exited) {
+                            trafficLog("виртуальная машина покинула мир в зоне удаления");
+                        } else {
+                            V_DEAD.incrementAndGet();
+                        }
+                        releaseSpot(c);
                         it.remove();
                     }
                 }
@@ -4190,7 +4601,7 @@ public final class PtmFixes {
                         int demand = (Integer) req.invoke(null, level, 144, (int) zx, (int) zz);
                         int near = 0;
                         for (VCar c : VCARS) {
-                            if (c.lane != null && !c.physical) {
+                            if (c.lane != null && !c.physical && !c.parked) {
                                 double[] p = posOnLane(c.lane, c.prog);
                                 double dx = p[0] - zx;
                                 double dz = p[2] - zz;
@@ -4209,7 +4620,7 @@ public final class PtmFixes {
                             double[] sp = posOnLane(lane, laneLen(lane) * (Double) ref[1]);
                             boolean free = true;
                             for (VCar c : VCARS) {
-                                if (c.lane != null && !c.physical) {
+                                if (c.lane != null && !c.physical && !c.parked) {
                                     double[] p = posOnLane(c.lane, c.prog);
                                     if (Math.abs(p[0] - sp[0]) < 9.0D && Math.abs(p[2] - sp[2]) < 9.0D) {
                                         free = false;
@@ -4222,6 +4633,9 @@ public final class PtmFixes {
                                 nc.lane = lane;
                                 nc.prog = laneLen(lane) * (Double) ref[1];
                                 nc.slow = slowLane(level, lane);
+                                nc.visits = VRND.nextInt(maxVisits + 1);
+                                nc.homeX = zx;
+                                nc.homeZ = zz;
                                 VCARS.add(nc);
                                 spawned++;
                                 V_NEW.incrementAndGet();
@@ -4239,20 +4653,45 @@ public final class PtmFixes {
                         int required = (Integer) req.invoke(null, level, 144, (int) px, (int) pz);
                         int count = PTMEntity.count(com.rinventor.ptm2.objects.entities.vehicle.car.Car.class, 144.0D, level, px, py, pz);
                         int budget = Math.min(3, required - count);
-                        if (budget <= 0) {
-                            continue;
-                        }
                         List<VCar> cands = new ArrayList<>();
+                        List<VCar> parkedCands = new ArrayList<>();
                         for (VCar c : VCARS) {
-                            if (c.physical || c.lane == null || c.cool > now || c.lane.isCurve()) {
+                            if (c.physical || c.lane == null || c.cool > now) {
                                 continue;
                             }
-                            double[] p = posOnLane(c.lane, c.prog);
+                            double[] p = c.parked && c.parkedAt != null ? c.parkedAt.pose : posOnLane(c.lane, c.prog);
                             double dx = p[0] - px;
                             double dz = p[2] - pz;
-                            if (dx * dx + dz * dz <= range * range) {
+                            if (dx * dx + dz * dz > range * range) {
+                                continue;
+                            }
+                            if (c.parked) {
+                                parkedCands.add(c);
+                            } else if (!c.lane.isCurve()) {
                                 cands.add(c);
                             }
+                        }
+                        // стоящие машины: расставляем на парковках вне поля зрения
+                        java.util.Collections.shuffle(parkedCands, VRND);
+                        int ptries = 0;
+                        for (VCar c : parkedCands) {
+                            if (ptries++ >= 4) {
+                                break;
+                            }
+                            double[] pp = c.parkedAt.pose;
+                            if (seenStrict(level, pp[0] + 0.5D, pp[1], pp[2] + 0.5D)) {
+                                c.cool = now + 3000L;
+                                continue;
+                            }
+                            if (tryMaterializeParked(level, c)) {
+                                P_MAT.incrementAndGet();
+                                trafficLog("стоящая машина поставлена на парковку " + at(pp[0], pp[1], pp[2]) + ", в поле зрения: нет");
+                            } else {
+                                c.cool = now + 5000L;
+                            }
+                        }
+                        if (budget <= 0) {
+                            continue;
                         }
                         java.util.Collections.shuffle(cands, VRND);
                         int tries = 0;
@@ -4276,11 +4715,12 @@ public final class PtmFixes {
                         }
                     }
                 }
-                // 4. излишки в зонах убираются тихо (записи не видны)
-                if (!zones.isEmpty() && VCARS.size() > cap) {
+                // 4. излишки сверх потолка убираются тихо (записи не видны)
+                if (VCARS.size() > cap) {
                     for (java.util.Iterator<VCar> it = VCARS.iterator(); it.hasNext() && VCARS.size() > cap;) {
                         VCar c = it.next();
                         if (!c.physical) {
+                            releaseSpot(c);
                             it.remove();
                             V_SURP.incrementAndGet();
                         }
@@ -4291,17 +4731,23 @@ public final class PtmFixes {
                 vcarSummaryAt = now;
                 int total;
                 int phys = 0;
+                int parkedN = 0;
                 synchronized (VCARS) {
                     total = VCARS.size();
                     for (VCar c : VCARS) {
                         if (c.physical) {
                             phys++;
                         }
+                        if (c.parked) {
+                            parkedN++;
+                        }
                     }
                 }
-                PTMLogger.info("PTM2 трафик: виртуальный слой: записей " + total + " (из них материализовано " + phys + "), за минуту создано " + V_NEW.getAndSet(0)
-                    + ", материализовано " + V_MAT.getAndSet(0) + ", возвращено в виртуальные " + V_BACK.getAndSet(0) + ", убрано в тупике " + V_DEAD.getAndSet(0)
-                    + ", убрано излишков " + V_SURP.getAndSet(0) + ", потолок " + cap);
+                PTMLogger.info("PTM2 трафик: виртуальный слой: записей " + total + " (материализовано " + phys + ", стоят на парковках " + parkedN + ", мест парковки " + spots(level).size()
+                    + "), за минуту создано " + V_NEW.getAndSet(0) + ", материализовано " + V_MAT.getAndSet(0) + ", возвращено в виртуальные " + V_BACK.getAndSet(0)
+                    + ", убрано в тупике " + V_DEAD.getAndSet(0) + ", излишков " + V_SURP.getAndSet(0) + "; парковки: маршрутов " + P_PLAN.getAndSet(0) + ", припарковалось " + P_PARK.getAndSet(0)
+                    + ", уехало " + P_LEAVE.getAndSet(0) + ", вышло через зону удаления " + P_EXIT.getAndSet(0) + ", без маршрута " + P_NOROUTE.getAndSet(0)
+                    + ", стоящих поставлено " + P_MAT.getAndSet(0) + ", убрано (никого рядом) " + P_UNMAT.getAndSet(0) + ", потолок " + cap);
             }
         } catch (Throwable t) {
             PTMLogger.warn("PTM2 fixes: ошибка виртуального слоя машин: " + t);

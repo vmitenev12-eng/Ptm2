@@ -86,7 +86,7 @@ public final class PtmFixes {
      * 1) даёт название станциям, у которых его нет;
      * 2) привязывает каждую платформу к станции, в зоне которой она находится.
      */
-    public static final String BUILD = "fixes-2026-11-04-parking";
+    public static final String BUILD = "fixes-2026-11-05-lots";
     private static boolean announced = false;
 
     public static void tick(Level level) {
@@ -2093,6 +2093,7 @@ public final class PtmFixes {
         long airAt;
         long airLog;
         long redLog;
+        long stuckAt;
     }
 
     static final Map<Integer, Drv> DRV = new ConcurrentHashMap<>();
@@ -2344,6 +2345,7 @@ public final class PtmFixes {
             d.seen = now;
             d.lastOrig = orig;
             airCheck(v, d, level, now);
+            stuckCheck(v, d, level, now);
             fareTick(v, level, now, d);
             if (v instanceof Transport && v.ai && !v.requiresTracks && inAnyDepot(level, PTMEntity.getX(v), PTMEntity.getZ(v))) {
                 return depotMove(v, d, level, now);
@@ -3846,7 +3848,7 @@ public final class PtmFixes {
                     keep.add(o);
                 }
             }
-            return keep.isEmpty() || keep.size() == list.size() ? list : keep;
+            return preferStraight(level, keep.isEmpty() || keep.size() == list.size() ? list : keep, lane);
         } catch (Throwable t) {
             return orig;
         }
@@ -3975,30 +3977,75 @@ public final class PtmFixes {
 
     private static volatile List<com.rinventor.ptm2.dimension.virtual.types.VDParkingZone> allParkZones = new ArrayList<>();
     private static volatile long allParkZonesAt;
+    private static final java.util.Map<String, Object[]> LOT_CACHE = new java.util.concurrent.ConcurrentHashMap<>();
 
-    private static boolean slowLane(Level level, VDTrafficLane lane) {
-        try {
-            long now = System.currentTimeMillis();
-            if (now - allParkZonesAt > 15000L) {
-                allParkZonesAt = now;
+    private static List<com.rinventor.ptm2.dimension.virtual.types.VDParkingZone> parkZones(Level level) {
+        long now = System.currentTimeMillis();
+        if (now - allParkZonesAt > 15000L) {
+            allParkZonesAt = now;
+            try {
                 List<com.rinventor.ptm2.dimension.virtual.types.VDParkingZone> zs = new ArrayList<>();
                 for (String data : com.rinventor.ptm2.dimension.virtual.storage.VDStorageHandler.getAll(level, VDMemoryIDs.PARKING_ZONE).values()) {
                     zs.add(new com.rinventor.ptm2.dimension.virtual.types.VDParkingZone(data));
                 }
                 allParkZones = zs;
+            } catch (Throwable t) {
+                // остаётся прежний список
             }
-            Object c = lane.center();
-            double cx = vc(c, 0);
-            double cz = vc(c, 2);
-            for (com.rinventor.ptm2.dimension.virtual.types.VDParkingZone z : allParkZones) {
-                if (z.isInside(cx, cz)) {
-                    return true;
+        }
+        return allParkZones;
+    }
+
+    /** Полоса парковки или двора: оба конца внутри зоны парковки, длина до 60 блоков (дороги, лишь пересекающие зону, сюда не входят). */
+    private static boolean isLotLane(Level level, VDTrafficLane lane) {
+        try {
+            String key = laneKey(lane);
+            long now = System.currentTimeMillis();
+            Object[] c = LOT_CACHE.get(key);
+            if (c != null && now - (Long) c[1] < 15000L) {
+                return (Boolean) c[0];
+            }
+            boolean lot = false;
+            if (laneLen(lane) <= 60.0D) {
+                Object st = lane.getStart();
+                Object en = lane.getEnd();
+                for (com.rinventor.ptm2.dimension.virtual.types.VDParkingZone z : parkZones(level)) {
+                    if (z.isInside(vc(st, 0), vc(st, 2)) && z.isInside(vc(en, 0), vc(en, 2))) {
+                        lot = true;
+                        break;
+                    }
                 }
             }
+            if (LOT_CACHE.size() > 6000) {
+                LOT_CACHE.clear();
+            }
+            LOT_CACHE.put(key, new Object[] {lot, now});
+            return lot;
         } catch (Throwable t) {
-            // считаем обычной
+            return false;
         }
-        return false;
+    }
+
+    private static boolean slowLane(Level level, VDTrafficLane lane) {
+        return isLotLane(level, lane);
+    }
+
+    /** На парковках и во дворах из нескольких следующих полос предпочитаем прямые (иначе машины виляют на выездах). */
+    private static List<?> preferStraight(Level level, List<?> list, VDTrafficLane from) {
+        try {
+            if (list == null || list.size() < 2 || from == null || !isLotLane(level, from)) {
+                return list;
+            }
+            List<Object> straight = new ArrayList<>();
+            for (Object o : list) {
+                if (!((VDTrafficLane) o).isCurve()) {
+                    straight.add(o);
+                }
+            }
+            return straight.isEmpty() || straight.size() == list.size() ? list : straight;
+        } catch (Throwable t) {
+            return list;
+        }
     }
 
     /** Как seenCompute, но с исключением: игрок с дальностью больше 10 чанков не мешает материализации у самой границы его дальности. */
@@ -4237,6 +4284,7 @@ public final class PtmFixes {
                     return;
                 }
             }
+            trafficLog("нет маршрута к местам парковки от полосы " + at(cp[0], cp[1], cp[2]) + " (свободных мест " + free.size() + ")");
             c.visits = 0;
         }
         // зона удаления в другой зоне
@@ -4363,6 +4411,16 @@ public final class PtmFixes {
                 v.ignition = false;
                 v.ai = false;
                 v.speed = 0.0F;
+                try {
+                    Object pass = srg(v, "m_20197_");
+                    if (pass instanceof List) {
+                        for (Object pe : new ArrayList<>((List<?>) pass)) {
+                            PTMEntity.syncedDespawn(null, (Entity) pe);
+                        }
+                    }
+                } catch (Throwable t) {
+                    // стоящая машина с водителем - не критично
+                }
                 c.physical = true;
                 c.ent = new java.lang.ref.WeakReference<>(vehicle);
                 PHYS.put(System.identityHashCode(vehicle), c);
@@ -4410,6 +4468,9 @@ public final class PtmFixes {
                 c.lane = null;
                 return;
             }
+            @SuppressWarnings("unchecked")
+            List<VDTrafficLane> pref = (List<VDTrafficLane>) preferStraight(level, good, c.lane);
+            good = pref;
             c.prog -= len;
             c.lane = good.get(VRND.nextInt(good.size()));
             c.slow = slowLane(level, c.lane);
@@ -4515,6 +4576,88 @@ public final class PtmFixes {
         }
     }
 
+    private static volatile long lotSweepAt;
+
+    /** Едущие машины внутри парковок и дворов (вне поля зрения) становятся виртуальными: физически там они создавали заторы. */
+    private static void lotSweep(Level level, long now) {
+        if (now - lotSweepAt < 2000L) {
+            return;
+        }
+        lotSweepAt = now;
+        try {
+            int moved = 0;
+            Class<?> vec3c = Class.forName("net.minecraft.world.phys.Vec3");
+            Class<?> aabbc = Class.forName("net.minecraft.world.phys.AABB");
+            java.lang.reflect.Method mk = aabbc.getMethod("m_165882_", vec3c, double.class, double.class, double.class);
+            java.util.function.Predicate<Object> all = (e) -> true;
+            for (com.rinventor.ptm2.dimension.virtual.types.VDParkingZone zone : parkZones(level)) {
+                if (moved >= 3) {
+                    break;
+                }
+                double cx = zone.getCenterX();
+                double cz = zone.getCenterZ();
+                double half = Math.max(Math.abs(zone.fbX - zone.sbX), Math.abs(zone.fbZ - zone.sbZ)) / 2.0D + 6.0D;
+                Object box = mk.invoke(null, vec3c.getConstructor(double.class, double.class, double.class).newInstance(cx, 64.0D, cz), half * 2.0D, 512.0D, half * 2.0D);
+                for (Object e : (List<?>) srg(level, "m_6443_", com.rinventor.ptm2.objects.entities.vehicle.car.Car.class, box, all)) {
+                    Vehicle car = (Vehicle) e;
+                    if (!car.ai || car.crashed || car instanceof Transport) {
+                        continue;
+                    }
+                    double x = PTMEntity.getX(car);
+                    double y = PTMEntity.getY(car);
+                    double z2 = PTMEntity.getZ(car);
+                    if (!zone.isInside(x, z2)) {
+                        continue;
+                    }
+                    Object tags = srg(car, "m_19880_");
+                    if (!(tags instanceof java.util.Collection) || !((java.util.Collection<?>) tags).contains("traffic")) {
+                        continue;
+                    }
+                    VDTrafficLane lane = VDUtils.getLaneByVehiclePosition(level, (net.minecraft.world.phys.Vec3) srg(car, "m_20182_"));
+                    if (lane == null || !isLotLane(level, lane) || seenByPlayers(level, x, y, z2)) {
+                        continue;
+                    }
+                    toVirtual(level, car);
+                    PTMEntity.syncedDespawn("Car to virtual (parking lot)", car);
+                    moved++;
+                    if (moved >= 3) {
+                        break;
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            // не критично
+        }
+    }
+
+    /** Машина стоит больше 75 секунд (затор) и её никто не видит: тихо уходит в виртуальные, затор рассасывается без ключа удаления. */
+    private static void stuckCheck(Vehicle v, Drv d, Level level, long now) {
+        if (v instanceof Transport || d.stillSince <= 0L || now - d.stillSince < 75000L || now - d.stuckAt < 5000L) {
+            return;
+        }
+        d.stuckAt = now;
+        try {
+            if (!v.ai || v.crashed) {
+                return;
+            }
+            Object tags = srg(v, "m_19880_");
+            if (!(tags instanceof java.util.Collection) || !((java.util.Collection<?>) tags).contains("traffic")) {
+                return;
+            }
+            double x = PTMEntity.getX(v);
+            double y = PTMEntity.getY(v);
+            double z = PTMEntity.getZ(v);
+            if (seenByPlayers(level, x, y, z)) {
+                return;
+            }
+            trafficLog("машина стоит " + ((now - d.stillSince) / 1000L) + " с (затор) на " + at(x, y, z) + ": убрана в виртуальные");
+            toVirtual(level, v);
+            PTMEntity.syncedDespawn("Stuck traffic car", v);
+        } catch (Throwable t) {
+            // не критично
+        }
+    }
+
     /** Раз в секунду: рождение, движение, маршруты, стоянка, материализация и удаление излишков виртуальных машин. */
     private static void vcarTick(Level level) {
         if (PTMWorld.isClient(level) || !cfgBool("virtualcars", true)) {
@@ -4529,6 +4672,7 @@ public final class PtmFixes {
         }
         double dt = vcarTickAt == 0L ? 1.0D : Math.min(5.0D, (now - vcarTickAt) / 1000.0D);
         vcarTickAt = now;
+        lotSweep(level, now);
         try {
             Object[] zd = zoneData(level);
             List<?> zones = (List<?>) zd[0];
@@ -4667,7 +4811,7 @@ public final class PtmFixes {
                             }
                             if (c.parked) {
                                 parkedCands.add(c);
-                            } else if (!c.lane.isCurve()) {
+                            } else if (!c.lane.isCurve() && !c.slow) {
                                 cands.add(c);
                             }
                         }
@@ -4924,11 +5068,14 @@ public final class PtmFixes {
             if (!hasZones && useRandom && !hidden) {
                 return orig;
             }
+            // Виртуальный слой сам рождает машины в зонах и ставит их на дороги вне парковок: прямой физический спавн на полосах парковок
+            // давал заторы на выезде (машины съезжались в одну точку)
+            boolean physicalZones = hasZones && !cfgBool("virtualcars", true);
             int r = spawnRangeAt(level, x, y, z, range);
             double rr = (double) r * (double) r;
             List<Object> out = new ArrayList<>();
             List<Object> zoneOut = new ArrayList<>();
-            if (hasZones) {
+            if (physicalZones) {
                 for (Object o : (List<?>) zd[1]) {
                     com.rinventor.ptm2.engine.computing.DirectionalPos p = (com.rinventor.ptm2.engine.computing.DirectionalPos) o;
                     double dx = p.getX() - x;

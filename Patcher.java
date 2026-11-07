@@ -136,7 +136,7 @@ public class Patcher implements Opcodes {
         if (mismatch) {
             System.exit(1);
         }
-        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay", "gate-bankcard", "boarding-fare", "gate-exit-radius", "gate-exit-auto", "gate-in-radius", "terminal-cap", "arrival-reach", "arrival-inside", "lamp-cap", "red-commit", "patience", "bypass-still", "merge-check", "player-ahead", "merge-width", "parallel-width", "auto-links", "link-revision", "bus-priority", "validator", "wheel-filter", "hull", "depot-ui", "depot-select", "schedule-toggle", "schedule-edit", "editor-updateOptions", "editor-updateRouteList1", "editor-updateRouteList2", "editor-createRow1", "editor-createRow2", "editor-add", "editor-tick", "day-options", "day-loops", "day-today", "preview-columns", "preview-click", "stop-pocket", "range-transportRange", "range-trafficRange", "range-near", "range-track", "zone-save", "zone-prop", "zone-load", "zone-ui", "zone-spawn", "zone-spawnlog", "zone-spawned", "zone-despawnreason", "car-deadends", "zone-keep", "zone-despawn", "board-arriving", "schedule-screen", "schedule-real", "schedule-cache", "depot-order", "depot-spawn", "depot-spawn2", "garage-fleet", "depot-park", "depot-return", "terminal-pax", "depot-clear", "depot-crash", "gravity-reset"};
+        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay", "gate-bankcard", "boarding-fare", "gate-exit-radius", "gate-exit-auto", "gate-in-radius", "terminal-cap", "arrival-reach", "arrival-inside", "lamp-cap", "red-commit", "patience", "bypass-still", "merge-check", "player-ahead", "merge-width", "parallel-width", "auto-links", "link-revision", "bus-priority", "validator", "wheel-filter", "hull", "depot-ui", "depot-select", "schedule-toggle", "schedule-edit", "editor-updateOptions", "editor-updateRouteList1", "editor-updateRouteList2", "editor-createRow1", "editor-createRow2", "editor-add", "editor-tick", "day-options", "day-loops", "day-today", "preview-columns", "preview-click", "stop-pocket", "range-transportRange", "range-trafficRange", "range-near", "range-track", "zone-save", "zone-prop", "zone-load", "zone-ui", "zone-spawn", "zone-spawnlog", "zone-spawned", "zone-despawnreason", "car-deadends", "car-route", "veh-tick", "zone-keep", "zone-despawn", "board-arriving", "schedule-screen", "schedule-real", "schedule-cache", "depot-order", "depot-spawn", "depot-spawn2", "garage-fleet", "depot-park", "depot-return", "terminal-pax", "depot-clear", "depot-crash", "gravity-reset"};
         for (String r : required) {
             if (!done.contains(r)) {
                 System.err.println("ERROR: patch not applied: " + r);
@@ -552,6 +552,41 @@ public class Patcher implements Opcodes {
                         }
                     }
                 }
+            }
+        }
+        if (name.equals("com/rinventor/ptm2/objects/entities/vehicle/car/Car")) {
+            // Машина с маршрутом (парковка, зона удаления) едет по нему вместо случайного выбора пути
+            final String CARR = "com/rinventor/ptm2/objects/entities/vehicle/car/Car";
+            for (MethodNode m : new java.util.ArrayList<>(cn.methods)) {
+                if (m.name.equals("updatePathToDestination") && m.desc.equals("()V")) {
+                    m.name = "ptmOrig_updatePathToDestination";
+                    MethodNode w = new MethodNode(ACC_PUBLIC, "updatePathToDestination", "()V", null, null);
+                    org.objectweb.asm.tree.LabelNode cont = new org.objectweb.asm.tree.LabelNode();
+                    w.instructions.add(new VarInsnNode(ALOAD, 0));
+                    w.instructions.add(new MethodInsnNode(INVOKESTATIC, FIXES, "routeUpdate", "(Ljava/lang/Object;)Z", false));
+                    w.instructions.add(new org.objectweb.asm.tree.JumpInsnNode(IFEQ, cont));
+                    w.instructions.add(new InsnNode(RETURN));
+                    w.instructions.add(cont);
+                    w.instructions.add(new org.objectweb.asm.tree.FrameNode(F_SAME, 0, null, 0, null));
+                    w.instructions.add(new VarInsnNode(ALOAD, 0));
+                    w.instructions.add(new MethodInsnNode(INVOKEVIRTUAL, CARR, "ptmOrig_updatePathToDestination", "()V", false));
+                    w.instructions.add(new InsnNode(RETURN));
+                    w.maxStack = 1;
+                    w.maxLocals = 1;
+                    cn.methods.add(w);
+                    done.add("car-route");
+                    changed = true;
+                }
+            }
+        }
+        if (name.equals("com/rinventor/ptm2/objects/entities/vehicle/Vehicle")) {
+            // Пошаговый выезд задним ходом
+            InsnList vt = new InsnList();
+            vt.add(new VarInsnNode(ALOAD, 0));
+            vt.add(new MethodInsnNode(INVOKESTATIC, FIXES, "vehTick", "(Ljava/lang/Object;)V", false));
+            if (insertAtStart(cn, "m_8119_", "()V", vt)) {
+                done.add("veh-tick");
+                changed = true;
             }
         }
         if (name.equals("com/rinventor/ptm2/objects/entities/vehicle/car/Car")) {

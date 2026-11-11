@@ -136,7 +136,7 @@ public class Patcher implements Opcodes {
         if (mismatch) {
             System.exit(1);
         }
-        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay", "gate-bankcard", "boarding-fare", "gate-exit-radius", "gate-exit-auto", "gate-in-radius", "terminal-cap", "arrival-reach", "arrival-inside", "lamp-cap", "red-commit", "patience", "bypass-still", "merge-check", "player-ahead", "merge-width", "parallel-width", "auto-links", "link-revision", "bus-priority", "validator", "wheel-filter", "hull", "depot-ui", "depot-select", "schedule-toggle", "schedule-edit", "editor-updateOptions", "editor-updateRouteList1", "editor-updateRouteList2", "editor-createRow1", "editor-createRow2", "editor-add", "editor-tick", "day-options", "day-loops", "day-today", "preview-columns", "preview-click", "stop-pocket", "range-transportRange", "range-trafficRange", "range-near", "range-track", "zone-save", "zone-prop", "zone-load", "zone-ui", "zone-spawn", "zone-spawnlog", "zone-spawned", "zone-despawnreason", "car-deadends", "car-route", "veh-tick", "zone-keep", "zone-despawn", "board-arriving", "schedule-screen", "schedule-real", "schedule-cache", "depot-order", "depot-spawn", "depot-spawn2", "garage-fleet", "depot-park", "depot-return", "terminal-pax", "depot-clear", "depot-crash", "gravity-reset"};
+        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay", "gate-bankcard", "boarding-fare", "gate-exit-radius", "gate-exit-auto", "gate-in-radius", "terminal-cap", "arrival-reach", "arrival-inside", "lamp-cap", "red-commit", "patience", "bypass-still", "merge-check", "player-ahead", "merge-width", "parallel-width", "auto-links", "link-revision", "bus-priority", "validator", "wheel-filter", "hull", "depot-ui", "depot-select", "schedule-toggle", "schedule-edit", "editor-updateOptions", "editor-updateRouteList1", "editor-updateRouteList2", "editor-createRow1", "editor-createRow2", "editor-add", "editor-tick", "day-options", "day-loops", "day-today", "preview-columns", "preview-click", "stop-pocket", "range-transportRange", "range-trafficRange", "range-near", "range-track", "zone-save", "zone-prop", "zone-load", "zone-ui", "zone-spawn", "zone-spawnlog", "zone-spawned", "zone-despawnreason", "car-deadends", "car-route", "ped-script", "veh-tick", "zone-keep", "zone-despawn", "board-arriving", "schedule-screen", "schedule-real", "schedule-cache", "depot-order", "depot-spawn", "depot-spawn2", "garage-fleet", "depot-park", "depot-return", "terminal-pax", "depot-clear", "depot-crash", "gravity-reset"};
         for (String r : required) {
             if (!done.contains(r)) {
                 System.err.println("ERROR: patch not applied: " + r);
@@ -158,7 +158,7 @@ public class Patcher implements Opcodes {
     }
 
     static byte[] patchClass(String name, byte[] data) {
-        boolean target = name.equals(OPD) || name.equals(ATM) || name.equals(VU) || name.equals(VSH) || name.equals(PTE) || name.equals(TRN) || name.equals(GATE_IN) || name.equals(VEH) || name.equals(GATE_EXIT) || name.equals(TM) || name.equals(TBM) || name.equals(VUT) || name.equals(TLU) || name.equals(RPATH) || name.equals(LES) || name.equals("com/rinventor/ptm2/dimension/virtual/util/ScheduleUtils") || name.equals("com/rinventor/ptm2/dimension/digital/screens/ScheduleEditScreen") || name.equals("com/rinventor/ptm2/dimension/virtual/util/Departures") || name.equals("com/rinventor/ptm2/dimension/digital/screens/LineViewScreen") || name.equals("com/rinventor/ptm2/dimension/digital/panels/PlatformSchedulePanel") || name.equals("com/rinventor/ptm2/dimension/digital/screens/SchedulePreviewScreen") || name.equals("com/rinventor/ptm2/dimension/digital/screens/SchedulePreviewScreen$SchedulePreviewBox") || name.equals("com/rinventor/ptm2/dimension/virtual/systems/PlayerTracker") || name.equals("com/rinventor/ptm2/dimension/virtual/types/VDParkingZone") || name.equals("com/rinventor/ptm2/dimension/digital/panels/ParkingZonePanel") || name.equals("com/rinventor/ptm2/dimension/physical/TrafficManager") || name.equals("com/rinventor/ptm2/engine/base/PTMEntity") || name.equals("com/rinventor/ptm2/objects/entities/vehicle/car/Car");
+        boolean target = name.equals(OPD) || name.equals(ATM) || name.equals(VU) || name.equals(VSH) || name.equals(PTE) || name.equals(TRN) || name.equals(GATE_IN) || name.equals(VEH) || name.equals(GATE_EXIT) || name.equals(TM) || name.equals(TBM) || name.equals(VUT) || name.equals(TLU) || name.equals(RPATH) || name.equals(LES) || name.equals("com/rinventor/ptm2/dimension/virtual/util/ScheduleUtils") || name.equals("com/rinventor/ptm2/dimension/digital/screens/ScheduleEditScreen") || name.equals("com/rinventor/ptm2/dimension/virtual/util/Departures") || name.equals("com/rinventor/ptm2/dimension/digital/screens/LineViewScreen") || name.equals("com/rinventor/ptm2/dimension/digital/panels/PlatformSchedulePanel") || name.equals("com/rinventor/ptm2/dimension/digital/screens/SchedulePreviewScreen") || name.equals("com/rinventor/ptm2/dimension/digital/screens/SchedulePreviewScreen$SchedulePreviewBox") || name.equals("com/rinventor/ptm2/dimension/virtual/systems/PlayerTracker") || name.equals("com/rinventor/ptm2/dimension/virtual/types/VDParkingZone") || name.equals("com/rinventor/ptm2/dimension/digital/panels/ParkingZonePanel") || name.equals("com/rinventor/ptm2/dimension/physical/TrafficManager") || name.equals("com/rinventor/ptm2/engine/base/PTMEntity") || name.equals("com/rinventor/ptm2/objects/entities/vehicle/car/Car") || name.equals("com/rinventor/ptm2/objects/entities/pedestrian/Pedestrian");
         boolean flags = contains(data, "INDEFINITE_BANK_ACCOUNT") || contains(data, "INDEFINITE_TRANSPORT_CARD");
         if (!target && !flags) {
             return data;
@@ -575,6 +575,35 @@ public class Patcher implements Opcodes {
                     w.maxLocals = 1;
                     cn.methods.add(w);
                     done.add("car-route");
+                    changed = true;
+                }
+            }
+        }
+        if (name.equals("com/rinventor/ptm2/objects/entities/pedestrian/Pedestrian")) {
+            // Пешеход-водитель ведётся скриптом: оригинальное движение (по тротуарам, с удалением вне их) отключается
+            final String PEDC = "com/rinventor/ptm2/objects/entities/pedestrian/Pedestrian";
+            for (MethodNode m : new java.util.ArrayList<>(cn.methods)) {
+                if (m.name.equals("m_6075_") && m.desc.equals("()V")) {
+                    m.name = "ptmOrig_m_6075_";
+                    MethodNode w = new MethodNode(ACC_PUBLIC, "m_6075_", "()V", null, null);
+                    org.objectweb.asm.tree.LabelNode cont = new org.objectweb.asm.tree.LabelNode();
+                    w.instructions.add(new VarInsnNode(ALOAD, 0));
+                    w.instructions.add(new MethodInsnNode(INVOKESTATIC, FIXES, "pedScripted", "(Ljava/lang/Object;)Z", false));
+                    w.instructions.add(new org.objectweb.asm.tree.JumpInsnNode(IFEQ, cont));
+                    w.instructions.add(new VarInsnNode(ALOAD, 0));
+                    w.instructions.add(new MethodInsnNode(INVOKESTATIC, FIXES, "pedScriptTick", "(Ljava/lang/Object;)V", false));
+                    w.instructions.add(new VarInsnNode(ALOAD, 0));
+                    w.instructions.add(new MethodInsnNode(INVOKESPECIAL, "com/rinventor/ptm2/objects/entities/pedestrian/Person", "m_6075_", "()V", false));
+                    w.instructions.add(new InsnNode(RETURN));
+                    w.instructions.add(cont);
+                    w.instructions.add(new org.objectweb.asm.tree.FrameNode(F_SAME, 0, null, 0, null));
+                    w.instructions.add(new VarInsnNode(ALOAD, 0));
+                    w.instructions.add(new MethodInsnNode(INVOKEVIRTUAL, PEDC, "ptmOrig_m_6075_", "()V", false));
+                    w.instructions.add(new InsnNode(RETURN));
+                    w.maxStack = 1;
+                    w.maxLocals = 1;
+                    cn.methods.add(w);
+                    done.add("ped-script");
                     changed = true;
                 }
             }

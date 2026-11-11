@@ -86,7 +86,7 @@ public final class PtmFixes {
      * 1) даёт название станциям, у которых его нет;
      * 2) привязывает каждую платформу к станции, в зоне которой она находится.
      */
-    public static final String BUILD = "fixes-2026-11-11-parkdrv";
+    public static final String BUILD = "fixes-2026-11-12-parkdrv2";
     private static boolean announced = false;
 
     public static void tick(Level level) {
@@ -3912,6 +3912,11 @@ public final class PtmFixes {
         boolean walkBack;
         boolean pedArrived;
         long walkSince;
+        long watchAt;
+        double pedX = Double.NaN;
+        double pedZ = Double.NaN;
+        long pedStillSince;
+        int unstick;
     }
 
     private static final List<VCar> VCARS = new ArrayList<>();
@@ -4521,6 +4526,113 @@ public final class PtmFixes {
         double[] cum;
         double dist;
         long last;
+        Spot spot;
+        boolean abort;
+    }
+
+    /** Место, куда едет машина, занято: выбрать другое, пока машина ещё на подъезде (не внутри полосы места). */
+    private static void abandonForward(Level level, Vehicle v, VCar c, List<VDTrafficLane> cp, long now) throws ReflectiveOperationException {
+        Spot sp0 = c.goalSpot;
+        Object pos = srg(v, "m_20182_");
+        synchronized (VCARS) {
+            SPOT_BLOCKED.put(sp0.key, now + 60000L);
+            releaseSpot(c);
+            VDTrafficLane cur = cp.get(Math.min(v.pathLaneIndex, cp.size() - 1));
+            c.lane = cur;
+            c.prog = progressOn(cur, vc(pos, 0), vc(pos, 1), vc(pos, 2));
+            c.route = null;
+            c.ridx = -1;
+            c.goalSpot = null;
+            c.pathBuilt = false;
+            c.visits++;
+            planNext(level, c, now, sp0.key);
+        }
+        trafficLog("место " + at(sp0.pose[0], sp0.pose[1], sp0.pose[2]) + " оказалось занято, машина выбирает другое");
+    }
+
+    /** Следит (2 раза в секунду) за машиной, едущей на парковку: если место заняли, она ищет другое, а не стоит в очереди. */
+    private static void spotWatch(Object vehicle, VCar c) {
+        try {
+            if (c.goalSpot == null || c.parked) {
+                return;
+            }
+            long now = System.currentTimeMillis();
+            if (c.watchAt > now) {
+                return;
+            }
+            c.watchAt = now + 500L;
+            Vehicle v = (Vehicle) vehicle;
+            List<VDTrafficLane> cp = v.currentPath;
+            if (!c.pathBuilt || cp == null || cp.size() < 2) {
+                return;
+            }
+            int idx = v.pathLaneIndex;
+            int n = cp.size();
+            if (idx < n - 3) {
+                return;
+            }
+            Level level = (Level) srg(v, "m_9236_");
+            if (PTMWorld.isClient(level)) {
+                return;
+            }
+            Spot sp = c.goalSpot;
+            if (!vehicleNear(level, v, sp.pose[0] + 0.5D, sp.pose[1], sp.pose[2] + 0.5D, 2.8D)) {
+                return;
+            }
+            if (idx < n - 1) {
+                abandonForward(level, v, c, cp, now);
+                return;
+            }
+            synchronized (VCARS) {
+                SPOT_BLOCKED.put(sp.key, now + 60000L);
+                releaseSpot(c);
+                c.goalSpot = null;
+                c.visits++;
+                c.route = null;
+                c.ridx = -1;
+                c.pathBuilt = false;
+            }
+            v.ai = false;
+            v.speed = 0.0F;
+            startReverseOut(level, c, v, sp, true);
+        } catch (Throwable t) {
+            // не критично
+        }
+    }
+
+    /** Заезд внутри зоны парковки с типом «Стоянка» или «оба»: там паркуются машины мода, оригинальные статичные не появляются. */
+    private static volatile List<com.rinventor.ptm2.dimension.virtual.types.VDParkingZone> lotZonesPB = new ArrayList<>();
+    private static volatile long lotZonesPBAt;
+
+    public static boolean inLotZone(Object levelObj, Object posObj) {
+        try {
+            if (cfgBool("lotstatic", false)) {
+                return false;
+            }
+            Level level = (Level) levelObj;
+            long now = System.currentTimeMillis();
+            if (now - lotZonesPBAt > 15000L) {
+                lotZonesPBAt = now;
+                List<com.rinventor.ptm2.dimension.virtual.types.VDParkingZone> zs = new ArrayList<>();
+                for (String data : com.rinventor.ptm2.dimension.virtual.storage.VDStorageHandler.getAll(level, VDMemoryIDs.PARKING_ZONE).values()) {
+                    int t = zoneTypeOfData(data);
+                    if (t == ZONE_PARK || t == ZONE_BOTH) {
+                        zs.add(new com.rinventor.ptm2.dimension.virtual.types.VDParkingZone(data));
+                    }
+                }
+                lotZonesPB = zs;
+            }
+            double x = ((Integer) srg(posObj, "m_123341_")).doubleValue();
+            double z = ((Integer) srg(posObj, "m_123343_")).doubleValue();
+            for (com.rinventor.ptm2.dimension.virtual.types.VDParkingZone zone : lotZonesPB) {
+                if (zone.isInside(x, z)) {
+                    return true;
+                }
+            }
+        } catch (Throwable t) {
+            // считаем, что вне зоны
+        }
+        return false;
     }
 
     private static void stripPassengers(Vehicle v) {
@@ -4574,10 +4686,29 @@ public final class PtmFixes {
         c.pedRef = null;
     }
 
-    /** Ближайший к (x, z) тротуарный блок в радиусе range: {x, y, z} точки, где стоит пешеход, или null. */
+    private static boolean nearCrossing(Level level, double x, double y, double z) {
+        try {
+            Object r = com.rinventor.ptm2.engine.base.PTMBlock.findInCube(com.rinventor.ptm2.core.init.ModBlocks.PEDESTRIAN_CROSSING_LINE_MARKING.get(), 4, level, x, y, z);
+            if (r == null) {
+                return false;
+            }
+            return !(((Integer) srg(r, "m_123341_")).intValue() == 0 && ((Integer) srg(r, "m_123342_")).intValue() == 0 && ((Integer) srg(r, "m_123343_")).intValue() == 0);
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /** Ближайший к (x, z) тротуар в радиусе range: {x, y, z} точки, где стоит пешеход, или null. */
     private static double[] nearestSidewalk(Level level, double x, double z, double range) {
-        double best = range * range;
-        double[] res = null;
+        return sidewalkPointAway(level, x, z, range, x, z, 0.0D);
+    }
+
+    /**
+     * Точка тротуара около (x, z), не ближе minAway к (ax, az). Берётся одна из ближайших, где нет пешеходного перехода рядом
+     * (у перехода пешеход ждёт «зелёного» и стоит), а при их отсутствии просто ближайшая.
+     */
+    private static double[] sidewalkPointAway(Level level, double x, double z, double range, double ax, double az, double minAway) {
+        List<double[]> cand = new ArrayList<>();
         try {
             for (java.util.Map.Entry<net.minecraft.core.BlockPos, String> en : new ArrayList<>(com.rinventor.ptm2.dimension.virtual.storage.VDStorageHandler.getBlocks(level, VDMemoryIDs.SIDEWALK_BLOCK).entrySet())) {
                 net.minecraft.core.BlockPos bp = en.getKey();
@@ -4587,19 +4718,73 @@ public final class PtmFixes {
                 double dx = bx + 0.5D - x;
                 double dz = bz + 0.5D - z;
                 double d = dx * dx + dz * dz;
-                if (d < best) {
-                    com.rinventor.ptm2.dimension.virtual.types.VDSidewalkBlock sb = new com.rinventor.ptm2.dimension.virtual.types.VDSidewalkBlock(en.getValue());
-                    if (!sb.topLayer) {
-                        continue;
-                    }
-                    best = d;
-                    res = new double[] {bx + 0.5D, by + (sb.slab ? 0.5D : 1.0D), bz + 0.5D};
+                if (d >= range * range || Math.hypot(bx + 0.5D - ax, bz + 0.5D - az) < minAway) {
+                    continue;
                 }
+                com.rinventor.ptm2.dimension.virtual.types.VDSidewalkBlock sb = new com.rinventor.ptm2.dimension.virtual.types.VDSidewalkBlock(en.getValue());
+                if (!sb.topLayer) {
+                    continue;
+                }
+                cand.add(new double[] {d, bx + 0.5D, by + (sb.slab ? 0.5D : 1.0D), bz + 0.5D});
             }
         } catch (Throwable t) {
             return null;
         }
-        return res;
+        if (cand.isEmpty()) {
+            return null;
+        }
+        cand.sort((p1, p2) -> Double.compare(p1[0], p2[0]));
+        List<double[]> good = new ArrayList<>();
+        for (int i = 0; i < cand.size() && i < 80 && good.size() < 5; i++) {
+            double[] cd = cand.get(i);
+            if (!nearCrossing(level, cd[1], cd[2], cd[3])) {
+                good.add(cd);
+            }
+        }
+        double[] pick = good.isEmpty() ? cand.get(0) : good.get(VRND.nextInt(good.size()));
+        return new double[] {pick[1], pick[2], pick[3]};
+    }
+
+    /** Водитель на тротуаре замер (ждёт перехода и т. п.): подтолкнуть, а если не помогает, отправить к другой точке тротуара. */
+    private static void driverIdleCheck(Level level, VCar c, long now) {
+        try {
+            Entity ped = driverPed(c);
+            if (ped == null || PED_JOBS.containsKey(System.identityHashCode(ped)) || PTMEntity.isRiding(ped)) {
+                c.pedStillSince = 0L;
+                return;
+            }
+            double px = PTMEntity.getX(ped);
+            double py = PTMEntity.getY(ped);
+            double pz = PTMEntity.getZ(ped);
+            if (Double.isNaN(c.pedX) || Math.hypot(px - c.pedX, pz - c.pedZ) > 0.6D) {
+                c.pedX = px;
+                c.pedZ = pz;
+                c.pedStillSince = now;
+                c.unstick = 0;
+                return;
+            }
+            if (c.pedStillSince == 0L) {
+                c.pedStillSince = now;
+            }
+            if (now - c.pedStillSince < 9000L) {
+                return;
+            }
+            c.pedStillSince = now;
+            c.unstick++;
+            com.rinventor.ptm2.objects.entities.pedestrian.Pedestrian p = (com.rinventor.ptm2.objects.entities.pedestrian.Pedestrian) ped;
+            if (c.unstick <= 2) {
+                p.crossingTimer = 999;
+                p.currentState = com.rinventor.ptm2.objects.entities.pedestrian.Pedestrian.State.WALK;
+            } else {
+                double[] pt = sidewalkPointAway(level, px, pz, 30.0D, px, pz, 8.0D);
+                if (pt != null) {
+                    startPedJob(ped, c, new double[][] {{px, py, pz}, pt}, false);
+                }
+                c.unstick = 0;
+            }
+        } catch (Throwable t) {
+            // не критично
+        }
     }
 
     private static double[] doorPoint(Entity car, double[] toward) throws ReflectiveOperationException {
@@ -4843,21 +5028,7 @@ public final class PtmFixes {
             if (c.goalSpot != null && cp.size() >= 2 && v.pathLaneIndex >= cp.size() - 2 && v.pathLaneIndex < cp.size() - 1) {
                 Spot sp0 = c.goalSpot;
                 if (vehicleNear(level, v, sp0.pose[0] + 0.5D, sp0.pose[1], sp0.pose[2] + 0.5D, 2.8D)) {
-                    long nowB = System.currentTimeMillis();
-                    synchronized (VCARS) {
-                        SPOT_BLOCKED.put(sp0.key, nowB + 60000L);
-                        releaseSpot(c);
-                        VDTrafficLane cur = cp.get(v.pathLaneIndex);
-                        c.lane = cur;
-                        c.prog = progressOn(cur, vc(pos, 0), vc(pos, 1), vc(pos, 2));
-                        c.route = null;
-                        c.ridx = -1;
-                        c.goalSpot = null;
-                        c.pathBuilt = false;
-                        c.visits++;
-                        planNext(level, c, nowB, sp0.key);
-                    }
-                    trafficLog("место " + at(sp0.pose[0], sp0.pose[1], sp0.pose[2]) + " оказалось занято, машина выбирает другое");
+                    abandonForward(level, v, c, cp, System.currentTimeMillis());
                     return true;
                 }
             }
@@ -4898,7 +5069,10 @@ public final class PtmFixes {
 
     /** Начинает выезд задним ходом: машина едет назад по полосе места к её началу (на виду у игроков). */
     private static void startReverseOut(Level level, VCar c, Object e) throws ReflectiveOperationException {
-        Spot sp = c.parkedAt;
+        startReverseOut(level, c, e, c.parkedAt, false);
+    }
+
+    private static void startReverseOut(Level level, VCar c, Object e, Spot sp, boolean abort) throws ReflectiveOperationException {
         VDTrafficLane a = sp.lane;
         double x = PTMEntity.getX((Entity) e);
         double y = PTMEntity.getY((Entity) e);
@@ -4926,11 +5100,13 @@ public final class PtmFixes {
             m.cum[i] = m.cum[i - 1] + Math.hypot(m.pts[i][0] - m.pts[i - 1][0], m.pts[i][2] - m.pts[i - 1][2]);
         }
         m.last = System.currentTimeMillis();
+        m.spot = sp;
+        m.abort = abort;
         c.man = m;
         if (e instanceof Vehicle) {
             indicatorsOff((Vehicle) e);
         }
-        trafficLog("машина выезжает с парковки задним ходом " + at(sp.pose[0], sp.pose[1], sp.pose[2]));
+        trafficLog((abort ? "место занято, машина сдаёт назад и ищет другое " : "машина выезжает с парковки задним ходом ") + at(sp.pose[0], sp.pose[1], sp.pose[2]));
     }
 
     /** Vehicle.tick: пошаговое движение машины, выезжающей задним ходом (4 м/с, без смены курса). */
@@ -4940,6 +5116,10 @@ public final class PtmFixes {
                 return;
             }
             VCar c = PHYS.get(System.identityHashCode(vehicle));
+            if (c != null && c.man == null) {
+                spotWatch(vehicle, c);
+                return;
+            }
             if (c == null || c.man == null) {
                 return;
             }
@@ -4968,7 +5148,7 @@ public final class PtmFixes {
             v.speed = 0.0F;
             if (m.dist >= total) {
                 synchronized (VCARS) {
-                    Spot sp = c.parkedAt;
+                    Spot sp = m.spot != null ? m.spot : c.parkedAt;
                     releaseSpot(c);
                     c.man = null;
                     c.parked = false;
@@ -4983,9 +5163,14 @@ public final class PtmFixes {
                     v.handBrake = false;
                     v.locked = false;
                     v.ignition = true;
-                    v.ai = true;
-                    v.startAI();
-                    P_LEAVE.incrementAndGet();
+                    if (m.abort) {
+                        v.ai = true;
+                        v.speed = 0.0F;
+                    } else {
+                        v.ai = true;
+                        v.startAI();
+                        P_LEAVE.incrementAndGet();
+                    }
                     planNext(level, c, now, sp.key);
                     trafficLog("машина выехала с парковки задним ходом " + at(x, y, z) + " и поехала дальше");
                 }
@@ -5321,6 +5506,9 @@ public final class PtmFixes {
                             double ey = PTMEntity.getY((Entity) e);
                             double ez = PTMEntity.getZ((Entity) e);
                             boolean near = anyPlayerWithinOwnRange(level, ex, ey, ez);
+                            if (!c.walkBack) {
+                                driverIdleCheck(level, c, now);
+                            }
                             if (c.walkBack) {
                                 if (c.pedArrived || now - c.walkSince > 80000L || driverPed(c) == null) {
                                     c.walkBack = false;

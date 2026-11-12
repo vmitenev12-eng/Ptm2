@@ -86,7 +86,7 @@ public final class PtmFixes {
      * 1) даёт название станциям, у которых его нет;
      * 2) привязывает каждую платформу к станции, в зоне которой она находится.
      */
-    public static final String BUILD = "fixes-2026-11-12-parkcycle2";
+    public static final String BUILD = "fixes-2026-11-12-arrow1";
     private static boolean announced = false;
 
     public static void tick(Level level) {
@@ -4681,6 +4681,26 @@ public final class PtmFixes {
             }
         } catch (Throwable t) {
             // стоящая машина с водителем - не критично
+        }
+    }
+
+    /** Рендер двусторонней стрелки точки трафика: высота центра (чтобы уменьшать стрелку вокруг её центра). */
+    public static double arrowPivotY(Object state) {
+        try {
+            Object v = srg(state, "m_61143_", com.rinventor.ptm2.objects.blockentities.traffic_point.TrafficPoint.SLAB);
+            return Boolean.TRUE.equals(v) ? 0.25D : 0.75D;
+        } catch (Throwable t) {
+            return 0.5D;
+        }
+    }
+
+    /** Масштаб двусторонней стрелки (1 = как в оригинале, около 3 блоков; по умолчанию стрелка размером в блок). */
+    public static float bothArrowScale() {
+        try {
+            double v = cfgNum("botharrowscale", 0.34D);
+            return (float) Math.max(0.1D, Math.min(1.0D, v));
+        } catch (Throwable t) {
+            return 0.34F;
         }
     }
 

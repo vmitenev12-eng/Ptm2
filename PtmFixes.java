@@ -86,7 +86,7 @@ public final class PtmFixes {
      * 1) даёт название станциям, у которых его нет;
      * 2) привязывает каждую платформу к станции, в зоне которой она находится.
      */
-    public static final String BUILD = "fixes-2026-11-12-parkcycle";
+    public static final String BUILD = "fixes-2026-11-12-parkcycle2";
     private static boolean announced = false;
 
     public static void tick(Level level) {
@@ -5665,6 +5665,12 @@ public final class PtmFixes {
                                 nc.visits = VRND.nextInt(maxVisits + 1);
                                 nc.homeX = zx;
                                 nc.homeZ = zz;
+                                if (cfgBool("parkcycle", true)) {
+                                    // родившаяся на парковке машина сначала уезжает с неё (1-2.5 мин по городу), а потом ищет место
+                                    nc.lastZx = zx;
+                                    nc.lastZz = zz;
+                                    nc.roamUntil = now + 60000L + (long) (VRND.nextDouble() * 90000.0D);
+                                }
                                 VCARS.add(nc);
                                 spawned++;
                                 V_NEW.incrementAndGet();

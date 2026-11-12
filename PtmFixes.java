@@ -86,7 +86,7 @@ public final class PtmFixes {
      * 1) даёт название станциям, у которых его нет;
      * 2) привязывает каждую платформу к станции, в зоне которой она находится.
      */
-    public static final String BUILD = "fixes-2026-11-12-arrow1";
+    public static final String BUILD = "fixes-2026-11-13-orphans";
     private static boolean announced = false;
 
     public static void tick(Level level) {
@@ -3913,6 +3913,7 @@ public final class PtmFixes {
         boolean pedArrived;
         long walkSince;
         long watchAt;
+        boolean needDriver;
         double lastZx = Double.NaN;
         double lastZz;
         long roamUntil;
@@ -4449,7 +4450,10 @@ public final class PtmFixes {
                     return;
                 }
             }
-            trafficLog("нет маршрута к местам парковки от полосы " + at(cp[0], cp[1], cp[2]) + " (свободных мест " + free.size() + ")");
+            if (now - noRouteLogAt > 30000L) {
+                noRouteLogAt = now;
+                trafficLog("нет маршрута к местам парковки от полосы " + at(cp[0], cp[1], cp[2]) + " (не удалось проложить маршрут ни к одному из свободных мест; сообщение не чаще раза в 30 с)");
+            }
             if (!cycle) {
                 c.visits = 0;
             }
@@ -5276,6 +5280,7 @@ public final class PtmFixes {
                 stripPassengers(v);
                 indicatorsOff(v);
                 c.physical = true;
+                c.needDriver = true;
                 c.ent = new java.lang.ref.WeakReference<>(vehicle);
                 PHYS.put(System.identityHashCode(vehicle), c);
                 pendingPark = null;
@@ -5443,6 +5448,64 @@ public final class PtmFixes {
     }
 
     private static volatile long lotSweepAt;
+    private static volatile long noRouteLogAt;
+    private static volatile long orphanSweepAt;
+    private static final java.util.Map<Integer, Long> ORPHAN_SEEN = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * Стоящие машины мода (тег traffic), которыми после перезапуска сервера никто не управляет (их запись в виртуальном слое пропала),
+     * занимают места парковки навсегда и стоят друг в друге. Через 20 секунд такие машины внутри зон парковки убираются.
+     * Машины игроков (без тега traffic) не затрагиваются.
+     */
+    private static void orphanSweep(Level level, long now) {
+        if (now - orphanSweepAt < 5000L || !cfgBool("orphansweep", true)) {
+            return;
+        }
+        orphanSweepAt = now;
+        try {
+            Class<?> vec3c = Class.forName("net.minecraft.world.phys.Vec3");
+            Class<?> aabbc = Class.forName("net.minecraft.world.phys.AABB");
+            java.lang.reflect.Method mk = aabbc.getMethod("m_165882_", vec3c, double.class, double.class, double.class);
+            java.util.function.Predicate<Object> all = (e) -> true;
+            java.util.Set<Integer> present = new java.util.HashSet<>();
+            int removed = 0;
+            for (com.rinventor.ptm2.dimension.virtual.types.VDParkingZone zone : parkZones(level)) {
+                double cx = zone.getCenterX();
+                double cz = zone.getCenterZ();
+                double half = Math.max(Math.abs(zone.fbX - zone.sbX), Math.abs(zone.fbZ - zone.sbZ)) / 2.0D + 6.0D;
+                Object box = mk.invoke(null, vec3c.getConstructor(double.class, double.class, double.class).newInstance(cx, 64.0D, cz), half * 2.0D, 512.0D, half * 2.0D);
+                for (Object e : (List<?>) srg(level, "m_6443_", com.rinventor.ptm2.objects.entities.vehicle.car.Car.class, box, all)) {
+                    Vehicle car = (Vehicle) e;
+                    if (!car.parked || car.ai || car instanceof Transport || PHYS.containsKey(System.identityHashCode(car))) {
+                        continue;
+                    }
+                    if (!zone.isInside(PTMEntity.getX(car), PTMEntity.getZ(car))) {
+                        continue;
+                    }
+                    Object tags = srg(car, "m_19880_");
+                    if (!(tags instanceof java.util.Collection) || !((java.util.Collection<?>) tags).contains("traffic")) {
+                        continue;
+                    }
+                    int id = System.identityHashCode(car);
+                    present.add(id);
+                    Long first = ORPHAN_SEEN.get(id);
+                    if (first == null) {
+                        ORPHAN_SEEN.put(id, now);
+                        continue;
+                    }
+                    if (now - first >= 20000L && removed < 6) {
+                        trafficLog("стоящая машина без записи в виртуальном слое (осталась с прошлого запуска) убрана с парковки " + at(PTMEntity.getX(car), PTMEntity.getY(car), PTMEntity.getZ(car)));
+                        PTMEntity.syncedDespawn("Orphan parked car", car);
+                        ORPHAN_SEEN.remove(id);
+                        removed++;
+                    }
+                }
+            }
+            ORPHAN_SEEN.keySet().retainAll(present);
+        } catch (Throwable t) {
+            // не критично
+        }
+    }
 
     /** Едущие машины внутри парковок и дворов (вне поля зрения) становятся виртуальными: физически там они создавали заторы. */
     private static void lotSweep(Level level, long now) {
@@ -5539,6 +5602,7 @@ public final class PtmFixes {
         double dt = vcarTickAt == 0L ? 1.0D : Math.min(5.0D, (now - vcarTickAt) / 1000.0D);
         vcarTickAt = now;
         lotSweep(level, now);
+        orphanSweep(level, now);
         try {
             Object[] zd = zoneData(level);
             List<?> zones = (List<?>) zd[0];
@@ -5565,6 +5629,12 @@ public final class PtmFixes {
                             double ey = PTMEntity.getY((Entity) e);
                             double ez = PTMEntity.getZ((Entity) e);
                             boolean near = anyPlayerWithinOwnRange(level, ex, ey, ez);
+                            if (c.needDriver) {
+                                c.needDriver = false;
+                                if (near) {
+                                    spawnDriverWalk(level, (Vehicle) e, c);
+                                }
+                            }
                             if (!c.walkBack) {
                                 driverIdleCheck(level, c, now);
                             }

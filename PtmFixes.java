@@ -86,7 +86,7 @@ public final class PtmFixes {
      * 1) даёт название станциям, у которых его нет;
      * 2) привязывает каждую платформу к станции, в зоне которой она находится.
      */
-    public static final String BUILD = "fixes-2026-11-12-parkdrv2";
+    public static final String BUILD = "fixes-2026-11-12-parkcycle";
     private static boolean announced = false;
 
     public static void tick(Level level) {
@@ -3913,6 +3913,9 @@ public final class PtmFixes {
         boolean pedArrived;
         long walkSince;
         long watchAt;
+        double lastZx = Double.NaN;
+        double lastZz;
+        long roamUntil;
         double pedX = Double.NaN;
         double pedZ = Double.NaN;
         long pedStillSince;
@@ -4201,6 +4204,8 @@ public final class PtmFixes {
         List<Spot> res = new ArrayList<>();
         java.util.Set<String> newSpotLanes = new java.util.HashSet<>();
         int twoWayCount = 0;
+        int shortDead = 0;
+        int noPred = 0;
         try {
             boolean twoWayOn = cfgBool("twowayspots", true);
             List<com.rinventor.ptm2.dimension.virtual.types.VDParkingZone> pz = new ArrayList<>();
@@ -4216,7 +4221,7 @@ public final class PtmFixes {
                     all.add(new VDTrafficLane(data));
                 }
                 for (VDTrafficLane lane : all) {
-                    if (lane.transport || laneLen(lane) < 3.0D) {
+                    if (lane.transport) {
                         continue;
                     }
                     Object c = lane.center();
@@ -4228,6 +4233,12 @@ public final class PtmFixes {
                         }
                     }
                     if (zone == null) {
+                        continue;
+                    }
+                    if (laneLen(lane) < 3.0D) {
+                        if (deadEnd(level, lane, 0)) {
+                            shortDead++;
+                        }
                         continue;
                     }
                     VDTrafficLane rev = twoWayOn ? reverseOf(all, lane) : null;
@@ -4248,6 +4259,7 @@ public final class PtmFixes {
                         }
                     }
                     if (pred == null) {
+                        noPred++;
                         continue;
                     }
                     double len = laneLen(lane);
@@ -4288,7 +4300,7 @@ public final class PtmFixes {
         SPOT_LANES = newSpotLanes;
         if (res.size() != spotsLoggedCount) {
             spotsLoggedCount = res.size();
-            PTMLogger.info("PTM2 трафик: мест парковки " + res.size() + " (из них въезд с обеих сторон: " + twoWayCount + ")");
+            PTMLogger.info("PTM2 трафик: мест парковки " + res.size() + " (из них въезд с обеих сторон: " + twoWayCount + "); тупиков в зоне короче 3 бл: " + shortDead + ", без подводящей полосы: " + noPred);
         }
         SPOTS = res;
         return res;
@@ -4391,17 +4403,26 @@ public final class PtmFixes {
             c.homeX = cp[0];
             c.homeZ = cp[2];
         }
+        boolean cycle = cfgBool("parkcycle", true);
+        boolean surplus = cycle && VCARS.size() > cfgNum("maxvirtualcars", 400.0D) * 0.9D;
         List<Spot> free = new ArrayList<>();
         for (Spot sp : spots(level)) {
             VCar occ = SPOT_OCC.get(sp.key);
             if ((occ == null || occ == c) && !sp.key.equals(avoidKey)) {
+                if (cycle && !Double.isNaN(c.lastZx) && now < c.roamUntil && Math.hypot(sp.zx - c.lastZx, sp.zz - c.lastZz) < 30.0D) {
+                    continue;
+                }
                 free.add(sp);
             }
         }
-        if (c.visits > 0 && !free.isEmpty()) {
+        if ((cycle ? !surplus : c.visits > 0) && !free.isEmpty()) {
             final double fx = cp[0];
             final double fz = cp[2];
-            free.sort((a, b) -> Double.compare(Math.hypot(a.pose[0] - fx, a.pose[2] - fz), Math.hypot(b.pose[0] - fx, b.pose[2] - fz)));
+            final double lzx = c.lastZx;
+            final double lzz = c.lastZz;
+            free.sort((a, b) -> Double.compare(
+                Math.hypot(a.pose[0] - fx, a.pose[2] - fz) + (!Double.isNaN(lzx) && Math.hypot(a.zx - lzx, a.zz - lzz) < 30.0D ? 500.0D : 0.0D),
+                Math.hypot(b.pose[0] - fx, b.pose[2] - fz) + (!Double.isNaN(lzx) && Math.hypot(b.zx - lzx, b.zz - lzz) < 30.0D ? 500.0D : 0.0D)));
             for (int attempt = 0; attempt < 3 && !free.isEmpty(); attempt++) {
                 Spot sp = free.remove(VRND.nextInt(Math.min(free.size(), 8)));
                 Long blk = SPOT_BLOCKED.get(sp.key);
@@ -4419,7 +4440,9 @@ public final class PtmFixes {
                     c.ridx = -1;
                     c.goalSpot = sp;
                     c.exitGoal = false;
-                    c.visits--;
+                    if (!cycle) {
+                        c.visits--;
+                    }
                     SPOT_OCC.put(sp.key, c);
                     P_PLAN.incrementAndGet();
                     trafficLog("машина " + at(cp[0], cp[1], cp[2]) + " едет парковаться: место " + at(sp.pose[0], sp.pose[1], sp.pose[2]) + ", маршрут из " + route.size() + " полос, осталось заездов " + c.visits);
@@ -4427,7 +4450,17 @@ public final class PtmFixes {
                 }
             }
             trafficLog("нет маршрута к местам парковки от полосы " + at(cp[0], cp[1], cp[2]) + " (свободных мест " + free.size() + ")");
-            c.visits = 0;
+            if (!cycle) {
+                c.visits = 0;
+            }
+        }
+        if (cycle && !surplus) {
+            // свободных мест нет (или все заняты/далеко): ездит по городу и пробует снова; исчезают только излишки сверх потолка
+            c.route = null;
+            c.exitGoal = false;
+            c.goalSpot = null;
+            c.replanAt = now + 20000L;
+            return;
         }
         // зона удаления в другой зоне
         Object[] zd = zoneData(level);
@@ -4499,6 +4532,9 @@ public final class PtmFixes {
         c.exitGoal = false;
         c.replanAt = 0L;
         c.leaveAvoid = sp.key;
+        c.lastZx = sp.zx;
+        c.lastZz = sp.zz;
+        c.roamUntil = now + 60000L + (long) (VRND.nextDouble() * 90000.0D);
         P_LEAVE.incrementAndGet();
         trafficLog("машина уезжает с парковки " + at(sp.pose[0], sp.pose[1], sp.pose[2]) + ", осталось заездов " + c.visits);
     }
@@ -5169,6 +5205,9 @@ public final class PtmFixes {
                     } else {
                         v.ai = true;
                         v.startAI();
+                        c.lastZx = sp.zx;
+                        c.lastZz = sp.zz;
+                        c.roamUntil = now + 60000L + (long) (VRND.nextDouble() * 90000.0D);
                         P_LEAVE.incrementAndGet();
                     }
                     planNext(level, c, now, sp.key);
@@ -5540,7 +5579,19 @@ public final class PtmFixes {
                         if (!c.parked && c.man == null && c.route == null && c.replanAt <= now && plans < 3 && c.lane != null) {
                             plans++;
                             c.pathBuilt = false;
-                            planNext(level, c, now, null);
+                            VDTrafficLane curLane = null;
+                            try {
+                                curLane = VDUtils.getLaneByVehiclePosition(level, (net.minecraft.world.phys.Vec3) srg(e, "m_20182_"));
+                            } catch (Throwable t) {
+                                curLane = null;
+                            }
+                            if (curLane == null) {
+                                c.replanAt = now + 5000L;
+                            } else {
+                                c.lane = curLane;
+                                c.prog = progressOn(curLane, PTMEntity.getX((Entity) e), PTMEntity.getY((Entity) e), PTMEntity.getZ((Entity) e));
+                                planNext(level, c, now, null);
+                            }
                         }
                         continue;
                     }

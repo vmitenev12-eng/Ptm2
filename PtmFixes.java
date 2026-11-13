@@ -86,7 +86,7 @@ public final class PtmFixes {
      * 1) даёт название станциям, у которых его нет;
      * 2) привязывает каждую платформу к станции, в зоне которой она находится.
      */
-    public static final String BUILD = "fixes-2026-11-14-spots";
+    public static final String BUILD = "fixes-2026-11-14-spots2";
     private static boolean announced = false;
 
     public static void tick(Level level) {
@@ -1182,6 +1182,18 @@ public final class PtmFixes {
                 return;
             }
             String cls = entity.getClass().getSimpleName();
+            if (entity instanceof Vehicle && !(entity instanceof Transport)) {
+                Level lv = (Level) srg(entity, "m_9236_");
+                double best = 1.0E9D;
+                for (Player pl : PTMWorld.getPlayers(lv)) {
+                    best = Math.min(best, Math.hypot(PTMEntity.getX(pl) - PTMEntity.getX(entity), PTMEntity.getZ(pl) - PTMEntity.getZ(entity)));
+                }
+                if (best <= 45.0D) {
+                    trafficLog("машина удалена рядом с игроком (" + (int) best + " бл.): причина «" + reason + "» на "
+                        + at(PTMEntity.getX(entity), PTMEntity.getY(entity), PTMEntity.getZ(entity))
+                        + ", видна игроку: " + (seenByPlayers(lv, PTMEntity.getX(entity), PTMEntity.getY(entity), PTMEntity.getZ(entity)) ? "да" : "нет") + "; вызвал: " + caller());
+                }
+            }
             if (cls.contains("Transport") || cls.contains("Bus") || cls.contains("Tram") || cls.contains("Driver")
                 || entity.getClass().getName().contains("vehicle")) {
                 remember("\u0441\u0443\u0449\u043d\u043e\u0441\u0442\u044c " + cls + ": " + reason + " < " + caller());
@@ -3724,7 +3736,7 @@ public final class PtmFixes {
                     if (dist > limit) {
                         continue;
                     }
-                    if (dist < 8.0D) {
+                    if (dist < cfgNum("seenclose", 22.0D)) {
                         return true;
                     }
                     double dot = (dx * vc(look, 0) + dy * vc(look, 1) + dz * vc(look, 2)) / dist;

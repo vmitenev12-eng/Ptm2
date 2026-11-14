@@ -86,7 +86,7 @@ public final class PtmFixes {
      * 1) даёт название станциям, у которых его нет;
      * 2) привязывает каждую платформу к станции, в зоне которой она находится.
      */
-    public static final String BUILD = "fixes-2026-11-15-peds";
+    public static final String BUILD = "fixes-2026-11-16-pdd1";
     private static boolean announced = false;
 
     public static void tick(Level level) {
@@ -3808,7 +3808,9 @@ public final class PtmFixes {
             }
             res.add(n);
         }
-        return res;
+        @SuppressWarnings("unchecked")
+        List<VDTrafficLane> filtered = (List<VDTrafficLane>) pddFilter(level, lane, res, BAN_CAR);
+        return filtered;
     }
 
     /** Тупиковая ли полоса: после неё нет полос, ведущих дальше (в пределах 3 шагов). Результат кэшируется на 15 секунд. */
@@ -3846,6 +3848,201 @@ public final class PtmFixes {
      * (ручное рисование), соединяем такие полосы, иначе машина доезжает до «обрыва» и сама удаляется;
      * (2) случайный выбор не заводит машину в тупик, если есть другие варианты.
      */
+    // ======================================================================
+    //  ПДД, ядро v1: знаки, которые мод уже хранит как данные (VDTrafficSign), исключают полосы и манёвры из выбора ИИ
+    //  Знак относится к полосе, если он обращён по ходу её движения (rot8 знака равен курсу полосы), стоит не дальше 12 блоков
+    //  впереди начала (запреты въезда) или до конца полосы (запреты поворота) и не дальше 9 блоков в сторону.
+    //  Встречные и поперечные полосы знак не затрагивает. Если после исключения вариантов не остаётся, ограничение не применяется.
+    // ======================================================================
+
+    private static final class SignRec {
+        String type;
+        boolean end;
+        int rot8;
+        double x;
+        double y;
+        double z;
+    }
+
+    private static volatile List<SignRec> SIGN_CACHE = new ArrayList<>();
+    private static volatile long signCacheAt;
+    private static final java.util.Map<String, Integer> BAN_CACHE = new java.util.concurrent.ConcurrentHashMap<>();
+    private static final java.util.Set<String> BAN_LOGGED = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    private static List<SignRec> signRecs(Level level) {
+        long now = System.currentTimeMillis();
+        if (now - signCacheAt < 15000L) {
+            return SIGN_CACHE;
+        }
+        signCacheAt = now;
+        List<SignRec> res = new ArrayList<>();
+        try {
+            for (java.util.Map.Entry<net.minecraft.core.BlockPos, String> en : new ArrayList<>(com.rinventor.ptm2.dimension.virtual.storage.VDStorageHandler.getBlocks(level, VDMemoryIDs.TRAFFIC_SIGN).entrySet())) {
+                com.rinventor.ptm2.dimension.virtual.types.VDTrafficSign sg = new com.rinventor.ptm2.dimension.virtual.types.VDTrafficSign(en.getValue());
+                if (sg.type == null) {
+                    continue;
+                }
+                SignRec r = new SignRec();
+                r.type = sg.type.name();
+                r.end = sg.end;
+                r.rot8 = sg.rot8;
+                r.x = ((Integer) srg(en.getKey(), "m_123341_")).doubleValue() + 0.5D;
+                r.y = ((Integer) srg(en.getKey(), "m_123342_")).doubleValue();
+                r.z = ((Integer) srg(en.getKey(), "m_123343_")).doubleValue() + 0.5D;
+                res.add(r);
+            }
+        } catch (Throwable t) {
+            // оставляем пустой список
+        }
+        SIGN_CACHE = res;
+        BAN_CACHE.clear();
+        return res;
+    }
+
+    /** Курс (rot8, как у машины) движения полосы на её начале (atStart) или конце. */
+    private static int laneHead8(VDTrafficLane lane, boolean atStart) throws ReflectiveOperationException {
+        double len = laneLen(lane);
+        double[] a = atStart ? posOnLane(lane, 0.0D) : posOnLane(lane, Math.max(0.0D, len - 3.0D));
+        double[] b = atStart ? posOnLane(lane, Math.min(len, 3.0D)) : posOnLane(lane, len);
+        return com.rinventor.ptm2.engine.computing.Rotation8.get(yawOf(b[0] - a[0], b[2] - a[2]));
+    }
+
+    private static boolean signSeesLane(SignRec sg, double[] ref, int head8, double ahead) {
+        if (sg.rot8 != head8) {
+            return false;
+        }
+        double yaw = Math.toRadians(head8 * 45.0D);
+        double fx = -Math.sin(yaw);
+        double fz = Math.cos(yaw);
+        double dx = ref[0] - sg.x;
+        double dz = ref[2] - sg.z;
+        double along = dx * fx + dz * fz;
+        double lateral = Math.abs(dx * fz - dz * fx);
+        return along >= -2.0D && along <= ahead && lateral <= 9.0D && Math.abs(ref[1] - sg.y) < 6.0D;
+    }
+
+    private static final int BAN_ALL = 1;
+    private static final int BAN_CAR = 2;
+    private static final int BAN_BUS = 4;
+    private static final int BAN_TRUCK = 8;
+    private static final int BAN_MOTO = 16;
+
+    /** Маска запретов въезда на полосу по знакам (на всех / легковым / автобусам / грузовым / мотоциклам). */
+    private static int entryBans(Level level, VDTrafficLane lane) {
+        String key = laneKey(lane);
+        Integer cached = BAN_CACHE.get(key);
+        List<SignRec> sr = signRecs(level);
+        if (cached != null) {
+            return cached;
+        }
+        int mask = 0;
+        try {
+            double[] st = posOnLane(lane, 0.0D);
+            int head = laneHead8(lane, true);
+            for (SignRec sg : sr) {
+                if (sg.end || !signSeesLane(sg, st, head, 12.0D)) {
+                    continue;
+                }
+                int bit = 0;
+                switch (sg.type) {
+                    case "NO_ENTRY":
+                    case "ROAD_CLOSED":
+                    case "NO_VEHICLES":
+                        bit = BAN_ALL;
+                        break;
+                    case "NO_CARS":
+                        bit = BAN_CAR;
+                        break;
+                    case "NO_BUSES":
+                        bit = BAN_BUS;
+                        break;
+                    case "NO_LORRIES":
+                        bit = BAN_TRUCK;
+                        break;
+                    case "BUS_LANE":
+                        bit = BAN_CAR | BAN_TRUCK | BAN_MOTO;
+                        break;
+                    default:
+                        break;
+                }
+                if (bit != 0) {
+                    mask |= bit;
+                    if (BAN_LOGGED.size() < 500 && BAN_LOGGED.add(key + sg.type)) {
+                        PTMLogger.info("PTM2 ПДД: полоса " + at(st[0], st[1], st[2]) + " исключена из выбора знаком " + sg.type + " (" + (int) sg.x + " " + (int) sg.z + ")");
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            mask = 0;
+        }
+        BAN_CACHE.put(key, mask);
+        return mask;
+    }
+
+    /** Запрещает ли знак повернуть с полосы from на полосу to (NO_LEFT / NO_RIGHT)? */
+    private static boolean turnBanned(Level level, VDTrafficLane from, VDTrafficLane to) {
+        try {
+            int h1 = laneHead8(from, false);
+            int h2 = laneHead8(to, true);
+            int diff = ((h2 - h1) % 8 + 8) % 8;
+            boolean right = diff == 2 || diff == 3;
+            boolean left = diff == 5 || diff == 6;
+            if (!right && !left) {
+                return false;
+            }
+            double[] en = posOnLane(from, laneLen(from));
+            for (SignRec sg : signRecs(level)) {
+                if (sg.end || !(right ? sg.type.equals("NO_RIGHT") : sg.type.equals("NO_LEFT"))) {
+                    continue;
+                }
+                if (signSeesLane(sg, en, h1, 14.0D)) {
+                    return true;
+                }
+            }
+        } catch (Throwable t) {
+            return false;
+        }
+        return false;
+    }
+
+    private static int vehicleBanBit(Object car) {
+        try {
+            if (car instanceof Transport) {
+                return BAN_BUS;
+            }
+            String vt = String.valueOf(((Vehicle) car).vehicleType);
+            if (vt.contains("TRUCK")) {
+                return BAN_TRUCK;
+            }
+            if (vt.contains("MOTORCYCLE")) {
+                return BAN_MOTO;
+            }
+        } catch (Throwable t) {
+            // считаем легковой
+        }
+        return BAN_CAR;
+    }
+
+    /** Убирает из списка следующих полос запрещённые знаками. Если ничего не останется, список не меняется. */
+    private static List<?> pddFilter(Level level, VDTrafficLane from, List<?> list, int vehBit) {
+        if (list == null || list.isEmpty() || !cfgBool("pdd", true) || signRecs(level).isEmpty()) {
+            return list;
+        }
+        List<Object> ok = new ArrayList<>();
+        for (Object o : list) {
+            VDTrafficLane n = (VDTrafficLane) o;
+            int ban = entryBans(level, n);
+            if ((ban & (BAN_ALL | vehBit)) != 0) {
+                continue;
+            }
+            if (from != null && turnBanned(level, from, n)) {
+                continue;
+            }
+            ok.add(o);
+        }
+        return ok.isEmpty() ? list : ok;
+    }
+
     public static List<?> connectedFix(Object car, List<?> orig, Object posObj, Object endObj, Object laneObj) {
         try {
             Level level = (Level) srg(car, "m_9236_");
@@ -3878,6 +4075,9 @@ public final class PtmFixes {
                 if (!noSpot.isEmpty()) {
                     list = noSpot;
                 }
+            }
+            if (list != null && list.size() >= 2) {
+                list = pddFilter(level, lane, list, vehicleBanBit(car));
             }
             if (list == null || list.size() < 2) {
                 return list;

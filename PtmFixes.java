@@ -86,7 +86,7 @@ public final class PtmFixes {
      * 1) даёт название станциям, у которых его нет;
      * 2) привязывает каждую платформу к станции, в зоне которой она находится.
      */
-    public static final String BUILD = "fixes-2026-11-14-spots2";
+    public static final String BUILD = "fixes-2026-11-15-peds";
     private static boolean announced = false;
 
     public static void tick(Level level) {
@@ -2064,6 +2064,7 @@ public final class PtmFixes {
     static final class Drv {
         volatile long seen;
         long stillSince;
+        long stillLogAt;
         long blockedSince;
         long forcedAt;
         boolean forced;
@@ -2376,6 +2377,11 @@ public final class PtmFixes {
                 d.stillSince = 0L;
             } else if (d.stillSince == 0L) {
                 d.stillSince = now;
+            }
+            if (still && d.stillSince > 0L && now - d.stillSince >= 20000L && now - d.stillLogAt > 60000L && v.ai && !v.parked && !v.crashed
+                && !(v instanceof Transport)) {
+                d.stillLogAt = now;
+                stillReport(v, level, now);
             }
             if (!v.ai || v.handBrake || v.crashed || v.requiresTracks) {
                 d.blockedSince = 0L;
@@ -4777,6 +4783,65 @@ public final class PtmFixes {
         c.pedRef = null;
     }
 
+    /** Диагностика: машина рядом с игроком стоит 20+ секунд. Пишет, что рядом (пешеход, другая машина), и состояние маршрута. */
+    private static void stillReport(Vehicle v, Level level, long now) {
+        try {
+            double x = PTMEntity.getX(v);
+            double y = PTMEntity.getY(v);
+            double z = PTMEntity.getZ(v);
+            if (!anyPlayerWithinOwnRange(level, x, y, z)) {
+                return;
+            }
+            StringBuilder sb = new StringBuilder("машина стоит 20+ с на " + at(x, y, z));
+            sb.append(", скорость ").append(Math.round(v.speed)).append(", целевая ").append(Math.round(v.targetSpeed));
+            VDTrafficLane ln = VDUtils.getLaneByVehiclePosition(level, (net.minecraft.world.phys.Vec3) srg(v, "m_20182_"));
+            sb.append(", полоса ").append(ln == null ? "нет" : (isLotLane(level, ln) ? "парковка" : "дорога"));
+            sb.append(", знак приоритета ").append(v.prioritySign).append(", предупреждающий ").append(v.warningSign);
+            Entity ped = PTMEntity.getNearest(com.rinventor.ptm2.objects.entities.pedestrian.Pedestrian.class, 12.0D, level, x, y, z);
+            if (ped != null) {
+                sb.append(", ближайший пешеход ").append((int) Math.hypot(PTMEntity.getX(ped) - x, PTMEntity.getZ(ped) - z)).append(" бл.")
+                    .append(PED_JOBS.containsKey(System.identityHashCode(ped)) ? " (идёт по заданию водителя)" : "");
+            }
+            for (Entity e : PTMEntity.getAll(Vehicle.class, 12.0D, level, x, y, z)) {
+                if (e == v) {
+                    continue;
+                }
+                sb.append(", машина ").append((int) Math.hypot(PTMEntity.getX(e) - x, PTMEntity.getZ(e) - z)).append(" бл. (скорость ")
+                    .append(Math.round(((Vehicle) e).speed)).append(((Vehicle) e).parked ? ", припаркована" : "").append(")");
+                break;
+            }
+            VCar c = PHYS.get(System.identityHashCode(v));
+            if (c != null) {
+                sb.append("; запись: ").append(c.goalSpot != null ? "едет на место" : (c.exitGoal ? "едет на удаление" : (c.route != null ? "есть маршрут" : "без маршрута")))
+                    .append(c.man != null ? ", манёвр" : "").append(c.walkBack ? ", ждёт водителя" : "");
+            }
+            trafficLog(sb.toString());
+        } catch (Throwable t) {
+            // диагностика не должна ломать игру
+        }
+    }
+
+    /** Прямая от (x1, z1) к точке пересекает полосу обычной дороги (не парковки)? Пешеходу-водителю там идти нельзя: машины встанут. */
+    private static boolean crossesRoad(Level level, double x1, double z1, double[] to) {
+        try {
+            double dx = to[0] - x1;
+            double dz = to[2] - z1;
+            double len = Math.hypot(dx, dz);
+            java.lang.reflect.Constructor<?> k = net.minecraft.world.phys.Vec3.class.getConstructor(double.class, double.class, double.class);
+            for (double t = 2.0D; t < len - 0.5D; t += 1.0D) {
+                double px = x1 + dx / len * t;
+                double pz = z1 + dz / len * t;
+                VDTrafficLane ln = VDUtils.getLaneByVehiclePosition(level, (net.minecraft.world.phys.Vec3) k.newInstance(px, to[1], pz));
+                if (ln != null && !ln.transport && !isLotLane(level, ln)) {
+                    return true;
+                }
+            }
+        } catch (Throwable t) {
+            return false;
+        }
+        return false;
+    }
+
     private static boolean nearCrossing(Level level, double x, double y, double z) {
         try {
             Object r = com.rinventor.ptm2.engine.base.PTMBlock.findInCube(com.rinventor.ptm2.core.init.ModBlocks.PEDESTRIAN_CROSSING_LINE_MARKING.get(), 4, level, x, y, z);
@@ -4828,11 +4893,15 @@ public final class PtmFixes {
         List<double[]> good = new ArrayList<>();
         for (int i = 0; i < cand.size() && i < 80 && good.size() < 5; i++) {
             double[] cd = cand.get(i);
-            if (!nearCrossing(level, cd[1], cd[2], cd[3])) {
+            double[] pt = new double[] {cd[1], cd[2], cd[3]};
+            if (!nearCrossing(level, cd[1], cd[2], cd[3]) && !crossesRoad(level, x, z, pt)) {
                 good.add(cd);
             }
         }
-        double[] pick = good.isEmpty() ? cand.get(0) : good.get(VRND.nextInt(good.size()));
+        if (good.isEmpty()) {
+            return null;
+        }
+        double[] pick = good.get(VRND.nextInt(good.size()));
         return new double[] {pick[1], pick[2], pick[3]};
     }
 
@@ -4926,7 +4995,7 @@ public final class PtmFixes {
             }
             double[] sw = nearestSidewalk(level, x, z, 28.0D);
             if (sw == null) {
-                trafficLog("водитель не вышел: тротуара в 28 блоках от " + at(x, y, z) + " нет");
+                trafficLog("водитель не вышел: тротуара в 28 блоках от " + at(x, y, z) + " нет или к нему нужно пересекать дорогу");
                 return;
             }
             double[] door = doorPoint(v, sw);
@@ -4953,7 +5022,9 @@ public final class PtmFixes {
             double z = PTMEntity.getZ(car);
             Entity ped = driverPed(c);
             double[] from = null;
-            if (ped != null && Math.hypot(PTMEntity.getX(ped) - x, PTMEntity.getZ(ped) - z) <= 35.0D) {
+            double[] doorChk = ped == null ? null : doorPoint(car, new double[] {PTMEntity.getX(ped), PTMEntity.getY(ped), PTMEntity.getZ(ped)});
+            if (ped != null && Math.hypot(PTMEntity.getX(ped) - x, PTMEntity.getZ(ped) - z) <= 35.0D
+                && !crossesRoad(level, PTMEntity.getX(ped), PTMEntity.getZ(ped), doorChk)) {
                 from = new double[] {PTMEntity.getX(ped), PTMEntity.getY(ped), PTMEntity.getZ(ped)};
             } else {
                 if (ped != null) {

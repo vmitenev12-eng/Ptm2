@@ -86,7 +86,7 @@ public final class PtmFixes {
      * 1) даёт название станциям, у которых его нет;
      * 2) привязывает каждую платформу к станции, в зоне которой она находится.
      */
-    public static final String BUILD = "fixes-2026-11-16-pdd1";
+    public static final String BUILD = "fixes-2026-11-16-pdd2";
     private static boolean announced = false;
 
     public static void tick(Level level) {
@@ -4005,6 +4005,374 @@ public final class PtmFixes {
         return false;
     }
 
+    // ======================================================================
+    //  ПДД v2: направления движения по полосам. Источники: знаки «Направления движения по полосе» (рядом друг с другом или над
+    //  полосами, белые и синие) и стрелки разметки. Каждый знак даёт колонку (какие манёвры, где стоит поперёк дороги); колонки
+    //  слева направо сопоставляются с попутными полосами подхода к перекрёстку. Знак важнее разметки.
+    //  Манёвр определяется углом между курсом полосы в конце и курсом следующей полосы (rot8): 0 прямо, 1 и 7 диагональ, 2-3 направо,
+    //  5-6 налево, 4 разворот. Если после исключения вариантов не остаётся, ограничение не применяется.
+    // ======================================================================
+
+    private static volatile java.util.Map<Object, Integer> LANE_SIGN_BLOCKS;
+    private static volatile java.util.Map<Object, Integer> LANE_ARROW_BLOCKS;
+
+    private static int dirMaskOfName(String core) {
+        int mask = 0;
+        String c = core;
+        if (c.contains("U_TURN")) {
+            mask |= 1 << 4;
+            c = c.replace("U_TURN", "");
+        }
+        if (c.contains("DIAG_LEFT") || c.contains("LITTLEBIT_LEFT")) {
+            mask |= 1 << 7;
+            c = c.replace("DIAG_LEFT", "").replace("LITTLEBIT_LEFT", "");
+        }
+        if (c.contains("DIAG_RIGHT") || c.contains("LITTLEBIT_RIGHT")) {
+            mask |= 1 << 1;
+            c = c.replace("DIAG_RIGHT", "").replace("LITTLEBIT_RIGHT", "");
+        }
+        if (c.contains("STRAIGHT")) {
+            mask |= 1;
+            c = c.replace("STRAIGHT", "");
+        }
+        if (c.contains("LEFT")) {
+            mask |= (1 << 5) | (1 << 6);
+        }
+        if (c.contains("RIGHT")) {
+            mask |= (1 << 2) | (1 << 3);
+        }
+        return mask;
+    }
+
+    private static void initLaneDirBlocks() {
+        java.util.Map<Object, Integer> signs = new java.util.HashMap<>();
+        java.util.Map<Object, Integer> arrows = new java.util.HashMap<>();
+        try {
+            for (java.lang.reflect.Field f : com.rinventor.ptm2.core.init.ModBlocks.class.getFields()) {
+                if (!java.lang.reflect.Modifier.isStatic(f.getModifiers())) {
+                    continue;
+                }
+                String n = f.getName();
+                boolean sign = n.startsWith("LANE_") && n.endsWith("_SIGN") && !n.contains("ENDS") && !n.contains("STARTS") && !n.contains("BOTH");
+                boolean arrow = n.endsWith("ARROW_MARKING");
+                if (!sign && !arrow) {
+                    continue;
+                }
+                try {
+                    Object ro = f.get(null);
+                    Object blk = ro == null ? null : ro.getClass().getMethod("get").invoke(ro);
+                    if (blk == null) {
+                        continue;
+                    }
+                    if (sign) {
+                        String core = n.substring(5, n.length() - 5).replace("_BLUE", "");
+                        int m = dirMaskOfName(core);
+                        if (m != 0) {
+                            signs.put(blk, m);
+                        }
+                    } else {
+                        int m;
+                        switch (n) {
+                            case "ARROW_MARKING":
+                                m = 1;
+                                break;
+                            case "TURN_LEFT_ARROW_MARKING":
+                                m = (1 << 5) | (1 << 6);
+                                break;
+                            case "TURN_RIGHT_ARROW_MARKING":
+                                m = (1 << 2) | (1 << 3);
+                                break;
+                            case "LEFT_RIGHT_ARROW_MARKING":
+                                m = (1 << 5) | (1 << 6) | (1 << 2) | (1 << 3);
+                                break;
+                            case "TRIPLE_ARROW_MARKING":
+                                m = 1 | (1 << 5) | (1 << 6) | (1 << 2) | (1 << 3);
+                                break;
+                            case "U_TURN_ARROW_MARKING":
+                                m = 1 << 4;
+                                break;
+                            default:
+                                m = 0;
+                                break;
+                        }
+                        if (m != 0) {
+                            arrows.put(blk, m);
+                        }
+                    }
+                } catch (Throwable t) {
+                    // поле не блок
+                }
+            }
+        } catch (Throwable t) {
+            // нет данных - ограничений нет
+        }
+        LANE_SIGN_BLOCKS = signs;
+        LANE_ARROW_BLOCKS = arrows;
+        PTMLogger.info("PTM2 ПДД: знаков направлений по полосам " + signs.size() + ", стрелок разметки " + arrows.size());
+    }
+
+    private static final class DirCol {
+        int mask;
+        double lat;
+        boolean sign;
+    }
+
+    private static final class DirScan {
+        List<DirCol> cols = new ArrayList<>();
+        long at;
+    }
+
+    private static final java.util.Map<String, DirScan> DIR_SCANS = new java.util.concurrent.ConcurrentHashMap<>();
+    private static final java.util.Map<String, long[]> DIR_MASKS = new java.util.concurrent.ConcurrentHashMap<>();
+    private static volatile long dirScanSec;
+    private static volatile int dirScanCount;
+    private static volatile List<VDTrafficLane> ALL_LANES_C = new ArrayList<>();
+    private static volatile long allLanesCAt;
+
+    private static List<VDTrafficLane> allLanesCached(Level level) {
+        long now = System.currentTimeMillis();
+        if (now - allLanesCAt > 30000L) {
+            allLanesCAt = now;
+            List<VDTrafficLane> res = new ArrayList<>();
+            try {
+                for (String data : new ArrayList<>(com.rinventor.ptm2.dimension.virtual.storage.VDStorageHandler.getAll(level, VDMemoryIDs.TRAFFIC_LANE).values())) {
+                    res.add(new VDTrafficLane(data));
+                }
+            } catch (Throwable t) {
+                // оставляем прежний список
+                return ALL_LANES_C;
+            }
+            ALL_LANES_C = res;
+        }
+        return ALL_LANES_C;
+    }
+
+    private static Object blockPosOf(int x, int y, int z) throws ReflectiveOperationException {
+        return net.minecraft.core.BlockPos.class.getConstructor(int.class, int.class, int.class).newInstance(x, y, z);
+    }
+
+    private static boolean chunksLoaded(Level level, double x, double z, int r) {
+        try {
+            int[][] c = {{(int) x - r, (int) z - r}, {(int) x + r, (int) z - r}, {(int) x - r, (int) z + r}, {(int) x + r, (int) z + r}, {(int) x, (int) z}};
+            for (int[] p : c) {
+                if (!Boolean.TRUE.equals(srg(level, "m_46805_", blockPosOf(p[0], 64, p[1])))) {
+                    return false;
+                }
+            }
+            return true;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /** Колонки (знаки и стрелки) вокруг подхода: поперечное положение относительно точки конца полосы, вправо по ходу движения - плюс. */
+    private static DirScan scanDirCols(Level level, double[] end, int head) {
+        String ck = head + ":" + (int) Math.floor(end[0] / 6.0D) + ":" + (int) Math.floor(end[2] / 6.0D) + ":" + (int) Math.floor(end[1] / 3.0D);
+        long now = System.currentTimeMillis();
+        DirScan old = DIR_SCANS.get(ck);
+        if (old != null && now - old.at < 60000L) {
+            return old;
+        }
+        long sec = now / 1000L;
+        if (sec != dirScanSec) {
+            dirScanSec = sec;
+            dirScanCount = 0;
+        }
+        if (dirScanCount >= 3 || !chunksLoaded(level, end[0], end[2], 20)) {
+            return old;
+        }
+        dirScanCount++;
+        DirScan res = new DirScan();
+        res.at = now;
+        try {
+            if (LANE_SIGN_BLOCKS == null) {
+                initLaneDirBlocks();
+            }
+            double yaw = Math.toRadians(head * 45.0D);
+            double fx = -Math.sin(yaw);
+            double fz = Math.cos(yaw);
+            double rx = -Math.cos(yaw);
+            double rz = -Math.sin(yaw);
+            int ex = (int) Math.floor(end[0]);
+            int ez = (int) Math.floor(end[2]);
+            int ey = (int) Math.floor(end[1]);
+            for (int dx = -18; dx <= 18; dx++) {
+                for (int dz = -18; dz <= 18; dz++) {
+                    double px = ex + dx + 0.5D - end[0];
+                    double pz = ez + dz + 0.5D - end[2];
+                    double along = px * fx + pz * fz;
+                    double lat = px * rx + pz * rz;
+                    if (along < -17.0D || along > 3.0D || Math.abs(lat) > 12.0D) {
+                        continue;
+                    }
+                    for (int dy = -1; dy <= 8; dy++) {
+                        Object blk = com.rinventor.ptm2.engine.base.PTMBlock.getBlock(level, (double) (ex + dx), (double) (ey + dy), (double) (ez + dz));
+                        if (blk == null) {
+                            continue;
+                        }
+                        Integer sm = LANE_SIGN_BLOCKS.get(blk);
+                        Integer am = sm == null && dy <= 1 && along >= -30.0D ? LANE_ARROW_BLOCKS.get(blk) : null;
+                        if (sm == null && am == null) {
+                            continue;
+                        }
+                        int rot = com.rinventor.ptm2.engine.base.PTMBlock.getIProperty("rotation", level, (double) (ex + dx), (double) (ey + dy), (double) (ez + dz));
+                        if (rot != head) {
+                            continue;
+                        }
+                        DirCol col = new DirCol();
+                        col.mask = sm != null ? sm : am;
+                        col.lat = lat;
+                        col.sign = sm != null;
+                        res.cols.add(col);
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            // пустой результат
+        }
+        DIR_SCANS.put(ck, res);
+        return res;
+    }
+
+    /** Допустимые манёвры (маска по углам 0..7) для полосы по знакам или стрелкам; 0 - ограничений нет. */
+    private static int laneDirMask(Level level, VDTrafficLane lane) {
+        try {
+            String key = laneKey(lane);
+            long now = System.currentTimeMillis();
+            long[] c = DIR_MASKS.get(key);
+            if (c != null && now - c[1] < 60000L) {
+                return (int) c[0];
+            }
+            double len = laneLen(lane);
+            double[] end = posOnLane(lane, len);
+            int head = laneHead8(lane, false);
+            DirScan sc = scanDirCols(level, end, head);
+            if (sc == null) {
+                return c == null ? 0 : (int) c[0];
+            }
+            double yaw = Math.toRadians(head * 45.0D);
+            double fx = -Math.sin(yaw);
+            double fz = Math.cos(yaw);
+            double rx = -Math.cos(yaw);
+            double rz = -Math.sin(yaw);
+            List<Double> sib = new ArrayList<>();
+            double myLat = 0.0D;
+            for (VDTrafficLane o : allLanesCached(level)) {
+                if (o.transport || o.getEnd() == null) {
+                    continue;
+                }
+                double ox = vc(o.getEnd(), 0) - end[0];
+                double oz = vc(o.getEnd(), 2) - end[2];
+                double along = ox * fx + oz * fz;
+                double lat = ox * rx + oz * rz;
+                if (Math.abs(along) > 4.0D || Math.abs(lat) > 12.0D || Math.abs(vc(o.getEnd(), 1) - end[1]) > 3.0D || laneHead8(o, false) != head) {
+                    continue;
+                }
+                sib.add(lat);
+            }
+            boolean haveMe = false;
+            for (double sl : sib) {
+                haveMe |= Math.abs(sl - myLat) < 0.3D;
+            }
+            if (!haveMe) {
+                sib.add(myLat);
+            }
+            java.util.Collections.sort(sib);
+            int myIdx = 0;
+            for (int i = 0; i < sib.size(); i++) {
+                if (Math.abs(sib.get(i) - myLat) < Math.abs(sib.get(myIdx) - myLat)) {
+                    myIdx = i;
+                }
+            }
+            double myLane = sib.get(myIdx);
+            // знаки приоритетнее стрелок разметки
+            boolean anySign = false;
+            for (DirCol col : sc.cols) {
+                anySign |= col.sign;
+            }
+            List<DirCol> cols = new ArrayList<>();
+            for (DirCol col : sc.cols) {
+                if (col.sign == anySign) {
+                    cols.add(col);
+                }
+            }
+            cols.sort((a, b) -> Double.compare(a.lat, b.lat));
+            int mask = 0;
+            if (!cols.isEmpty()) {
+                if (anySign && cols.size() == sib.size()) {
+                    mask = cols.get(myIdx).mask;
+                } else if (anySign) {
+                    // нет точного соответствия: колонка относится к ближайшей полосе
+                    for (DirCol col : cols) {
+                        double best = 1.0E9D;
+                        double bestLane = 0.0D;
+                        for (double sl : sib) {
+                            if (Math.abs(sl - col.lat) < best) {
+                                best = Math.abs(sl - col.lat);
+                                bestLane = sl;
+                            }
+                        }
+                        if (bestLane == myLane) {
+                            mask |= col.mask;
+                        }
+                    }
+                } else {
+                    // стрелки разметки: только те, что лежат на самой полосе
+                    for (DirCol col : cols) {
+                        if (Math.abs(col.lat) <= 1.7D) {
+                            mask |= col.mask;
+                        }
+                    }
+                }
+            }
+            DIR_MASKS.put(key, new long[] {mask, now});
+            if (mask != 0 && DIR_LOGGED.size() < 400 && DIR_LOGGED.add(key)) {
+                PTMLogger.info("PTM2 ПДД: полоса " + at(end[0], end[1], end[2]) + ": манёвры по " + (anySign ? "знакам" : "разметке") + " " + dirMaskText(mask));
+            }
+            return mask;
+        } catch (Throwable t) {
+            return 0;
+        }
+    }
+
+    private static final java.util.Set<String> DIR_LOGGED = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    private static String dirMaskText(int m) {
+        StringBuilder sb = new StringBuilder();
+        if ((m & 1) != 0) {
+            sb.append("прямо ");
+        }
+        if ((m & ((1 << 5) | (1 << 6))) != 0) {
+            sb.append("налево ");
+        }
+        if ((m & ((1 << 2) | (1 << 3))) != 0) {
+            sb.append("направо ");
+        }
+        if ((m & (1 << 4)) != 0) {
+            sb.append("разворот ");
+        }
+        if ((m & (1 << 7)) != 0) {
+            sb.append("влево-диагональ ");
+        }
+        if ((m & (1 << 1)) != 0) {
+            sb.append("вправо-диагональ ");
+        }
+        return sb.toString().trim();
+    }
+
+    private static boolean laneDirAllows(Level level, VDTrafficLane from, VDTrafficLane to) {
+        try {
+            int mask = laneDirMask(level, from);
+            if (mask == 0) {
+                return true;
+            }
+            int diff = ((laneHead8(to, true) - laneHead8(from, false)) % 8 + 8) % 8;
+            return ((mask >> diff) & 1) != 0;
+        } catch (Throwable t) {
+            return true;
+        }
+    }
+
     private static int vehicleBanBit(Object car) {
         try {
             if (car instanceof Transport) {
@@ -4036,6 +4404,9 @@ public final class PtmFixes {
                 continue;
             }
             if (from != null && turnBanned(level, from, n)) {
+                continue;
+            }
+            if (from != null && !laneDirAllows(level, from, n)) {
                 continue;
             }
             ok.add(o);

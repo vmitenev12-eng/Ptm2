@@ -86,7 +86,7 @@ public final class PtmFixes {
      * 1) даёт название станциям, у которых его нет;
      * 2) привязывает каждую платформу к станции, в зоне которой она находится.
      */
-    public static final String BUILD = "fixes-2026-11-16-pdd2";
+    public static final String BUILD = "fixes-2026-11-17-pdd3";
     private static boolean announced = false;
 
     public static void tick(Level level) {
@@ -4165,6 +4165,36 @@ public final class PtmFixes {
         }
     }
 
+    /**
+     * Мягкая поддержка LittleTiles: если в ячейке блок из миниблоков, возвращает блоки, из которых сделаны его части
+     * (например, части из блоков знаков и разметки ptm2). Без мода LittleTiles ничего не делает.
+     */
+    private static List<Object> littleBlocks(Level level, int x, int y, int z) {
+        List<Object> res = new ArrayList<>();
+        try {
+            Object be = srg(level, "m_7702_", blockPosOf(x, y, z));
+            if (be == null || !be.getClass().getName().endsWith(".BETiles")) {
+                return res;
+            }
+            Object itr = be.getClass().getMethod("allTiles").invoke(be);
+            int n = 0;
+            for (Object pr : (Iterable<?>) itr) {
+                if (++n > 80) {
+                    break;
+                }
+                Object tile = ((java.util.Map.Entry<?, ?>) pr).getValue();
+                Object state = tile.getClass().getMethod("getState").invoke(tile);
+                Object block = srg(state, "m_60734_");
+                if (block != null && !res.contains(block)) {
+                    res.add(block);
+                }
+            }
+        } catch (Throwable t) {
+            // нет LittleTiles или другая версия: части не читаются
+        }
+        return res;
+    }
+
     /** Колонки (знаки и стрелки) вокруг подхода: поперечное положение относительно точки конца полосы, вправо по ходу движения - плюс. */
     private static DirScan scanDirCols(Level level, double[] end, int head) {
         String ck = head + ":" + (int) Math.floor(end[0] / 6.0D) + ":" + (int) Math.floor(end[2] / 6.0D) + ":" + (int) Math.floor(end[1] / 3.0D);
@@ -4210,20 +4240,25 @@ public final class PtmFixes {
                         if (blk == null) {
                             continue;
                         }
-                        Integer sm = LANE_SIGN_BLOCKS.get(blk);
-                        Integer am = sm == null && dy <= 1 && along >= -30.0D ? LANE_ARROW_BLOCKS.get(blk) : null;
-                        if (sm == null && am == null) {
-                            continue;
+                        boolean little = blk.getClass().getName().startsWith("team.creative.littletiles.");
+                        List<Object> blocks = little ? littleBlocks(level, ex + dx, ey + dy, ez + dz) : java.util.Collections.singletonList(blk);
+                        for (Object b : blocks) {
+                            Integer sm = LANE_SIGN_BLOCKS.get(b);
+                            Integer am = sm == null && dy <= 1 && along >= -30.0D ? LANE_ARROW_BLOCKS.get(b) : null;
+                            if (sm == null && am == null) {
+                                continue;
+                            }
+                            // у частей LittleTiles направление хранится в форме, а не в свойстве блока: берём курс полосы
+                            int rot = little ? head : com.rinventor.ptm2.engine.base.PTMBlock.getIProperty("rotation", level, (double) (ex + dx), (double) (ey + dy), (double) (ez + dz));
+                            if (rot != head) {
+                                continue;
+                            }
+                            DirCol col = new DirCol();
+                            col.mask = sm != null ? sm : am;
+                            col.lat = lat;
+                            col.sign = sm != null;
+                            res.cols.add(col);
                         }
-                        int rot = com.rinventor.ptm2.engine.base.PTMBlock.getIProperty("rotation", level, (double) (ex + dx), (double) (ey + dy), (double) (ez + dz));
-                        if (rot != head) {
-                            continue;
-                        }
-                        DirCol col = new DirCol();
-                        col.mask = sm != null ? sm : am;
-                        col.lat = lat;
-                        col.sign = sm != null;
-                        res.cols.add(col);
                     }
                 }
             }

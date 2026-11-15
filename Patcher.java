@@ -136,7 +136,7 @@ public class Patcher implements Opcodes {
         if (mismatch) {
             System.exit(1);
         }
-        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay", "gate-bankcard", "boarding-fare", "gate-exit-radius", "gate-exit-auto", "gate-in-radius", "terminal-cap", "arrival-reach", "arrival-inside", "lamp-cap", "red-commit", "patience", "bypass-still", "merge-check", "player-ahead", "merge-width", "parallel-width", "auto-links", "link-revision", "bus-priority", "validator", "wheel-filter", "hull", "depot-ui", "depot-select", "schedule-toggle", "schedule-edit", "editor-updateOptions", "editor-updateRouteList1", "editor-updateRouteList2", "editor-createRow1", "editor-createRow2", "editor-add", "editor-tick", "day-options", "day-loops", "day-today", "preview-columns", "preview-click", "stop-pocket", "range-transportRange", "range-trafficRange", "range-near", "range-track", "zone-save", "zone-prop", "zone-load", "zone-ui", "zone-spawn", "zone-spawnlog", "zone-spawned", "zone-despawnreason", "car-deadends", "car-route", "ped-script", "park-static", "arrow-scale", "veh-tick", "zone-keep", "zone-despawn", "board-arriving", "schedule-screen", "schedule-real", "schedule-cache", "depot-order", "depot-spawn", "depot-spawn2", "garage-fleet", "depot-park", "depot-return", "terminal-pax", "depot-clear", "depot-crash", "gravity-reset"};
+        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay", "gate-bankcard", "boarding-fare", "gate-exit-radius", "gate-exit-auto", "gate-in-radius", "terminal-cap", "arrival-reach", "arrival-inside", "lamp-cap", "red-commit", "patience", "bypass-still", "merge-check", "player-ahead", "merge-width", "parallel-width", "auto-links", "link-revision", "bus-priority", "validator", "wheel-filter", "hull", "depot-ui", "depot-select", "schedule-toggle", "schedule-edit", "editor-updateOptions", "editor-updateRouteList1", "editor-updateRouteList2", "editor-createRow1", "editor-createRow2", "editor-add", "editor-tick", "day-options", "day-loops", "day-today", "preview-columns", "preview-click", "stop-pocket", "range-transportRange", "range-trafficRange", "range-near", "range-track", "zone-save", "zone-prop", "zone-load", "zone-ui", "zone-spawn", "zone-spawnlog", "zone-spawned", "zone-despawnreason", "car-deadends", "car-route", "ped-script", "park-static", "arrow-scale", "board-blocks", "board-items", "board-tab", "veh-tick", "zone-keep", "zone-despawn", "board-arriving", "schedule-screen", "schedule-real", "schedule-cache", "depot-order", "depot-spawn", "depot-spawn2", "garage-fleet", "depot-park", "depot-return", "terminal-pax", "depot-clear", "depot-crash", "gravity-reset"};
         for (String r : required) {
             if (!done.contains(r)) {
                 System.err.println("ERROR: patch not applied: " + r);
@@ -158,7 +158,8 @@ public class Patcher implements Opcodes {
     }
 
     static byte[] patchClass(String name, byte[] data) {
-        boolean target = name.equals(OPD) || name.equals(ATM) || name.equals(VU) || name.equals(VSH) || name.equals(PTE) || name.equals(TRN) || name.equals(GATE_IN) || name.equals(VEH) || name.equals(GATE_EXIT) || name.equals(TM) || name.equals(TBM) || name.equals(VUT) || name.equals(TLU) || name.equals(RPATH) || name.equals(LES) || name.equals("com/rinventor/ptm2/dimension/virtual/util/ScheduleUtils") || name.equals("com/rinventor/ptm2/dimension/digital/screens/ScheduleEditScreen") || name.equals("com/rinventor/ptm2/dimension/virtual/util/Departures") || name.equals("com/rinventor/ptm2/dimension/digital/screens/LineViewScreen") || name.equals("com/rinventor/ptm2/dimension/digital/panels/PlatformSchedulePanel") || name.equals("com/rinventor/ptm2/dimension/digital/screens/SchedulePreviewScreen") || name.equals("com/rinventor/ptm2/dimension/digital/screens/SchedulePreviewScreen$SchedulePreviewBox") || name.equals("com/rinventor/ptm2/dimension/virtual/systems/PlayerTracker") || name.equals("com/rinventor/ptm2/dimension/virtual/types/VDParkingZone") || name.equals("com/rinventor/ptm2/dimension/digital/panels/ParkingZonePanel") || name.equals("com/rinventor/ptm2/dimension/physical/TrafficManager") || name.equals("com/rinventor/ptm2/engine/base/PTMEntity") || name.equals("com/rinventor/ptm2/objects/entities/vehicle/car/Car") || name.equals("com/rinventor/ptm2/objects/entities/pedestrian/Pedestrian") || name.equals("com/rinventor/ptm2/dimension/physical/ParkingManager") || name.equals("com/rinventor/ptm2/objects/blockentities/traffic_point/TrafficPointRenderer");
+        boolean target = name.equals(OPD) || name.equals(ATM) || name.equals(VU) || name.equals(VSH) || name.equals(PTE) || name.equals(TRN) || name.equals(GATE_IN) || name.equals(VEH) || name.equals(GATE_EXIT) || name.equals(TM) || name.equals(TBM) || name.equals(VUT) || name.equals(TLU) || name.equals(RPATH) || name.equals(LES) || name.equals("com/rinventor/ptm2/dimension/virtual/util/ScheduleUtils") || name.equals("com/rinventor/ptm2/dimension/digital/screens/ScheduleEditScreen") || name.equals("com/rinventor/ptm2/dimension/virtual/util/Departures") || name.equals("com/rinventor/ptm2/dimension/digital/screens/LineViewScreen") || name.equals("com/rinventor/ptm2/dimension/digital/panels/PlatformSchedulePanel") || name.equals("com/rinventor/ptm2/dimension/digital/screens/SchedulePreviewScreen") || name.equals("com/rinventor/ptm2/dimension/digital/screens/SchedulePreviewScreen$SchedulePreviewBox") || name.equals("com/rinventor/ptm2/dimension/virtual/systems/PlayerTracker") || name.equals("com/rinventor/ptm2/dimension/virtual/types/VDParkingZone") || name.equals("com/rinventor/ptm2/dimension/digital/panels/ParkingZonePanel") || name.equals("com/rinventor/ptm2/dimension/physical/TrafficManager") || name.equals("com/rinventor/ptm2/engine/base/PTMEntity") || name.equals("com/rinventor/ptm2/objects/entities/vehicle/car/Car") || name.equals("com/rinventor/ptm2/objects/entities/pedestrian/Pedestrian") || name.equals("com/rinventor/ptm2/dimension/physical/ParkingManager") || name.equals("com/rinventor/ptm2/objects/blockentities/traffic_point/TrafficPointRenderer")
+            || name.equals("com/rinventor/ptm2/core/init/ModBlocks") || name.equals("com/rinventor/ptm2/core/init/ModItems") || name.equals("com/rinventor/ptm2/core/init/ModTabs");
         boolean flags = contains(data, "INDEFINITE_BANK_ACCOUNT") || contains(data, "INDEFINITE_TRANSPORT_CARD");
         if (!target && !flags) {
             return data;
@@ -690,6 +691,37 @@ public class Patcher implements Opcodes {
                     done.add("arrow-scale");
                     changed = true;
                 }
+            }
+        }
+        if (name.equals("com/rinventor/ptm2/core/init/ModBlocks")) {
+            // Регистрация блоков-секций табло направлений по полосам (см. PtmFixes.registerBoardBlocks)
+            final String DR = "com/rinventor/ptm2/platform/DeferredRegister";
+            InsnList il = new InsnList();
+            il.add(new FieldInsnNode(GETSTATIC, "com/rinventor/ptm2/core/init/ModBlocks", "BLOCKS", "L" + DR + ";"));
+            il.add(new MethodInsnNode(INVOKESTATIC, FIXES, "registerBoardBlocks", "(L" + DR + ";)V", false));
+            if (insertBeforeReturns(cn, "<clinit>", "()V", il)) {
+                done.add("board-blocks");
+                changed = true;
+            }
+        }
+        if (name.equals("com/rinventor/ptm2/core/init/ModItems")) {
+            final String DR = "com/rinventor/ptm2/platform/DeferredRegister";
+            InsnList il = new InsnList();
+            il.add(new FieldInsnNode(GETSTATIC, "com/rinventor/ptm2/core/init/ModItems", "ITEMS", "L" + DR + ";"));
+            il.add(new MethodInsnNode(INVOKESTATIC, FIXES, "registerBoardItems", "(L" + DR + ";)V", false));
+            if (insertBeforeReturns(cn, "<clinit>", "()V", il)) {
+                done.add("board-items");
+                changed = true;
+            }
+        }
+        if (name.equals("com/rinventor/ptm2/core/init/ModTabs")) {
+            InsnList il = new InsnList();
+            il.add(new VarInsnNode(ALOAD, 0));
+            il.add(new VarInsnNode(ALOAD, 2));
+            il.add(new MethodInsnNode(INVOKESTATIC, FIXES, "creativeExtra", "(Ljava/lang/Object;Ljava/lang/Object;)V", false));
+            if (insertBeforeReturns(cn, "addCreative", "(Lnet/minecraft/world/item/CreativeModeTab;Lnet/minecraft/resources/ResourceKey;Ljava/util/function/Consumer;)V", il)) {
+                done.add("board-tab");
+                changed = true;
             }
         }
         if (name.equals("com/rinventor/ptm2/objects/entities/vehicle/Vehicle")) {
@@ -1775,6 +1807,38 @@ public class Patcher implements Opcodes {
         ClassWriter cw = new ClassWriter(ClassWriter.COMPUTE_MAXS);
         cn.accept(cw);
         return cw.toByteArray();
+    }
+
+    /** Вставляет копию списка инструкций перед каждым RETURN метода (метод может завершаться в нескольких местах). */
+    static boolean insertBeforeReturns(ClassNode cn, String method, String desc, InsnList list) {
+        for (MethodNode m : cn.methods) {
+            if (m.name.equals(method) && m.desc.equals(desc)) {
+                int n = 0;
+                for (AbstractInsnNode in : m.instructions.toArray()) {
+                    if (in.getOpcode() == RETURN) {
+                        InsnList copy = new InsnList();
+                        for (AbstractInsnNode src : list.toArray()) {
+                            if (src instanceof MethodInsnNode) {
+                                MethodInsnNode mi = (MethodInsnNode) src;
+                                copy.add(new MethodInsnNode(mi.getOpcode(), mi.owner, mi.name, mi.desc, mi.itf));
+                            } else if (src instanceof FieldInsnNode) {
+                                FieldInsnNode fi = (FieldInsnNode) src;
+                                copy.add(new FieldInsnNode(fi.getOpcode(), fi.owner, fi.name, fi.desc));
+                            } else if (src instanceof VarInsnNode) {
+                                copy.add(new VarInsnNode(src.getOpcode(), ((VarInsnNode) src).var));
+                            } else {
+                                copy.add(src.clone(new java.util.HashMap<>()));
+                            }
+                        }
+                        m.instructions.insertBefore(in, copy);
+                        n++;
+                    }
+                }
+                return n > 0;
+            }
+        }
+        System.err.println("method not found: " + cn.name + "." + method + desc);
+        return false;
     }
 
     static boolean insertAtStart(ClassNode cn, String method, String desc, InsnList list) {

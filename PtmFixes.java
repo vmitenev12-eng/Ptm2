@@ -86,7 +86,7 @@ public final class PtmFixes {
      * 1) даёт название станциям, у которых его нет;
      * 2) привязывает каждую платформу к станции, в зоне которой она находится.
      */
-    public static final String BUILD = "fixes-2026-11-17-pdd3";
+    public static final String BUILD = "fixes-2026-11-18-boards";
     private static boolean announced = false;
 
     public static void tick(Level level) {
@@ -4016,6 +4016,114 @@ public final class PtmFixes {
     private static volatile java.util.Map<Object, Integer> LANE_SIGN_BLOCKS;
     private static volatile java.util.Map<Object, Integer> LANE_ARROW_BLOCKS;
 
+    // ======================================================================
+    //  Табло направлений по полосам (конструктор): набор блоков-секций. Каждая секция - одна полоса с набором стрелок и позиция
+    //  (одиночная, левая, средняя, правая). Секции ставятся рядом и образуют цельное табло, как на знаках ПДД.
+    //  Блоки регистрируются в реестрах мода дополнительными вызовами; текстуры, модели и переводы лежат в extra-assets.zip.
+    //  Каждая секция читается ИИ как колонка (см. laneDirMask), поэтому табло работает так же, как ряд отдельных знаков.
+    // ======================================================================
+
+    private static final String[] BOARD_CODES = {"L", "S", "R", "LR", "SL", "SR", "SLR", "SU", "U", "LU", "DL", "DR", "SDL", "SDR"};
+    private static final String[] BOARD_POS = {"s", "l", "m", "r"};
+
+    private static String boardName(String code, String pos) {
+        return "lane_board_" + code.toLowerCase() + "_" + pos;
+    }
+
+    public static void registerBoardBlocks(com.rinventor.ptm2.platform.DeferredRegister<net.minecraft.world.level.block.Block> blocks) {
+        for (String code : BOARD_CODES) {
+            for (String pos : BOARD_POS) {
+                blocks.register(boardName(code, pos), com.rinventor.ptm2.objects.blocks.SignSquare::new);
+            }
+        }
+    }
+
+    public static void registerBoardItems(com.rinventor.ptm2.platform.DeferredRegister<net.minecraft.world.item.Item> items) {
+        for (String code : BOARD_CODES) {
+            for (String pos : BOARD_POS) {
+                final String name = boardName(code, pos);
+                items.register(name, () -> new net.minecraft.world.item.BlockItem(boardBlock(name), new net.minecraft.world.item.Item.Properties()));
+            }
+        }
+    }
+
+    private static Object forgeRegistryValue(String registryField, String name) throws ReflectiveOperationException {
+        Object reg = Class.forName("net.minecraftforge.registries.ForgeRegistries").getField(registryField).get(null);
+        Class<?> rlc = Class.forName("net.minecraft.resources.ResourceLocation");
+        Object rl = rlc.getConstructor(String.class, String.class).newInstance("ptm2", name);
+        return Class.forName("net.minecraftforge.registries.IForgeRegistry").getMethod("getValue", rlc).invoke(reg, rl);
+    }
+
+    private static net.minecraft.world.level.block.Block boardBlock(String name) {
+        try {
+            return (net.minecraft.world.level.block.Block) forgeRegistryValue("BLOCKS", name);
+        } catch (Throwable t) {
+            throw new IllegalStateException("не найден блок табло " + name, t);
+        }
+    }
+
+    /** ModTabs.addCreative: после обычного набора вкладки знаков добавляются секции табло. */
+    public static void creativeExtra(Object tab, Object accept) {
+        try {
+            if (tab != com.rinventor.ptm2.core.init.ModTabs.SIGNS_TAB.get()) {
+                return;
+            }
+            @SuppressWarnings("unchecked")
+            java.util.function.Consumer<Object> acc = (java.util.function.Consumer<Object>) accept;
+            for (String code : BOARD_CODES) {
+                for (String pos : BOARD_POS) {
+                    Object item = forgeRegistryValue("ITEMS", boardName(code, pos));
+                    if (item != null) {
+                        acc.accept(item);
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            // вкладка останется без табло, игра работает
+        }
+    }
+
+    private static int boardMask(String code) {
+        int s = 1;
+        int l = (1 << 5) | (1 << 6);
+        int r = (1 << 2) | (1 << 3);
+        int u = 1 << 4;
+        int dl = 1 << 7;
+        int dr = 1 << 1;
+        switch (code) {
+            case "L":
+                return l;
+            case "S":
+                return s;
+            case "R":
+                return r;
+            case "LR":
+                return l | r;
+            case "SL":
+                return s | l;
+            case "SR":
+                return s | r;
+            case "SLR":
+                return s | l | r;
+            case "SU":
+                return s | u;
+            case "U":
+                return u;
+            case "LU":
+                return l | u;
+            case "DL":
+                return dl;
+            case "DR":
+                return dr;
+            case "SDL":
+                return s | dl;
+            case "SDR":
+                return s | dr;
+            default:
+                return 0;
+        }
+    }
+
     private static int dirMaskOfName(String core) {
         int mask = 0;
         String c = core;
@@ -4105,6 +4213,18 @@ public final class PtmFixes {
             }
         } catch (Throwable t) {
             // нет данных - ограничений нет
+        }
+        try {
+            for (String code : BOARD_CODES) {
+                for (String pos : BOARD_POS) {
+                    Object blk = forgeRegistryValue("BLOCKS", boardName(code, pos));
+                    if (blk != null) {
+                        signs.put(blk, boardMask(code));
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            // табло нет в этой сборке
         }
         LANE_SIGN_BLOCKS = signs;
         LANE_ARROW_BLOCKS = arrows;

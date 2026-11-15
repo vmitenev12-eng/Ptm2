@@ -92,7 +92,7 @@ jobs:
             echo "ru_ru.json not found, skipping"
           fi
 
-      - name: Add extra assets (lane board blocks: textures, models, blockstates, English names)
+      - name: Add extra assets
         run: |
           if [ -f extra-assets.zip ]; then
             mkdir -p tmpassets

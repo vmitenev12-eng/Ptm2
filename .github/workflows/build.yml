@@ -92,6 +92,17 @@ jobs:
             echo "ru_ru.json not found, skipping"
           fi
 
+      - name: Add extra assets (lane board blocks: textures, models, blockstates, English names)
+        run: |
+          if [ -f extra-assets.zip ]; then
+            mkdir -p tmpassets
+            unzip -q -o extra-assets.zip -d tmpassets
+            (cd tmpassets && zip -q -r ../out/ptm2-patched.jar assets)
+            unzip -l out/ptm2-patched.jar | grep -c "lane_board_" || true
+          else
+            echo "extra-assets.zip not found, skipping"
+          fi
+
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}

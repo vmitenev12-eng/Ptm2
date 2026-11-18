@@ -86,7 +86,7 @@ public final class PtmFixes {
      * 1) даёт название станциям, у которых его нет;
      * 2) привязывает каждую платформу к станции, в зоне которой она находится.
      */
-    public static final String BUILD = "fixes-2026-11-18-boards";
+    public static final String BUILD = "fixes-2026-11-19-laneboard";
     private static boolean announced = false;
 
     public static void tick(Level level) {
@@ -4017,52 +4017,12 @@ public final class PtmFixes {
     private static volatile java.util.Map<Object, Integer> LANE_ARROW_BLOCKS;
 
     // ======================================================================
-    //  Табло направлений по полосам (конструктор): набор блоков-секций. Каждая секция - одна полоса с набором стрелок и позиция
-    //  (одиночная, левая, средняя, правая). Секции ставятся рядом и образуют цельное табло, как на знаках ПДД.
-    //  Блоки регистрируются в реестрах мода дополнительными вызовами; текстуры, модели и переводы лежат в extra-assets.zip.
-    //  Каждая секция читается ИИ как колонка (см. laneDirMask), поэтому табло работает так же, как ряд отдельных знаков.
+    //  Табло направлений по полосам (блок с окном настройки): классы лежат в пакете fixes.board
+    //  (LaneBoardBlock, LaneBoardBlockEntity, LaneBoardRenderer, LaneBoardScreen, LaneBoardPacket, LaneBoardRegistry).
+    //  Здесь остаётся только добавление предмета во вкладку знаков и чтение полос табло ИИ.
     // ======================================================================
 
-    private static final String[] BOARD_CODES = {"L", "S", "R", "LR", "SL", "SR", "SLR", "SU", "U", "LU", "DL", "DR", "SDL", "SDR"};
-    private static final String[] BOARD_POS = {"s", "l", "m", "r"};
-
-    private static String boardName(String code, String pos) {
-        return "lane_board_" + code.toLowerCase() + "_" + pos;
-    }
-
-    public static void registerBoardBlocks(com.rinventor.ptm2.platform.DeferredRegister<net.minecraft.world.level.block.Block> blocks) {
-        for (String code : BOARD_CODES) {
-            for (String pos : BOARD_POS) {
-                blocks.register(boardName(code, pos), com.rinventor.ptm2.objects.blocks.SignSquare::new);
-            }
-        }
-    }
-
-    public static void registerBoardItems(com.rinventor.ptm2.platform.DeferredRegister<net.minecraft.world.item.Item> items) {
-        for (String code : BOARD_CODES) {
-            for (String pos : BOARD_POS) {
-                final String name = boardName(code, pos);
-                items.register(name, () -> new net.minecraft.world.item.BlockItem(boardBlock(name), new net.minecraft.world.item.Item.Properties()));
-            }
-        }
-    }
-
-    private static Object forgeRegistryValue(String registryField, String name) throws ReflectiveOperationException {
-        Object reg = Class.forName("net.minecraftforge.registries.ForgeRegistries").getField(registryField).get(null);
-        Class<?> rlc = Class.forName("net.minecraft.resources.ResourceLocation");
-        Object rl = rlc.getConstructor(String.class, String.class).newInstance("ptm2", name);
-        return Class.forName("net.minecraftforge.registries.IForgeRegistry").getMethod("getValue", rlc).invoke(reg, rl);
-    }
-
-    private static net.minecraft.world.level.block.Block boardBlock(String name) {
-        try {
-            return (net.minecraft.world.level.block.Block) forgeRegistryValue("BLOCKS", name);
-        } catch (Throwable t) {
-            throw new IllegalStateException("не найден блок табло " + name, t);
-        }
-    }
-
-    /** ModTabs.addCreative: после обычного набора вкладки знаков добавляются секции табло. */
+    /** ModTabs.addCreative: после обычного набора вкладки знаков добавляется предмет табло. */
     public static void creativeExtra(Object tab, Object accept) {
         try {
             if (tab != com.rinventor.ptm2.core.init.ModTabs.SIGNS_TAB.get()) {
@@ -4070,57 +4030,11 @@ public final class PtmFixes {
             }
             @SuppressWarnings("unchecked")
             java.util.function.Consumer<Object> acc = (java.util.function.Consumer<Object>) accept;
-            for (String code : BOARD_CODES) {
-                for (String pos : BOARD_POS) {
-                    Object item = forgeRegistryValue("ITEMS", boardName(code, pos));
-                    if (item != null) {
-                        acc.accept(item);
-                    }
-                }
+            if (com.rinventor.ptm2.fixes.board.LaneBoardRegistry.ITEM != null) {
+                acc.accept(com.rinventor.ptm2.fixes.board.LaneBoardRegistry.ITEM.get());
             }
         } catch (Throwable t) {
             // вкладка останется без табло, игра работает
-        }
-    }
-
-    private static int boardMask(String code) {
-        int s = 1;
-        int l = (1 << 5) | (1 << 6);
-        int r = (1 << 2) | (1 << 3);
-        int u = 1 << 4;
-        int dl = 1 << 7;
-        int dr = 1 << 1;
-        switch (code) {
-            case "L":
-                return l;
-            case "S":
-                return s;
-            case "R":
-                return r;
-            case "LR":
-                return l | r;
-            case "SL":
-                return s | l;
-            case "SR":
-                return s | r;
-            case "SLR":
-                return s | l | r;
-            case "SU":
-                return s | u;
-            case "U":
-                return u;
-            case "LU":
-                return l | u;
-            case "DL":
-                return dl;
-            case "DR":
-                return dr;
-            case "SDL":
-                return s | dl;
-            case "SDR":
-                return s | dr;
-            default:
-                return 0;
         }
     }
 
@@ -4214,21 +4128,34 @@ public final class PtmFixes {
         } catch (Throwable t) {
             // нет данных - ограничений нет
         }
-        try {
-            for (String code : BOARD_CODES) {
-                for (String pos : BOARD_POS) {
-                    Object blk = forgeRegistryValue("BLOCKS", boardName(code, pos));
-                    if (blk != null) {
-                        signs.put(blk, boardMask(code));
-                    }
-                }
-            }
-        } catch (Throwable t) {
-            // табло нет в этой сборке
-        }
         LANE_SIGN_BLOCKS = signs;
         LANE_ARROW_BLOCKS = arrows;
         PTMLogger.info("PTM2 ПДД: знаков направлений по полосам " + signs.size() + ", стрелок разметки " + arrows.size());
+    }
+
+    /** Табло направлений по полосам: каждая полоса табло - колонка; полосы слева направо по взгляду водителя, по полблока на полосу. */
+    private static void addBoardColumns(Level level, DirScan res, int x, int y, int z, double lat, int head) {
+        try {
+            int rot = com.rinventor.ptm2.engine.base.PTMBlock.getIProperty("rotation", level, (double) x, (double) y, (double) z);
+            if (rot != head) {
+                return;
+            }
+            Object be = srg(level, "m_7702_", blockPosOf(x, y, z));
+            if (!(be instanceof com.rinventor.ptm2.fixes.board.LaneBoardBlockEntity)) {
+                return;
+            }
+            List<String> lanes = com.rinventor.ptm2.fixes.board.LaneBoardData.parse(((com.rinventor.ptm2.fixes.board.LaneBoardBlockEntity) be).getLanes());
+            int n = lanes.size();
+            for (int i = 0; i < n; i++) {
+                DirCol col = new DirCol();
+                col.mask = com.rinventor.ptm2.fixes.board.LaneBoardData.mask(lanes.get(i));
+                col.lat = lat + (i - (n - 1) / 2.0D) * 0.5D;
+                col.sign = true;
+                res.cols.add(col);
+            }
+        } catch (Throwable t) {
+            // нет табло или данных: ничего не добавляем
+        }
     }
 
     private static final class DirCol {
@@ -4358,6 +4285,10 @@ public final class PtmFixes {
                     for (int dy = -1; dy <= 8; dy++) {
                         Object blk = com.rinventor.ptm2.engine.base.PTMBlock.getBlock(level, (double) (ex + dx), (double) (ey + dy), (double) (ez + dz));
                         if (blk == null) {
+                            continue;
+                        }
+                        if (com.rinventor.ptm2.fixes.board.LaneBoardRegistry.BLOCK != null && blk == com.rinventor.ptm2.fixes.board.LaneBoardRegistry.BLOCK.get()) {
+                            addBoardColumns(level, res, ex + dx, ey + dy, ez + dz, lat, head);
                             continue;
                         }
                         boolean little = blk.getClass().getName().startsWith("team.creative.littletiles.");

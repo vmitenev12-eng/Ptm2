@@ -136,7 +136,7 @@ public class Patcher implements Opcodes {
         if (mismatch) {
             System.exit(1);
         }
-        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay", "gate-bankcard", "boarding-fare", "gate-exit-radius", "gate-exit-auto", "gate-in-radius", "terminal-cap", "arrival-reach", "arrival-inside", "lamp-cap", "red-commit", "patience", "bypass-still", "merge-check", "player-ahead", "merge-width", "parallel-width", "auto-links", "link-revision", "bus-priority", "validator", "wheel-filter", "hull", "depot-ui", "depot-select", "schedule-toggle", "schedule-edit", "editor-updateOptions", "editor-updateRouteList1", "editor-updateRouteList2", "editor-createRow1", "editor-createRow2", "editor-add", "editor-tick", "day-options", "day-loops", "day-today", "preview-columns", "preview-click", "stop-pocket", "range-transportRange", "range-trafficRange", "range-near", "range-track", "zone-save", "zone-prop", "zone-load", "zone-ui", "zone-spawn", "zone-spawnlog", "zone-spawned", "zone-despawnreason", "car-deadends", "car-route", "ped-script", "park-static", "arrow-scale", "board-blocks", "board-items", "board-tab", "veh-tick", "zone-keep", "zone-despawn", "board-arriving", "schedule-screen", "schedule-real", "schedule-cache", "depot-order", "depot-spawn", "depot-spawn2", "garage-fleet", "depot-park", "depot-return", "terminal-pax", "depot-clear", "depot-crash", "gravity-reset"};
+        String[] required = {"hook-tick", "atm-amount", "value-update-filter", "diag-hook", "remove-hook", "despawn-hook", "driver-delay", "gate-bankcard", "boarding-fare", "gate-exit-radius", "gate-exit-auto", "gate-in-radius", "terminal-cap", "arrival-reach", "arrival-inside", "lamp-cap", "red-commit", "patience", "bypass-still", "merge-check", "player-ahead", "merge-width", "parallel-width", "auto-links", "link-revision", "bus-priority", "validator", "wheel-filter", "hull", "depot-ui", "depot-select", "schedule-toggle", "schedule-edit", "editor-updateOptions", "editor-updateRouteList1", "editor-updateRouteList2", "editor-createRow1", "editor-createRow2", "editor-add", "editor-tick", "day-options", "day-loops", "day-today", "preview-columns", "preview-click", "stop-pocket", "range-transportRange", "range-trafficRange", "range-near", "range-track", "zone-save", "zone-prop", "zone-load", "zone-ui", "zone-spawn", "zone-spawnlog", "zone-spawned", "zone-despawnreason", "car-deadends", "car-route", "ped-script", "park-static", "arrow-scale", "board-blocks", "board-items", "board-tab", "board-entity", "board-render", "veh-tick", "zone-keep", "zone-despawn", "board-arriving", "schedule-screen", "schedule-real", "schedule-cache", "depot-order", "depot-spawn", "depot-spawn2", "garage-fleet", "depot-park", "depot-return", "terminal-pax", "depot-clear", "depot-crash", "gravity-reset"};
         for (String r : required) {
             if (!done.contains(r)) {
                 System.err.println("ERROR: patch not applied: " + r);
@@ -159,7 +159,8 @@ public class Patcher implements Opcodes {
 
     static byte[] patchClass(String name, byte[] data) {
         boolean target = name.equals(OPD) || name.equals(ATM) || name.equals(VU) || name.equals(VSH) || name.equals(PTE) || name.equals(TRN) || name.equals(GATE_IN) || name.equals(VEH) || name.equals(GATE_EXIT) || name.equals(TM) || name.equals(TBM) || name.equals(VUT) || name.equals(TLU) || name.equals(RPATH) || name.equals(LES) || name.equals("com/rinventor/ptm2/dimension/virtual/util/ScheduleUtils") || name.equals("com/rinventor/ptm2/dimension/digital/screens/ScheduleEditScreen") || name.equals("com/rinventor/ptm2/dimension/virtual/util/Departures") || name.equals("com/rinventor/ptm2/dimension/digital/screens/LineViewScreen") || name.equals("com/rinventor/ptm2/dimension/digital/panels/PlatformSchedulePanel") || name.equals("com/rinventor/ptm2/dimension/digital/screens/SchedulePreviewScreen") || name.equals("com/rinventor/ptm2/dimension/digital/screens/SchedulePreviewScreen$SchedulePreviewBox") || name.equals("com/rinventor/ptm2/dimension/virtual/systems/PlayerTracker") || name.equals("com/rinventor/ptm2/dimension/virtual/types/VDParkingZone") || name.equals("com/rinventor/ptm2/dimension/digital/panels/ParkingZonePanel") || name.equals("com/rinventor/ptm2/dimension/physical/TrafficManager") || name.equals("com/rinventor/ptm2/engine/base/PTMEntity") || name.equals("com/rinventor/ptm2/objects/entities/vehicle/car/Car") || name.equals("com/rinventor/ptm2/objects/entities/pedestrian/Pedestrian") || name.equals("com/rinventor/ptm2/dimension/physical/ParkingManager") || name.equals("com/rinventor/ptm2/objects/blockentities/traffic_point/TrafficPointRenderer")
-            || name.equals("com/rinventor/ptm2/core/init/ModBlocks") || name.equals("com/rinventor/ptm2/core/init/ModItems") || name.equals("com/rinventor/ptm2/core/init/ModTabs");
+            || name.equals("com/rinventor/ptm2/core/init/ModBlocks") || name.equals("com/rinventor/ptm2/core/init/ModItems") || name.equals("com/rinventor/ptm2/core/init/ModTabs")
+            || name.equals("com/rinventor/ptm2/core/init/ModBlockEntities") || name.equals("com/rinventor/ptm2/client/RenderHandler");
         boolean flags = contains(data, "INDEFINITE_BANK_ACCOUNT") || contains(data, "INDEFINITE_TRANSPORT_CARD");
         if (!target && !flags) {
             return data;
@@ -698,7 +699,7 @@ public class Patcher implements Opcodes {
             final String DR = "com/rinventor/ptm2/platform/DeferredRegister";
             InsnList il = new InsnList();
             il.add(new FieldInsnNode(GETSTATIC, "com/rinventor/ptm2/core/init/ModBlocks", "BLOCKS", "L" + DR + ";"));
-            il.add(new MethodInsnNode(INVOKESTATIC, FIXES, "registerBoardBlocks", "(L" + DR + ";)V", false));
+            il.add(new MethodInsnNode(INVOKESTATIC, "com/rinventor/ptm2/fixes/board/LaneBoardRegistry", "registerBlock", "(L" + DR + ";)V", false));
             if (insertBeforeReturns(cn, "<clinit>", "()V", il)) {
                 done.add("board-blocks");
                 changed = true;
@@ -708,7 +709,7 @@ public class Patcher implements Opcodes {
             final String DR = "com/rinventor/ptm2/platform/DeferredRegister";
             InsnList il = new InsnList();
             il.add(new FieldInsnNode(GETSTATIC, "com/rinventor/ptm2/core/init/ModItems", "ITEMS", "L" + DR + ";"));
-            il.add(new MethodInsnNode(INVOKESTATIC, FIXES, "registerBoardItems", "(L" + DR + ";)V", false));
+            il.add(new MethodInsnNode(INVOKESTATIC, "com/rinventor/ptm2/fixes/board/LaneBoardRegistry", "registerItem", "(L" + DR + ";)V", false));
             if (insertBeforeReturns(cn, "<clinit>", "()V", il)) {
                 done.add("board-items");
                 changed = true;
@@ -721,6 +722,25 @@ public class Patcher implements Opcodes {
             il.add(new MethodInsnNode(INVOKESTATIC, FIXES, "creativeExtra", "(Ljava/lang/Object;Ljava/lang/Object;)V", false));
             if (insertBeforeReturns(cn, "addCreative", "(Lnet/minecraft/world/item/CreativeModeTab;Lnet/minecraft/resources/ResourceKey;Ljava/util/function/Consumer;)V", il)) {
                 done.add("board-tab");
+                changed = true;
+            }
+        }
+        if (name.equals("com/rinventor/ptm2/core/init/ModBlockEntities")) {
+            final String DR = "com/rinventor/ptm2/platform/DeferredRegister";
+            InsnList il = new InsnList();
+            il.add(new FieldInsnNode(GETSTATIC, "com/rinventor/ptm2/core/init/ModBlockEntities", "BLOCK_ENTITIES", "L" + DR + ";"));
+            il.add(new MethodInsnNode(INVOKESTATIC, "com/rinventor/ptm2/fixes/board/LaneBoardRegistry", "registerEntity", "(L" + DR + ";)V", false));
+            if (insertBeforeReturns(cn, "<clinit>", "()V", il)) {
+                done.add("board-entity");
+                changed = true;
+            }
+        }
+        if (name.equals("com/rinventor/ptm2/client/RenderHandler")) {
+            InsnList il = new InsnList();
+            il.add(new VarInsnNode(ALOAD, 0));
+            il.add(new MethodInsnNode(INVOKESTATIC, "com/rinventor/ptm2/fixes/board/LaneBoardClient", "registerRenderer", "(Lcom/rinventor/ptm2/platform/PlatformRenderRegistry;)V", false));
+            if (insertBeforeReturns(cn, "clientSetup", "(Lcom/rinventor/ptm2/platform/PlatformRenderRegistry;)V", il)) {
+                done.add("board-render");
                 changed = true;
             }
         }

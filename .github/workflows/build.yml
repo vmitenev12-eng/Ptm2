@@ -36,6 +36,8 @@ jobs:
         run: |
           mkdir -p src/main/java/com/rinventor/ptm2/fixes
           cp PtmFixes.java src/main/java/com/rinventor/ptm2/fixes/PtmFixes.java
+          mkdir -p src/main/java/com/rinventor/ptm2/fixes/board
+          cp board/*.java src/main/java/com/rinventor/ptm2/fixes/board/
           cat > settings.gradle <<'EOT'
           pluginManagement {
               repositories {
@@ -92,7 +94,7 @@ jobs:
             echo "ru_ru.json not found, skipping"
           fi
 
-      - name: Add extra assets
+      - name: Add extra assets (lane board blocks: textures, models, blockstates, English names)
         run: |
           if [ -f extra-assets.zip ]; then
             mkdir -p tmpassets

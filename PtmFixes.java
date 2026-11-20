@@ -86,7 +86,7 @@ public final class PtmFixes {
      * 1) даёт название станциям, у которых его нет;
      * 2) привязывает каждую платформу к станции, в зоне которой она находится.
      */
-    public static final String BUILD = "fixes-2026-11-19-laneboard";
+    public static final String BUILD = "fixes-2026-11-20-pdd4-little";
     private static boolean announced = false;
 
     public static void tick(Level level) {
@@ -3983,7 +3983,7 @@ public final class PtmFixes {
     private static boolean turnBanned(Level level, VDTrafficLane from, VDTrafficLane to) {
         try {
             int h1 = laneHead8(from, false);
-            int h2 = laneHead8(to, true);
+            int h2 = laneHead8(to, false);
             int diff = ((h2 - h1) % 8 + 8) % 8;
             boolean right = diff == 2 || diff == 3;
             boolean left = diff == 5 || diff == 6;
@@ -4452,10 +4452,110 @@ public final class PtmFixes {
             if (mask == 0) {
                 return true;
             }
-            int diff = ((laneHead8(to, true) - laneHead8(from, false)) % 8 + 8) % 8;
+            // манёвр определяется курсом КОНЦА следующей полосы: поворотная кривая начинается по касательной (курс как у прямой)
+            int diff = ((laneHead8(to, false) - laneHead8(from, false)) % 8 + 8) % 8;
             return ((mask >> diff) & 1) != 0;
         } catch (Throwable t) {
             return true;
+        }
+    }
+
+    // ======================================================================
+    //  Слой «что за блок»: блоки LittleTiles, части которых сделаны из блоков тротуара ptm2, регистрируются как тротуар,
+    //  чтобы пешеходы ходили по ним. Мягкая зависимость: без LittleTiles ничего не происходит. Работает рядом с игроками (до 5 чанков).
+    // ======================================================================
+
+    private static volatile long littleScanAt;
+    private static volatile Boolean littlePresent;
+
+    private static boolean isSidewalkBlock(Object b) {
+        return b instanceof com.rinventor.ptm2.objects.blocks.SidewalkBlock || b instanceof com.rinventor.ptm2.objects.blocks.SidewalkSlab
+            || b instanceof com.rinventor.ptm2.objects.blocks.WalkableFloor || b instanceof com.rinventor.ptm2.objects.blocks.WalkableFloorSlab;
+    }
+
+    /** Верх частей из блоков тротуара в доле блока (0..1) или -1, если таких частей в блоке LittleTiles нет. */
+    private static double littleSidewalkTop(Object be) {
+        double top = -1.0D;
+        try {
+            Object grid = be.getClass().getMethod("getGrid").invoke(be);
+            double count = ((Integer) grid.getClass().getField("count").get(grid)).doubleValue();
+            Object itr = be.getClass().getMethod("allTiles").invoke(be);
+            int n = 0;
+            for (Object pr : (Iterable<?>) itr) {
+                if (++n > 200) {
+                    break;
+                }
+                Object tile = ((java.util.Map.Entry<?, ?>) pr).getValue();
+                Object state = tile.getClass().getMethod("getState").invoke(tile);
+                if (!isSidewalkBlock(srg(state, "m_60734_"))) {
+                    continue;
+                }
+                for (Object box : (Iterable<?>) tile) {
+                    double mt = ((Integer) box.getClass().getField("maxY").get(box)).doubleValue() / count;
+                    top = Math.max(top, mt);
+                }
+            }
+        } catch (Throwable t) {
+            return -1.0D;
+        }
+        return top;
+    }
+
+    private static void littleBridgeTick(Level level, long now) {
+        if (now - littleScanAt < 5000L || Boolean.FALSE.equals(littlePresent) || !cfgBool("littletiles", true)) {
+            return;
+        }
+        littleScanAt = now;
+        try {
+            if (littlePresent == null) {
+                try {
+                    Class.forName("team.creative.littletiles.common.block.entity.BETiles");
+                    littlePresent = Boolean.TRUE;
+                    PTMLogger.info("PTM2: найден LittleTiles, блоки из частей тротуара ptm2 будут регистрироваться как тротуар");
+                } catch (ClassNotFoundException e) {
+                    littlePresent = Boolean.FALSE;
+                    return;
+                }
+            }
+            java.util.Set<Long> visited = new java.util.HashSet<>();
+            int added = 0;
+            int removed = 0;
+            for (Player pl : PTMWorld.getPlayers(level)) {
+                int pcx = (int) Math.floor(PTMEntity.getX(pl)) >> 4;
+                int pcz = (int) Math.floor(PTMEntity.getZ(pl)) >> 4;
+                for (int cx = pcx - 5; cx <= pcx + 5; cx++) {
+                    for (int cz = pcz - 5; cz <= pcz + 5; cz++) {
+                        long ck = ((long) cx << 32) ^ (cz & 0xFFFFFFFFL);
+                        if (!visited.add(ck) || !chunksLoaded(level, cx * 16 + 8, cz * 16 + 8, 7)) {
+                            continue;
+                        }
+                        Object chunk = srg(level, "m_6325_", cx, cz);
+                        java.util.Map<?, ?> bes = (java.util.Map<?, ?>) srg(chunk, "m_62954_");
+                        for (java.util.Map.Entry<?, ?> en : new ArrayList<>(bes.entrySet())) {
+                            Object be = en.getValue();
+                            if (be == null || !be.getClass().getName().endsWith(".BETiles")) {
+                                continue;
+                            }
+                            net.minecraft.core.BlockPos bp = (net.minecraft.core.BlockPos) en.getKey();
+                            double top = littleSidewalkTop(be);
+                            String cur = com.rinventor.ptm2.dimension.virtual.storage.VDStorageHandler.get(level, bp, VDMemoryIDs.SIDEWALK_BLOCK);
+                            if (top >= 0.0D && cur == null) {
+                                com.rinventor.ptm2.dimension.virtual.storage.VDStorageHandler.update(level, bp,
+                                    (new com.rinventor.ptm2.dimension.virtual.types.VDSidewalkBlock(top <= 0.75D, true)).toString());
+                                added++;
+                            } else if (top < 0.0D && cur != null) {
+                                com.rinventor.ptm2.dimension.virtual.storage.VDStorageHandler.remove(level, bp, VDMemoryIDs.SIDEWALK_BLOCK);
+                                removed++;
+                            }
+                        }
+                    }
+                }
+            }
+            if (added + removed > 0) {
+                PTMLogger.info("PTM2 LittleTiles: тротуар добавлено " + added + ", убрано " + removed);
+            }
+        } catch (Throwable t) {
+            PTMLogger.warn("PTM2 LittleTiles: ошибка сканирования: " + t);
         }
     }
 
@@ -4497,8 +4597,18 @@ public final class PtmFixes {
             }
             ok.add(o);
         }
+        if (!ok.isEmpty() && ok.size() < list.size() && from != null && PDD_LOGGED.size() < 300 && PDD_LOGGED.add(laneKey(from) + ok.size())) {
+            try {
+                double[] e = posOnLane(from, laneLen(from));
+                PTMLogger.info("PTM2 ПДД: у полосы " + at(e[0], e[1], e[2]) + " из " + list.size() + " вариантов остаются " + ok.size());
+            } catch (Throwable t) {
+                // журнал не критичен
+            }
+        }
         return ok.isEmpty() ? list : ok;
     }
+
+    private static final java.util.Set<String> PDD_LOGGED = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     public static List<?> connectedFix(Object car, List<?> orig, Object posObj, Object endObj, Object laneObj) {
         try {
@@ -6388,6 +6498,7 @@ public final class PtmFixes {
         vcarTickAt = now;
         lotSweep(level, now);
         orphanSweep(level, now);
+        littleBridgeTick(level, now);
         try {
             Object[] zd = zoneData(level);
             List<?> zones = (List<?>) zd[0];

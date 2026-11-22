@@ -27,11 +27,23 @@
 - Учесть все вариации миниблоков из блоков дорог и тротуаров: разные формы и размеры, диагональные и прочие.
 - На миниблоках, как на оригинальных блоках, должны ставиться маршрутные стрелки, разметка и прочее.
 
-### Что уже найдено (сессия 4)
-- Исходники лежат в `_docs/littletiles/` (LittleTiles-1.20.zip = 1.6.0-pre161, CreativeCore-1.20.zip = 2.12.30), это настоящие исходники, не декомпиляция.
-- Модель LittleTiles: блок-сущность `BETiles` -> `allTiles()` -> `LittleTile` (= обычный `BlockState` + цвет + список `LittleBox`). Размеры в сетке `LittleGrid` (`count` клеток на блок). Диагональные части — `LittleTransformableBox` (наследник `LittleBox`, наклон хранится в данных углов).
-- В `PtmFixes.java` уже есть: `littleBlocks()` (читает состояния частей), слой тротуара `littleBridgeTick()` (регистрирует блок как `SIDEWALK_BLOCK` по верху частей-тротуаров) и чтение знаков/стрелок в `scanDirCols()`. Ограничения сейчас: форма и размер частей не учитываются; у частей знаков/стрелок направление берётся по курсу полосы, а не по самой части; разметка частей (`ROAD_MARKING`), дорога и переходы в хранилище не регистрируются — поэтому машины не слушаются разметки на миниблоках.
-- Блокер: нет исходников/декомпиляции самого ptm2 (классы блоков дороги, разметки, перехода, `VDRoadMarking`, `VDStorageHandler`). Положить в `_docs/ptm2/`.
+### Что найдено (сессия 4)
+Исходники: `_docs/littletiles/` (LittleTiles 1.6.0-pre161, CreativeCore 2.12.30 — настоящие исходники), `_docs/ptm2/` (декомпиляция ptm2 0.6.6.1, если загружена; иначе распаковывать из присланного zip).
+
+LittleTiles:
+- `BETiles.allTiles()` -> `Pair<IParentCollection, LittleTile>` (Pair реализует `Map.Entry`). `LittleTile` = `BlockState` + цвет + список `LittleBox` (итерируется). Сетка `BETiles.getGrid().count`. Диагональные части — `LittleTransformableBox` (наследник `LittleBox`).
+- `LittleMCBlock.rotate/mirror` возвращают состояние без изменений: свойство `rotation` у части = то, что было в состоянии при захвате.
+
+ptm2 (как блок «становится» разметкой/знаком):
+- Регистрация идёт при установке блока (`onPlace`, `m_6807_`) в `VDStorageHandler.update(level, pos, ...)`: `RoadMarking` -> `VDRoadMarking(type, rot8)` (тип по имени блока: pedestrian=CROSSING, stop/triangles=STOP, bus, zig_zag, half, double, line, restricted, platform) или `VDTrafficMarker` (стрелки, через `VDUtils.getMarkerType/getMarkerDirection`); `Sign` -> `VDTrafficSign`/`VDSpeedSign`/`VDTrafficMarker`. Снятие — в `m_6810_`. У частей LittleTiles `onPlace` не вызывается, поэтому в хранилище они не попадают.
+- Ключевая причина «нельзя поставить на миниблоки»: `RoadMarking.m_5573_` (getStateForPlacement) возвращает воздух, если блок под ним не `RoadBlock/RoadSlab/SidewalkBlock/SidewalkSlab/platform_edge_line`; `m_6861_` (neighbor update) разрушает маркировку, если под ней воздух; `update()` не обновляет состояние, если под ней не дорога/тротуар. Блок LittleTiles (`BETiles`) этим условиям не соответствует.
+- Те же проверки `instanceof RoadBlock/RoadSlab` есть в `Vehicle` (supportY, строка ~2322), `TrafficPointsConnector` (~761, 800, 839, 914), `Pedestrian` (~927), `ModBlockStates` (~130), `SewerCover`.
+- Точки движения (`TrafficPoint`) и полосы строятся от пользовательских блоков-точек, а не от блоков дороги.
+
+### План
+1. Слой «что за блок»: класс в `board/` (например `LittleBridge`), опрос `BETiles` рядом с игроками; категории частей: дорога, тротуар, переход (по блоку/форме/верху), с учётом `LittleBox`/диагонали. Хук в `vcarTick` рядом с `littleBridgeTick`.
+2. Через Patcher: проверки «под разметкой дорога/тротуар» и поддержки ТС/пешехода/соединения точек учитывают блок LittleTiles с дорожными частями.
+3. Регистрация частей-разметки/стрелок/знаков в `VDStorageHandler` (с реальным направлением) и снятие при удалении.
 
 ## Дальше
 NPC из CustomNPCs -> метро MTR -> машины MTS.

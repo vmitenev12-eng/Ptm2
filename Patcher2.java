@@ -15,13 +15,17 @@ import org.objectweb.asm.tree.MethodNode;
 import org.objectweb.asm.tree.VarInsnNode;
 
 /**
- * Второй проход патчера (запускается после Patcher): подмена результата PTMBlock.getBlock для ячеек LittleTiles,
- * чтобы миниблоки с частями-дорогой и частями-тротуаром считались дорогой и тротуаром (LittleBridge).
+ * Второй проход патчера (запускается после Patcher):
+ * 1) подмена результата PTMBlock.getBlock для ячеек LittleTiles, чтобы миниблоки с частями-дорогой и частями-тротуаром
+ *    считались дорогой и тротуаром (LittleBridge);
+ * 2) добавление «Разметочного карандаша» во вкладку знаков (ModTabs.addCreative -> LineMarkerItem.creativeExtra).
  * Usage: Patcher2 in.jar out.jar
  */
 public class Patcher2 implements Opcodes {
     static final String PTMBLOCK = "com/rinventor/ptm2/engine/base/PTMBlock";
+    static final String MODTABS = "com/rinventor/ptm2/core/init/ModTabs";
     static final String LB = "com/rinventor/ptm2/fixes/board/LittleBridge";
+    static final String LMI = "com/rinventor/ptm2/fixes/board/LineMarkerItem";
     static final String BLOCK = "Lnet/minecraft/world/level/block/Block;";
     static final String LEVEL = "Lnet/minecraft/world/level/LevelAccessor;";
 
@@ -38,47 +42,68 @@ public class Patcher2 implements Opcodes {
                 if (e.getName().equals(PTMBLOCK + ".class")) {
                     ClassNode cn = new ClassNode();
                     new ClassReader(data).accept(cn, 0);
-                    patched += hook(cn, "(" + LEVEL + "DDD)" + BLOCK, "mapD", "(" + BLOCK + LEVEL + "DDD)" + BLOCK, true);
-                    patched += hook(cn, "(" + LEVEL + "Lnet/minecraft/core/BlockPos;)" + BLOCK, "mapP",
-                        "(" + BLOCK + LEVEL + "Lnet/minecraft/core/BlockPos;)" + BLOCK, false);
-                    ClassWriter cw = new ClassWriter(ClassWriter.COMPUTE_MAXS);
-                    cn.accept(cw);
-                    data = cw.toByteArray();
+                    patched += hook(cn, "getBlock", "(" + LEVEL + "DDD)" + BLOCK, LB, "mapD", "(" + BLOCK + LEVEL + "DDD)" + BLOCK, 0);
+                    patched += hook(cn, "getBlock", "(" + LEVEL + "Lnet/minecraft/core/BlockPos;)" + BLOCK, LB, "mapP",
+                        "(" + BLOCK + LEVEL + "Lnet/minecraft/core/BlockPos;)" + BLOCK, 1);
+                    data = write(cn);
+                } else if (e.getName().equals(MODTABS + ".class")) {
+                    ClassNode cn = new ClassNode();
+                    new ClassReader(data).accept(cn, 0);
+                    patched += hook(cn, "addCreative",
+                        "(Lnet/minecraft/world/item/CreativeModeTab;Lnet/minecraft/resources/ResourceKey;Ljava/util/function/Consumer;)V",
+                        LMI, "creativeExtra", "(Ljava/lang/Object;Ljava/lang/Object;)V", 2);
+                    data = write(cn);
                 }
-                ZipEntry ne = new ZipEntry(e.getName());
-                out.putNextEntry(ne);
+                out.putNextEntry(new ZipEntry(e.getName()));
                 out.write(data);
                 out.closeEntry();
             }
         }
-        System.out.println("Patcher2: PTMBlock.getBlock hooks = " + patched);
-        if (patched != 2) {
-            System.err.println("ERROR: PTMBlock.getBlock was not patched (expected 2 hooks)");
+        System.out.println("Patcher2: hooks = " + patched);
+        if (patched != 3) {
+            System.err.println("ERROR: expected 3 hooks (PTMBlock.getBlock x2, ModTabs.addCreative), got " + patched);
             System.exit(1);
         }
     }
 
-    static int hook(ClassNode cn, String desc, String target, String targetDesc, boolean coords) {
+    static byte[] write(ClassNode cn) {
+        ClassWriter cw = new ClassWriter(ClassWriter.COMPUTE_MAXS);
+        cn.accept(cw);
+        return cw.toByteArray();
+    }
+
+    /**
+     * kind 0: getBlock(level, x, y, z) - результат (ARETURN) пропускается через target(block, level, x, y, z);
+     * kind 1: getBlock(level, pos) - через target(block, level, pos);
+     * kind 2: addCreative(tab, key, consumer) - перед RETURN вызывается target(tab, consumer).
+     */
+    static int hook(ClassNode cn, String method, String desc, String owner, String target, String targetDesc, int kind) {
         for (MethodNode m : cn.methods) {
-            if (!m.name.equals("getBlock") || !m.desc.equals(desc)) {
+            if (!m.name.equals(method) || !m.desc.equals(desc)) {
                 continue;
             }
             int n = 0;
+            int op = kind == 2 ? RETURN : ARETURN;
             for (AbstractInsnNode in : m.instructions.toArray()) {
-                if (in.getOpcode() == ARETURN) {
-                    InsnList l = new InsnList();
-                    l.add(new VarInsnNode(ALOAD, 0));
-                    if (coords) {
-                        l.add(new VarInsnNode(DLOAD, 1));
-                        l.add(new VarInsnNode(DLOAD, 3));
-                        l.add(new VarInsnNode(DLOAD, 5));
-                    } else {
-                        l.add(new VarInsnNode(ALOAD, 1));
-                    }
-                    l.add(new MethodInsnNode(INVOKESTATIC, LB, target, targetDesc, false));
-                    m.instructions.insertBefore(in, l);
-                    n++;
+                if (in.getOpcode() != op) {
+                    continue;
                 }
+                InsnList l = new InsnList();
+                if (kind == 0) {
+                    l.add(new VarInsnNode(ALOAD, 0));
+                    l.add(new VarInsnNode(DLOAD, 1));
+                    l.add(new VarInsnNode(DLOAD, 3));
+                    l.add(new VarInsnNode(DLOAD, 5));
+                } else if (kind == 1) {
+                    l.add(new VarInsnNode(ALOAD, 0));
+                    l.add(new VarInsnNode(ALOAD, 1));
+                } else {
+                    l.add(new VarInsnNode(ALOAD, 0));
+                    l.add(new VarInsnNode(ALOAD, 2));
+                }
+                l.add(new MethodInsnNode(INVOKESTATIC, owner, target, targetDesc, false));
+                m.instructions.insertBefore(in, l);
+                n++;
             }
             return n > 0 ? 1 : 0;
         }

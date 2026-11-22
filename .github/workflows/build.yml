@@ -109,6 +109,10 @@ jobs:
           else
             echo "extra-assets.zip not found, skipping"
           fi
+          if [ -d extra-assets-src/assets ]; then
+            (cd extra-assets-src && zip -q -r ../out/ptm2-patched.jar assets)
+            unzip -l out/ptm2-patched.jar | grep "line_marker" || true
+          fi
 
       - name: Publish release
         env:

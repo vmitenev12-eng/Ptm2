@@ -82,8 +82,10 @@ jobs:
           for j in asm asm-tree; do
             curl -fsSL -o tools/$j.jar https://repo1.maven.org/maven2/org/ow2/asm/$j/9.6/$j-9.6.jar
           done
-          javac -cp tools/asm.jar:tools/asm-tree.jar -d tools Patcher.java
+          javac -cp tools/asm.jar:tools/asm-tree.jar -d tools Patcher.java Patcher2.java
           java -cp tools:tools/asm.jar:tools/asm-tree.jar Patcher base/ptm2-base.jar build/libs/fixes.jar out/ptm2-patched.jar
+          java -cp tools:tools/asm.jar:tools/asm-tree.jar Patcher2 out/ptm2-patched.jar out/ptm2-patched-2.jar
+          mv out/ptm2-patched-2.jar out/ptm2-patched.jar
           ls -l out
 
       - name: Add Russian translation

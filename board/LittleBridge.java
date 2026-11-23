@@ -8,6 +8,7 @@ import java.lang.reflect.Method;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.Level;
 import net.minecraft.world.level.LevelAccessor;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.entity.BlockEntity;
@@ -18,6 +19,7 @@ import net.minecraft.world.level.block.state.BlockState;
  * для ptm2 выглядит как соответствующий блок дороги или тротуара. Подмена делается в PTMBlock.getBlock
  * (хук ставит Patcher2), поэтому все проверки вида "под разметкой дорога", посадка транспорта, соединение точек
  * и пешеходы начинают считать такую ячейку дорогой. Без мода LittleTiles класс ничего не делает.
+ * Дополнительно topAt даёт высоту верха миниблоков-дороги в точке (для ямок и бугорков).
  */
 public final class LittleBridge {
     private static final long TTL_MS = 1500L;
@@ -77,30 +79,45 @@ public final class LittleBridge {
         }
     }
 
-    private static Block compute(Block original, LevelAccessor level, BlockPos pos) throws ReflectiveOperationException {
-        BlockEntity be = level.getBlockEntity(pos);
-        if (be == null || !be.getClass().getName().endsWith(".BETiles")) {
-            return original;
-        }
+    private static boolean isTilesEntity(BlockEntity be) {
+        return be != null && be.getClass().getName().endsWith(".BETiles");
+    }
+
+    private static Iterable<?> allTiles(BlockEntity be) throws ReflectiveOperationException {
         Method all = allTilesMethod;
         if (all == null) {
             all = be.getClass().getMethod("allTiles");
             allTilesMethod = all;
         }
+        return (Iterable<?>) all.invoke(be);
+    }
+
+    private static Block partBlock(Object tile) throws ReflectiveOperationException {
+        Method gs = getStateMethod;
+        if (gs == null) {
+            gs = tile.getClass().getMethod("getState");
+            getStateMethod = gs;
+        }
+        return ((BlockState) gs.invoke(tile)).getBlock();
+    }
+
+    private static boolean roadLike(Block b) {
+        return b instanceof RoadBlock || b instanceof RoadSlab || b instanceof SidewalkBlock || b instanceof SidewalkSlab;
+    }
+
+    private static Block compute(Block original, LevelAccessor level, BlockPos pos) throws ReflectiveOperationException {
+        BlockEntity be = level.getBlockEntity(pos);
+        if (!isTilesEntity(be)) {
+            return original;
+        }
         Block road = null;
         Block walk = null;
         int n = 0;
-        for (Object pr : (Iterable<?>) all.invoke(be)) {
+        for (Object pr : allTiles(be)) {
             if (++n > MAX_PARTS) {
                 break;
             }
-            Object tile = ((Map.Entry<?, ?>) pr).getValue();
-            Method gs = getStateMethod;
-            if (gs == null) {
-                gs = tile.getClass().getMethod("getState");
-                getStateMethod = gs;
-            }
-            Block pb = ((BlockState) gs.invoke(tile)).getBlock();
+            Block pb = partBlock(((Map.Entry<?, ?>) pr).getValue());
             if (pb instanceof RoadBlock || pb instanceof RoadSlab) {
                 if (road == null) {
                     road = pb;
@@ -115,5 +132,59 @@ public final class LittleBridge {
             return road;
         }
         return walk != null ? walk : original;
+    }
+
+    /**
+     * Высота верха частей-дороги/тротуара миниблоков в ячейке cell в точке (px, pz) (мировые координаты).
+     * NaN - в ячейке нет миниблоков или их части не покрывают точку;
+     * +Infinity - в ячейке есть наклонная (диагональная, pillar) часть-дорога, высоту нужно брать из наклона.
+     */
+    public static double topAt(Level level, BlockPos cell, double px, double pz) {
+        try {
+            BlockEntity be = level.getBlockEntity(cell);
+            if (!isTilesEntity(be)) {
+                return Double.NaN;
+            }
+            Object grid = be.getClass().getMethod("getGrid").invoke(be);
+            int count = grid.getClass().getField("count").getInt(grid);
+            double lx = (px - cell.getX()) * count;
+            double lz = (pz - cell.getZ()) * count;
+            double best = Double.NaN;
+            boolean tilted = false;
+            int n = 0;
+            for (Object pr : allTiles(be)) {
+                if (++n > MAX_PARTS) {
+                    break;
+                }
+                Object tile = ((Map.Entry<?, ?>) pr).getValue();
+                if (!roadLike(partBlock(tile))) {
+                    continue;
+                }
+                for (Object box : (Iterable<?>) tile) {
+                    Class<?> bc = box.getClass();
+                    if (bc.getName().contains("Transformable")) {
+                        tilted = true;
+                        continue;
+                    }
+                    int minX = bc.getField("minX").getInt(box);
+                    int minZ = bc.getField("minZ").getInt(box);
+                    int maxX = bc.getField("maxX").getInt(box);
+                    int maxY = bc.getField("maxY").getInt(box);
+                    int maxZ = bc.getField("maxZ").getInt(box);
+                    if (lx >= minX && lx < maxX && lz >= minZ && lz < maxZ) {
+                        double top = cell.getY() + maxY / (double) count;
+                        if (Double.isNaN(best) || top > best) {
+                            best = top;
+                        }
+                    }
+                }
+            }
+            if (tilted) {
+                return Double.POSITIVE_INFINITY;
+            }
+            return best;
+        } catch (Throwable t) {
+            return Double.NaN;
+        }
     }
 }

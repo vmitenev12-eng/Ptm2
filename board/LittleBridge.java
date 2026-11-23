@@ -1,6 +1,7 @@
 package com.rinventor.ptm2.fixes.board;
 
 import com.rinventor.ptm2.objects.blocks.RoadBlock;
+import com.rinventor.ptm2.objects.blocks.RoadMarking;
 import com.rinventor.ptm2.objects.blocks.RoadSlab;
 import com.rinventor.ptm2.objects.blocks.SidewalkBlock;
 import com.rinventor.ptm2.objects.blocks.SidewalkSlab;
@@ -8,18 +9,26 @@ import java.lang.reflect.Method;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.LevelAccessor;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.block.state.properties.IntegerProperty;
+import net.minecraft.world.level.block.state.properties.Property;
+import net.minecraft.world.phys.shapes.VoxelShape;
 
 /**
  * Мягкая поддержка LittleTiles: ячейка из миниблоков (BETiles), в которой есть части-дорога или части-тротуар,
  * для ptm2 выглядит как соответствующий блок дороги или тротуара. Подмена делается в PTMBlock.getBlock
  * (хук ставит Patcher2), поэтому все проверки вида "под разметкой дорога", посадка транспорта, соединение точек
  * и пешеходы начинают считать такую ячейку дорогой. Без мода LittleTiles класс ничего не делает.
- * Дополнительно topAt даёт высоту верха миниблоков-дороги в точке (для ямок и бугорков).
+ * Дополнительно:
+ * - topAt даёт высоту верха поверхности в точке (для миниблоков-дороги - по их коробкам, для обычных блоков - по форме коллизии);
+ * - onMarkingPlaced вызывается из RoadMarking.onPlace (хук Patcher2): если разметка поставлена на миниблоки, верх которых
+ *   ниже верха ячейки (ямка, низкая часть), она заменяется на SlopedMarkingBlock с нужным смещением.
  */
 public final class LittleBridge {
     private static final long TTL_MS = 1500L;
@@ -39,6 +48,7 @@ public final class LittleBridge {
     private static volatile Method allTilesMethod;
     private static volatile Method getStateMethod;
     private static volatile boolean broken;
+    private static boolean snapping;
 
     private LittleBridge() {
     }
@@ -135,15 +145,17 @@ public final class LittleBridge {
     }
 
     /**
-     * Высота верха частей-дороги/тротуара миниблоков в ячейке cell в точке (px, pz) (мировые координаты).
-     * NaN - в ячейке нет миниблоков или их части не покрывают точку;
-     * +Infinity - в ячейке есть наклонная (диагональная, pillar) часть-дорога, высоту нужно брать из наклона.
+     * Высота верха поверхности в ячейке cell в точке (px, pz) (мировые координаты).
+     * Ячейка LittleTiles: верх частей-дороги/тротуара (коробки без наклона), обычная ячейка: верх формы коллизии.
+     * NaN - нет покрытия; +Infinity - в ячейке LittleTiles есть наклонная (диагональная, pillar) часть-дорога,
+     * высоту нужно брать из наклона.
      */
     public static double topAt(Level level, BlockPos cell, double px, double pz) {
         try {
             BlockEntity be = level.getBlockEntity(cell);
             if (!isTilesEntity(be)) {
-                return Double.NaN;
+                VoxelShape sh = level.getBlockState(cell).getCollisionShape(level, cell);
+                return sh.isEmpty() ? Double.NaN : cell.getY() + sh.max(Direction.Axis.Y);
             }
             Object grid = be.getClass().getMethod("getGrid").invoke(be);
             int count = grid.getClass().getField("count").getInt(grid);
@@ -185,6 +197,73 @@ public final class LittleBridge {
             return best;
         } catch (Throwable t) {
             return Double.NaN;
+        }
+    }
+
+    /**
+     * Вызывается из RoadMarking.onPlace (хук Patcher2) на сервере. Если под разметкой ячейка LittleTiles, верх поверхности которой
+     * в центре ниже верха ячейки (ямка, низкая часть), блок заменяется на наклонную плитку с тем же
+     * типом и поворотом и смещением вниз. Если в ячейке наклонные части (pillar), ничего не меняется.
+     */
+    public static void onMarkingPlaced(Object self, BlockState state, Level level, BlockPos pos) {
+        if (snapping) {
+            return;
+        }
+        try {
+            if (level == null || level.isClientSide || LaneBoardRegistry.SLOPED_BLOCK == null || !(self instanceof RoadMarking)) {
+                return;
+            }
+            BlockPos below = pos.below();
+            if (!isTilesEntity(level.getBlockEntity(below))) {
+                return;
+            }
+            double px = pos.getX() + 0.5D;
+            double pz = pos.getZ() + 0.5D;
+            double top = topAt(level, below, px, pz);
+            if (top == Double.POSITIVE_INFINITY) {
+                return;
+            }
+            if (Double.isNaN(top)) {
+                for (int k = 1; k <= 2; k++) {
+                    double t = topAt(level, below.below(k), px, pz);
+                    if (t == Double.POSITIVE_INFINITY) {
+                        return;
+                    }
+                    if (!Double.isNaN(t)) {
+                        top = t;
+                        break;
+                    }
+                }
+            }
+            if (Double.isNaN(top)) {
+                return;
+            }
+            double dy = top - pos.getY();
+            if (dy > -0.03D || dy < -3.0D) {
+                return;
+            }
+            Block mb = state.getBlock();
+            int rot = 0;
+            Property<?> rp = mb.getStateDefinition().getProperty("rotation");
+            if (rp instanceof IntegerProperty) {
+                rot = state.getValue((IntegerProperty) rp);
+            }
+            snapping = true;
+            try {
+                level.setBlock(pos, LaneBoardRegistry.SLOPED_BLOCK.get().defaultBlockState(), 3);
+                BlockEntity nb = level.getBlockEntity(pos);
+                if (nb instanceof SlopedMarkingBlockEntity) {
+                    SlopedMarkingBlockEntity sm = (SlopedMarkingBlockEntity) nb;
+                    sm.configure(BuiltInRegistries.BLOCK.getKey(mb).toString(), rot, 0.0F, (float) dy);
+                    sm.register(level);
+                } else {
+                    level.setBlock(pos, state, 3);
+                }
+            } finally {
+                snapping = false;
+            }
+        } catch (Throwable t) {
+            snapping = false;
         }
     }
 }

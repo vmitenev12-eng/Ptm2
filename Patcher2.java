@@ -18,16 +18,22 @@ import org.objectweb.asm.tree.VarInsnNode;
  * Второй проход патчера (запускается после Patcher):
  * 1) подмена результата PTMBlock.getBlock для ячеек LittleTiles, чтобы миниблоки с частями-дорогой и частями-тротуаром
  *    считались дорогой и тротуаром (LittleBridge);
- * 2) добавление «Разметочного карандаша» во вкладку знаков (ModTabs.addCreative -> LineMarkerItem.creativeExtra).
+ * 2) добавление «Разметочного карандаша» во вкладку знаков (ModTabs.addCreative -> LineMarkerItem.creativeExtra);
+ * 3) при установке блока разметки (RoadMarking.onPlace) — LittleBridge.onMarkingPlaced: подгонка по верху миниблоков.
  * Usage: Patcher2 in.jar out.jar
  */
 public class Patcher2 implements Opcodes {
     static final String PTMBLOCK = "com/rinventor/ptm2/engine/base/PTMBlock";
     static final String MODTABS = "com/rinventor/ptm2/core/init/ModTabs";
+    static final String ROADMARKING = "com/rinventor/ptm2/objects/blocks/RoadMarking";
     static final String LB = "com/rinventor/ptm2/fixes/board/LittleBridge";
     static final String LMI = "com/rinventor/ptm2/fixes/board/LineMarkerItem";
     static final String BLOCK = "Lnet/minecraft/world/level/block/Block;";
     static final String LEVEL = "Lnet/minecraft/world/level/LevelAccessor;";
+    static final String BSTATE = "Lnet/minecraft/world/level/block/state/BlockState;";
+    static final String WLEVEL = "Lnet/minecraft/world/level/Level;";
+    static final String BPOS = "Lnet/minecraft/core/BlockPos;";
+    static final int EXPECTED = 4;
 
     public static void main(String[] args) throws Exception {
         int patched = 0;
@@ -43,8 +49,7 @@ public class Patcher2 implements Opcodes {
                     ClassNode cn = new ClassNode();
                     new ClassReader(data).accept(cn, 0);
                     patched += hook(cn, "getBlock", "(" + LEVEL + "DDD)" + BLOCK, LB, "mapD", "(" + BLOCK + LEVEL + "DDD)" + BLOCK, 0);
-                    patched += hook(cn, "getBlock", "(" + LEVEL + "Lnet/minecraft/core/BlockPos;)" + BLOCK, LB, "mapP",
-                        "(" + BLOCK + LEVEL + "Lnet/minecraft/core/BlockPos;)" + BLOCK, 1);
+                    patched += hook(cn, "getBlock", "(" + LEVEL + BPOS + ")" + BLOCK, LB, "mapP", "(" + BLOCK + LEVEL + BPOS + ")" + BLOCK, 1);
                     data = write(cn);
                 } else if (e.getName().equals(MODTABS + ".class")) {
                     ClassNode cn = new ClassNode();
@@ -53,6 +58,12 @@ public class Patcher2 implements Opcodes {
                         "(Lnet/minecraft/world/item/CreativeModeTab;Lnet/minecraft/resources/ResourceKey;Ljava/util/function/Consumer;)V",
                         LMI, "creativeExtra", "(Ljava/lang/Object;Ljava/lang/Object;)V", 2);
                     data = write(cn);
+                } else if (e.getName().equals(ROADMARKING + ".class")) {
+                    ClassNode cn = new ClassNode();
+                    new ClassReader(data).accept(cn, 0);
+                    patched += hook(cn, "m_6807_", "(" + BSTATE + WLEVEL + BPOS + BSTATE + "Z)V",
+                        LB, "onMarkingPlaced", "(Ljava/lang/Object;" + BSTATE + WLEVEL + BPOS + ")V", 3);
+                    data = write(cn);
                 }
                 out.putNextEntry(new ZipEntry(e.getName()));
                 out.write(data);
@@ -60,8 +71,8 @@ public class Patcher2 implements Opcodes {
             }
         }
         System.out.println("Patcher2: hooks = " + patched);
-        if (patched != 3) {
-            System.err.println("ERROR: expected 3 hooks (PTMBlock.getBlock x2, ModTabs.addCreative), got " + patched);
+        if (patched != EXPECTED) {
+            System.err.println("ERROR: expected " + EXPECTED + " hooks (PTMBlock.getBlock x2, ModTabs.addCreative, RoadMarking.onPlace), got " + patched);
             System.exit(1);
         }
     }
@@ -75,12 +86,23 @@ public class Patcher2 implements Opcodes {
     /**
      * kind 0: getBlock(level, x, y, z) - результат (ARETURN) пропускается через target(block, level, x, y, z);
      * kind 1: getBlock(level, pos) - через target(block, level, pos);
-     * kind 2: addCreative(tab, key, consumer) - перед RETURN вызывается target(tab, consumer).
+     * kind 2: addCreative(tab, key, consumer) - перед RETURN вызывается target(tab, consumer);
+     * kind 3: в начале метода onPlace(state, level, pos, old, moving) вызывается target(this, state, level, pos).
      */
     static int hook(ClassNode cn, String method, String desc, String owner, String target, String targetDesc, int kind) {
         for (MethodNode m : cn.methods) {
             if (!m.name.equals(method) || !m.desc.equals(desc)) {
                 continue;
+            }
+            if (kind == 3) {
+                InsnList l = new InsnList();
+                l.add(new VarInsnNode(ALOAD, 0));
+                l.add(new VarInsnNode(ALOAD, 1));
+                l.add(new VarInsnNode(ALOAD, 2));
+                l.add(new VarInsnNode(ALOAD, 3));
+                l.add(new MethodInsnNode(INVOKESTATIC, owner, target, targetDesc, false));
+                m.instructions.insert(l);
+                return 1;
             }
             int n = 0;
             int op = kind == 2 ? RETURN : ARETURN;

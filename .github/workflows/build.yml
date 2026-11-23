@@ -109,10 +109,14 @@ jobs:
           else
             echo "extra-assets.zip not found, skipping"
           fi
-          if [ -d extra-assets-src/assets ]; then
-            (cd extra-assets-src && zip -q -r ../out/ptm2-patched.jar assets)
-            unzip -l out/ptm2-patched.jar | grep "line_marker" || true
-          fi
+
+      - name: Add pencil texture and model
+        run: |
+          python3 tools/make_pencil.py gen-assets
+          (cd gen-assets && zip -q -r ../out/ptm2-patched.jar assets)
+          unzip -l out/ptm2-patched.jar | grep "line_marker"
+          unzip -l out/ptm2-patched.jar | grep -q "assets/ptm2/textures/item/line_marker.png"
+          unzip -l out/ptm2-patched.jar | grep -q "assets/ptm2/models/item/line_marker.json"
 
       - name: Publish release
         env:

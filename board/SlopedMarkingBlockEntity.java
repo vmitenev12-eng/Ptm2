@@ -8,6 +8,7 @@ import com.rinventor.ptm2.dimension.virtual.types.VDTrafficMarker;
 import com.rinventor.ptm2.dimension.virtual.util.VDUtils;
 import com.rinventor.ptm2.objects.blocks.RoadMarking;
 import com.rinventor.ptm2.platform.PlatformBlockEntity;
+import java.util.Locale;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.nbt.CompoundTag;
@@ -48,6 +49,12 @@ public class SlopedMarkingBlockEntity extends PlatformBlockEntity {
 
     public float getDy() {
         return this.dy;
+    }
+
+    /** Краткое описание данных плитки (для диагностики карандашом). */
+    public String describe() {
+        return this.blockId + " rot=" + this.rot + " pitch=" + String.format(Locale.ROOT, "%.1f", this.pitch)
+            + " dy=" + String.format(Locale.ROOT, "%.2f", this.dy);
     }
 
     public void configure(String blockId, int rot, float pitch, float dy) {

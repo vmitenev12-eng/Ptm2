@@ -17,6 +17,8 @@ import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.EntityBlock;
+import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.block.state.properties.IntegerProperty;
 import net.minecraft.world.level.block.state.properties.Property;
@@ -26,6 +28,8 @@ import net.minecraft.world.phys.AABB;
  * Наклонная разметка: хранит, какой обычный блок разметки ptm2 изображать, поворот (0-7), угол наклона в градусах
  * (плюс - поднимается по направлению поворота) и смещение по высоте относительно низа ячейки (обычно отрицательное:
  * поверхность миниблока лежит ниже верха ячейки). Для ИИ регистрируется в хранилище как обычная разметка.
+ * На клиенте для разметок, которые ptm2 рисует блок-сущностью (линии), создаётся немировая блок-сущность того же типа
+ * (mimicEntity), чтобы нарисовать её родным рендерером.
  */
 public class SlopedMarkingBlockEntity extends PlatformBlockEntity {
     private String blockId = "";
@@ -34,6 +38,8 @@ public class SlopedMarkingBlockEntity extends PlatformBlockEntity {
     private float dy;
     private BlockState cachedState;
     private String cachedFor = "";
+    private BlockEntity inner;
+    private String innerFor = "";
 
     public SlopedMarkingBlockEntity(BlockPos pos, BlockState state) {
         super(LaneBoardRegistry.SLOPED_ENTITY.get(), pos, state);
@@ -63,6 +69,7 @@ public class SlopedMarkingBlockEntity extends PlatformBlockEntity {
         this.pitch = pitch;
         this.dy = dy;
         this.cachedState = null;
+        this.inner = null;
         this.setChanged();
         if (this.level != null) {
             BlockState st = this.getBlockState();
@@ -103,6 +110,30 @@ public class SlopedMarkingBlockEntity extends PlatformBlockEntity {
         return st;
     }
 
+    /**
+     * Немировая блок-сущность исходной разметки (только для отрисовки на клиенте): такой же тип, тот же поворот, та же позиция.
+     * null, если блок разметки не EntityBlock.
+     */
+    public BlockEntity mimicEntity() {
+        BlockState st = this.mimicState();
+        if (st == null || this.level == null || !(st.getBlock() instanceof EntityBlock)) {
+            return null;
+        }
+        String key = this.blockId + ":" + this.rot;
+        if (this.inner == null || !key.equals(this.innerFor)) {
+            try {
+                this.inner = ((EntityBlock) st.getBlock()).newBlockEntity(this.getBlockPos(), st);
+                if (this.inner != null) {
+                    this.inner.setLevel(this.level);
+                }
+            } catch (RuntimeException e) {
+                this.inner = null;
+            }
+            this.innerFor = key;
+        }
+        return this.inner;
+    }
+
     /** Регистрация в хранилище ptm2 так же, как при установке обычного блока разметки (только сервер). */
     public void register(Level lvl) {
         Block mb = this.mimicBlock();
@@ -139,6 +170,7 @@ public class SlopedMarkingBlockEntity extends PlatformBlockEntity {
         this.pitch = tag.getFloat("pitch");
         this.dy = tag.getFloat("dy");
         this.cachedState = null;
+        this.inner = null;
     }
 
     protected void m_183515_(CompoundTag tag) {

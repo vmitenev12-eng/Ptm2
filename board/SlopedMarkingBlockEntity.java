@@ -28,14 +28,19 @@ import net.minecraft.world.phys.AABB;
  * Наклонная разметка: хранит, какой обычный блок разметки ptm2 изображать, поворот (0-7), угол наклона в градусах
  * (плюс - поднимается по направлению поворота) и смещение по высоте относительно низа ячейки (обычно отрицательное:
  * поверхность миниблока лежит ниже верха ячейки). Для ИИ регистрируется в хранилище как обычная разметка.
+ * Необязательный массив hs (SUB высот вдоль направления линии, относительно низа ячейки): линия рисуется кусками,
+ * каждый на своём уровне (ямки и бугорки из миниблоков).
  * На клиенте для разметок, которые ptm2 рисует блок-сущностью (линии), создаётся немировая блок-сущность того же типа
  * (mimicEntity), чтобы нарисовать её родным рендерером.
  */
 public class SlopedMarkingBlockEntity extends PlatformBlockEntity {
+    public static final int SUB = 8;
+
     private String blockId = "";
     private int rot;
     private float pitch;
     private float dy;
+    private float[] hs;
     private BlockState cachedState;
     private String cachedFor = "";
     private BlockEntity inner;
@@ -57,17 +62,27 @@ public class SlopedMarkingBlockEntity extends PlatformBlockEntity {
         return this.dy;
     }
 
+    /** Высоты по кускам линии (SUB штук) или null, если плитка целиком на одной высоте dy. */
+    public float[] getHeights() {
+        return this.hs;
+    }
+
     /** Краткое описание данных плитки (для диагностики карандашом). */
     public String describe() {
         return this.blockId + " rot=" + this.rot + " pitch=" + String.format(Locale.ROOT, "%.1f", this.pitch)
-            + " dy=" + String.format(Locale.ROOT, "%.2f", this.dy);
+            + " dy=" + String.format(Locale.ROOT, "%.2f", this.dy) + (this.hs != null ? " кусков=" + this.hs.length : "");
     }
 
     public void configure(String blockId, int rot, float pitch, float dy) {
+        this.configure(blockId, rot, pitch, dy, null);
+    }
+
+    public void configure(String blockId, int rot, float pitch, float dy, float[] heights) {
         this.blockId = blockId == null ? "" : blockId;
         this.rot = ((rot % 8) + 8) % 8;
         this.pitch = pitch;
         this.dy = dy;
+        this.hs = (heights != null && heights.length == SUB) ? heights : null;
         this.cachedState = null;
         this.inner = null;
         this.setChanged();
@@ -161,6 +176,13 @@ public class SlopedMarkingBlockEntity extends PlatformBlockEntity {
         tag.putInt("rot", this.rot);
         tag.putFloat("pitch", this.pitch);
         tag.putFloat("dy", this.dy);
+        if (this.hs != null) {
+            int[] ints = new int[this.hs.length];
+            for (int i = 0; i < ints.length; i++) {
+                ints[i] = Math.round(this.hs[i] * 256.0F);
+            }
+            tag.putIntArray("hs", ints);
+        }
     }
 
     public void m_142466_(CompoundTag tag) {
@@ -169,6 +191,17 @@ public class SlopedMarkingBlockEntity extends PlatformBlockEntity {
         this.rot = tag.getInt("rot");
         this.pitch = tag.getFloat("pitch");
         this.dy = tag.getFloat("dy");
+        this.hs = null;
+        if (tag.contains("hs")) {
+            int[] ints = tag.getIntArray("hs");
+            if (ints.length == SUB) {
+                float[] f = new float[SUB];
+                for (int i = 0; i < SUB; i++) {
+                    f[i] = ints[i] / 256.0F;
+                }
+                this.hs = f;
+            }
+        }
         this.cachedState = null;
         this.inner = null;
     }
@@ -190,6 +223,6 @@ public class SlopedMarkingBlockEntity extends PlatformBlockEntity {
 
     /** Плитка лежит ниже границы своей ячейки и наклонена: расширяем область рендера. */
     public AABB getRenderBoundingBox() {
-        return new AABB(this.getBlockPos()).inflate(1.5D, 1.5D, 1.5D);
+        return new AABB(this.getBlockPos()).inflate(1.5D, 3.5D, 1.5D);
     }
 }

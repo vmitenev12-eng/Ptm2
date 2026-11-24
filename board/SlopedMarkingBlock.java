@@ -12,11 +12,16 @@ import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.state.BlockBehaviour;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.shapes.CollisionContext;
+import net.minecraft.world.phys.shapes.Shapes;
 import net.minecraft.world.phys.shapes.VoxelShape;
 
 /**
  * Невидимый блок-носитель наклонной разметки. Саму плитку рисует SlopedMarkingRenderer по данным блока-сущности,
  * коллизии нет. Ставится инструментом «Разметочный карандаш» на поверхность миниблоков (например, pillar).
+ *
+ * Форма (getShape) для игрока (прицел, ломание) - тонкая плита 1/16 внизу ячейки. Но ptm2 ищет поверхность под колёсами
+ * и ногами через state.getShape(level, pos) без контекста (CollisionContext.empty()), и такая плита поднимала бы машины
+ * на блок над дорогой. Поэтому для запроса без контекста форма пустая.
  */
 public class SlopedMarkingBlock extends Block implements EntityBlock {
     private static final VoxelShape SHAPE = Block.box(0.0D, 0.0D, 0.0D, 16.0D, 1.0D, 16.0D);
@@ -34,6 +39,9 @@ public class SlopedMarkingBlock extends Block implements EntityBlock {
     }
 
     public VoxelShape getShape(BlockState state, BlockGetter level, BlockPos pos, CollisionContext context) {
+        if (context == CollisionContext.empty()) {
+            return Shapes.empty();
+        }
         return SHAPE;
     }
 

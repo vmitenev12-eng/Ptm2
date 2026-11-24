@@ -34,7 +34,8 @@ import net.minecraft.world.phys.Vec3;
  * Направление - ближайшее из 8 (шаг 45 градусов). Высота поверхности: если в ячейке нет наклонных
  * частей (pillar, диагональ), высоты берутся по верху миниблоков в 8 точках вдоль линии (ямки, бугорки), иначе -
  * линейно между A и B. Ячейка для плитки выбирается над самой высокой точкой поверхности в ячейке, чтобы
- * на подъёмах ячейка не оказывалась занятой краем того же подъёма.
+ * на подъёмах ячейка не оказывалась занятой краем того же подъёма. Для плитки запоминается высота
+ * первого куска следующей ячейки (hNext) — по ней рисуется стенка на границе ячеек.
  * Shift+ПКМ по готовой разметке выбирает её тип (для наклонной плитки ещё показывает её данные), Shift+ПКМ не по разметке сбрасывает точку A.
  */
 public class LineMarkerItem extends Item {
@@ -231,6 +232,7 @@ public class LineMarkerItem extends Item {
             double off;
             double pitchUse;
             float[] hs = null;
+            float hNext = Float.NaN;
             if (!tilted && !none) {
                 cy = (int) Math.floor(maxT - 0.001D) + 1;
                 pitchUse = 0.0D;
@@ -242,6 +244,14 @@ public class LineMarkerItem extends Item {
                     hs = new float[LittleBridge.SUB];
                     for (int j = 0; j < hs.length; j++) {
                         hs[j] = (float) (tops[j] - cy);
+                    }
+                }
+                if (i + 1 < n) {
+                    // высота первого куска следующей ячейки - для стенки на границе ячеек
+                    double[] nt = LittleBridge.sampleAlong(level, cx + sx, cz + sz, pl.rot, base + 3);
+                    double t0 = nt[0];
+                    if (!Double.isNaN(t0) && t0 != Double.POSITIVE_INFINITY && Math.abs(t0 - yc) <= 1.6D) {
+                        hNext = (float) (t0 - cy);
                     }
                 }
             } else {
@@ -261,12 +271,16 @@ public class LineMarkerItem extends Item {
                         hs[j] -= 1.0F;
                     }
                 }
+                if (!Float.isNaN(hNext)) {
+                    hNext -= 1.0F;
+                }
                 if (!canPlace(level, pos)) {
                     skipped++;
                     continue;
                 }
             }
-            if (hs == null && Math.abs(pitchUse) < 0.3D && Math.abs(off) < 0.03D) {
+            boolean wallAhead = !Float.isNaN(hNext) && Math.abs(hNext - (float) off) > 0.03F && hs == null;
+            if (hs == null && !wallAhead && Math.abs(pitchUse) < 0.3D && Math.abs(off) < 0.03D) {
                 level.setBlock(pos, flatState(mb, level, pos, pl.rot), 3);
                 flat++;
             } else {
@@ -274,7 +288,7 @@ public class LineMarkerItem extends Item {
                 BlockEntity be = level.getBlockEntity(pos);
                 if (be instanceof SlopedMarkingBlockEntity) {
                     SlopedMarkingBlockEntity sm = (SlopedMarkingBlockEntity) be;
-                    sm.configure(id, pl.rot, (float) pitchUse, (float) off, hs);
+                    sm.configure(id, pl.rot, (float) pitchUse, (float) off, hs, hNext);
                     sm.register(level);
                     sloped++;
                     if (hs != null) {

@@ -30,7 +30,10 @@ import net.minecraft.world.phys.shapes.VoxelShape;
  * - sampleAlong: SUB высот поверхности вдоль направления линии через ячейку (ямки и бугорки);
  * - onMarkingPlaced вызывается из RoadMarking.onPlace (хук Patcher2): если разметка поставлена на миниблоки, верх которых
  *   не на уровне верха ячейки (ямка, бугорок, низкая часть), она заменяется на SlopedMarkingBlock, либо
- *   с одной высотой, либо (если вдоль линии высота меняется) с высотой по кускам.
+ *   с одной высотой, либо (если вдоль линии высота меняется) с высотой по кускам;
+ * - connectable вызывается из RoadMarking.connectableTypeAt (хук Patcher2): линия разметки соединяется с наклонными плитками
+ *   (на клиенте хранилище ptm2 недоступно, поэтому смотрим блок-сущность плитки), в том числе на ячейку выше
+ *   или ниже (подъёмы).
  */
 public final class LittleBridge {
     public static final int SUB = SlopedMarkingBlockEntity.SUB;
@@ -48,6 +51,9 @@ public final class LittleBridge {
 
     private static final ConcurrentHashMap<Long, Object[]> CACHE_SERVER = new ConcurrentHashMap<>();
     private static final ConcurrentHashMap<Long, Object[]> CACHE_CLIENT = new ConcurrentHashMap<>();
+
+    private static final ThreadLocal<Boolean> SLOPED_RENDER = ThreadLocal.withInitial(() -> Boolean.FALSE);
+    private static final ThreadLocal<Boolean> IN_CONNECT = ThreadLocal.withInitial(() -> Boolean.FALSE);
 
     private static volatile Method allTilesMethod;
     private static volatile Method getStateMethod;
@@ -232,6 +238,57 @@ public final class LittleBridge {
             r[i] = columnTop(level, cx, cz, px, pz, fromY, 4);
         }
         return r;
+    }
+
+    /** Клиентский рендерер наклонной плитки включает флаг на время отрисовки родной линии ptm2. */
+    public static void setSlopedRender(boolean value) {
+        SLOPED_RENDER.set(value ? Boolean.TRUE : Boolean.FALSE);
+    }
+
+    private static boolean slopedConnectable(Level level, BlockPos p, Boolean matchTemporary) {
+        BlockEntity be = level.getBlockEntity(p);
+        if (be instanceof SlopedMarkingBlockEntity) {
+            BlockState ms = ((SlopedMarkingBlockEntity) be).mimicState();
+            if (ms != null && ms.getBlock() instanceof RoadMarking) {
+                return RoadMarking.connectableTypeAt(level, p, ms, matchTemporary);
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Вызывается из RoadMarking.connectableTypeAt (хук Patcher2) перед возвратом. orig - исходный результат.
+     * Дополнительно считается подключаемой наклонная плитка в этой ячейке или в ячейке на блок выше/ниже
+     * (подъёмы), а для плитки, которую рисует наш рендерер, - ещё и обычная разметка на блок выше/ниже.
+     */
+    public static boolean connectable(boolean orig, Level level, BlockPos pos, BlockState state, Boolean matchTemporary) {
+        if (orig || level == null || pos == null || LaneBoardRegistry.SLOPED_BLOCK == null || IN_CONNECT.get()) {
+            return orig;
+        }
+        IN_CONNECT.set(Boolean.TRUE);
+        try {
+            if (slopedConnectable(level, pos, matchTemporary)) {
+                return true;
+            }
+            boolean fromSloped = SLOPED_RENDER.get();
+            for (int d = -1; d <= 1; d += 2) {
+                BlockPos q = pos.offset(0, d, 0);
+                if (slopedConnectable(level, q, matchTemporary)) {
+                    return true;
+                }
+                if (fromSloped) {
+                    BlockState qs = level.getBlockState(q);
+                    if (qs.getBlock() instanceof RoadMarking && RoadMarking.connectableTypeAt(level, q, qs, matchTemporary)) {
+                        return true;
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            // остаётся исходный результат
+        } finally {
+            IN_CONNECT.set(Boolean.FALSE);
+        }
+        return false;
     }
 
     /**

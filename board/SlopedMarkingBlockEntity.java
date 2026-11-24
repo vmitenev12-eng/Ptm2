@@ -29,7 +29,8 @@ import net.minecraft.world.phys.AABB;
  * (плюс - поднимается по направлению поворота) и смещение по высоте относительно низа ячейки (обычно отрицательное:
  * поверхность миниблока лежит ниже верха ячейки). Для ИИ регистрируется в хранилище как обычная разметка.
  * Необязательный массив hs (SUB высот вдоль направления линии, относительно низа ячейки): линия рисуется кусками,
- * каждый на своём уровне (ямки и бугорки из миниблоков).
+ * каждый на своём уровне (ямки и бугорки из миниблоков). hNext - высота первого куска следующей
+ * за этой ячейки плитки (относительно низа этой ячейки, NaN - нет): по ней рисуется стенка на границе ячеек.
  * На клиенте для разметок, которые ptm2 рисует блок-сущностью (линии), создаётся немировая блок-сущность того же типа
  * (mimicEntity), чтобы нарисовать её родным рендерером.
  */
@@ -41,6 +42,7 @@ public class SlopedMarkingBlockEntity extends PlatformBlockEntity {
     private float pitch;
     private float dy;
     private float[] hs;
+    private float hNext = Float.NaN;
     private BlockState cachedState;
     private String cachedFor = "";
     private BlockEntity inner;
@@ -67,22 +69,33 @@ public class SlopedMarkingBlockEntity extends PlatformBlockEntity {
         return this.hs;
     }
 
+    /** Высота первого куска следующей ячейки линии относительно низа этой ячейки или NaN. */
+    public float getHNext() {
+        return this.hNext;
+    }
+
     /** Краткое описание данных плитки (для диагностики карандашом). */
     public String describe() {
         return this.blockId + " rot=" + this.rot + " pitch=" + String.format(Locale.ROOT, "%.1f", this.pitch)
-            + " dy=" + String.format(Locale.ROOT, "%.2f", this.dy) + (this.hs != null ? " кусков=" + this.hs.length : "");
+            + " dy=" + String.format(Locale.ROOT, "%.2f", this.dy) + (this.hs != null ? " кусков=" + this.hs.length : "")
+            + (Float.isNaN(this.hNext) ? "" : " стенкаВперёд=" + String.format(Locale.ROOT, "%.2f", this.hNext));
     }
 
     public void configure(String blockId, int rot, float pitch, float dy) {
-        this.configure(blockId, rot, pitch, dy, null);
+        this.configure(blockId, rot, pitch, dy, null, Float.NaN);
     }
 
     public void configure(String blockId, int rot, float pitch, float dy, float[] heights) {
+        this.configure(blockId, rot, pitch, dy, heights, Float.NaN);
+    }
+
+    public void configure(String blockId, int rot, float pitch, float dy, float[] heights, float hNext) {
         this.blockId = blockId == null ? "" : blockId;
         this.rot = ((rot % 8) + 8) % 8;
         this.pitch = pitch;
         this.dy = dy;
         this.hs = (heights != null && heights.length == SUB) ? heights : null;
+        this.hNext = hNext;
         this.cachedState = null;
         this.inner = null;
         this.setChanged();
@@ -183,6 +196,9 @@ public class SlopedMarkingBlockEntity extends PlatformBlockEntity {
             }
             tag.putIntArray("hs", ints);
         }
+        if (!Float.isNaN(this.hNext)) {
+            tag.putFloat("hn", this.hNext);
+        }
     }
 
     public void m_142466_(CompoundTag tag) {
@@ -202,6 +218,7 @@ public class SlopedMarkingBlockEntity extends PlatformBlockEntity {
                 this.hs = f;
             }
         }
+        this.hNext = tag.contains("hn") ? tag.getFloat("hn") : Float.NaN;
         this.cachedState = null;
         this.inner = null;
     }

@@ -19,7 +19,8 @@ import org.objectweb.asm.tree.VarInsnNode;
  * 1) подмена результата PTMBlock.getBlock для ячеек LittleTiles, чтобы миниблоки с частями-дорогой и частями-тротуаром
  *    считались дорогой и тротуаром (LittleBridge);
  * 2) добавление «Разметочного карандаша» во вкладку знаков (ModTabs.addCreative -> LineMarkerItem.creativeExtra);
- * 3) при установке блока разметки (RoadMarking.onPlace) — LittleBridge.onMarkingPlaced: подгонка по верху миниблоков.
+ * 3) при установке блока разметки (RoadMarking.onPlace) — LittleBridge.onMarkingPlaced: подгонка по верху миниблоков;
+ * 4) RoadMarking.connectableTypeAt — LittleBridge.connectable: линии разметки соединяются с наклонными плитками.
  * Usage: Patcher2 in.jar out.jar
  */
 public class Patcher2 implements Opcodes {
@@ -33,7 +34,7 @@ public class Patcher2 implements Opcodes {
     static final String BSTATE = "Lnet/minecraft/world/level/block/state/BlockState;";
     static final String WLEVEL = "Lnet/minecraft/world/level/Level;";
     static final String BPOS = "Lnet/minecraft/core/BlockPos;";
-    static final int EXPECTED = 4;
+    static final int EXPECTED = 5;
 
     public static void main(String[] args) throws Exception {
         int patched = 0;
@@ -63,6 +64,8 @@ public class Patcher2 implements Opcodes {
                     new ClassReader(data).accept(cn, 0);
                     patched += hook(cn, "m_6807_", "(" + BSTATE + WLEVEL + BPOS + BSTATE + "Z)V",
                         LB, "onMarkingPlaced", "(Ljava/lang/Object;" + BSTATE + WLEVEL + BPOS + ")V", 3);
+                    patched += hook(cn, "connectableTypeAt", "(" + WLEVEL + BPOS + BSTATE + "Ljava/lang/Boolean;)Z",
+                        LB, "connectable", "(Z" + WLEVEL + BPOS + BSTATE + "Ljava/lang/Boolean;)Z", 4);
                     data = write(cn);
                 }
                 out.putNextEntry(new ZipEntry(e.getName()));
@@ -72,7 +75,7 @@ public class Patcher2 implements Opcodes {
         }
         System.out.println("Patcher2: hooks = " + patched);
         if (patched != EXPECTED) {
-            System.err.println("ERROR: expected " + EXPECTED + " hooks (PTMBlock.getBlock x2, ModTabs.addCreative, RoadMarking.onPlace), got " + patched);
+            System.err.println("ERROR: expected " + EXPECTED + " hooks (PTMBlock.getBlock x2, ModTabs.addCreative, RoadMarking.onPlace, RoadMarking.connectableTypeAt), got " + patched);
             System.exit(1);
         }
     }
@@ -87,7 +90,8 @@ public class Patcher2 implements Opcodes {
      * kind 0: getBlock(level, x, y, z) - результат (ARETURN) пропускается через target(block, level, x, y, z);
      * kind 1: getBlock(level, pos) - через target(block, level, pos);
      * kind 2: addCreative(tab, key, consumer) - перед RETURN вызывается target(tab, consumer);
-     * kind 3: в начале метода onPlace(state, level, pos, old, moving) вызывается target(this, state, level, pos).
+     * kind 3: в начале метода onPlace(state, level, pos, old, moving) вызывается target(this, state, level, pos);
+     * kind 4: connectableTypeAt(level, pos, state, temporary) - результат (IRETURN) пропускается через target(result, level, pos, state, temporary).
      */
     static int hook(ClassNode cn, String method, String desc, String owner, String target, String targetDesc, int kind) {
         for (MethodNode m : cn.methods) {
@@ -105,7 +109,7 @@ public class Patcher2 implements Opcodes {
                 return 1;
             }
             int n = 0;
-            int op = kind == 2 ? RETURN : ARETURN;
+            int op = kind == 2 ? RETURN : (kind == 4 ? IRETURN : ARETURN);
             for (AbstractInsnNode in : m.instructions.toArray()) {
                 if (in.getOpcode() != op) {
                     continue;
@@ -119,6 +123,11 @@ public class Patcher2 implements Opcodes {
                 } else if (kind == 1) {
                     l.add(new VarInsnNode(ALOAD, 0));
                     l.add(new VarInsnNode(ALOAD, 1));
+                } else if (kind == 4) {
+                    l.add(new VarInsnNode(ALOAD, 0));
+                    l.add(new VarInsnNode(ALOAD, 1));
+                    l.add(new VarInsnNode(ALOAD, 2));
+                    l.add(new VarInsnNode(ALOAD, 3));
                 } else {
                     l.add(new VarInsnNode(ALOAD, 0));
                     l.add(new VarInsnNode(ALOAD, 2));

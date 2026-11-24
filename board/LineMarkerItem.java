@@ -31,9 +31,10 @@ import net.minecraft.world.phys.Vec3;
  * Разметочный карандаш: ПКМ в точке A, затем ПКМ в точке B - между ними кладётся линия выбранной разметки.
  * Пока точка A задана, на экране (в строке над панелью предметов) показывается длина линии до блока, на который смотрит игрок.
  * Тип разметки: блок разметки во второй руке, либо выбранный раньше (Shift+ПКМ по готовой разметке).
- * Направление - ближайшее из 8 (шаг 45 градусов). Высота поверхности в каждой ячейке: если в ячейке миниблоки
- * без наклонных частей - верх их частей-дороги (ямки, бугорки), иначе - линейно между A и B (pillar и обычные блоки).
- * Если поверхность наклонная или лежит не на верхе ячейки, ставится наклонная разметка, иначе - обычный блок.
+ * Направление - ближайшее из 8 (шаг 45 градусов). Высота поверхности: если в ячейке нет наклонных
+ * частей (pillar, диагональ), высоты берутся по верху миниблоков в 8 точках вдоль линии (ямки, бугорки), иначе -
+ * линейно между A и B. Ячейка для плитки выбирается над самой высокой точкой поверхности в ячейке, чтобы
+ * на подъёмах ячейка не оказывалась занятой краем того же подъёма.
  * Shift+ПКМ по готовой разметке выбирает её тип (для наклонной плитки ещё показывает её данные), Shift+ПКМ не по разметке сбрасывает точку A.
  */
 public class LineMarkerItem extends Item {
@@ -195,43 +196,77 @@ public class LineMarkerItem extends Item {
         int cx0 = (int) Math.floor(a.x);
         int cz0 = (int) Math.floor(a.z);
         String id = BuiltInRegistries.BLOCK.getKey(mb).toString();
+        double ext = (Math.abs(pl.fx) + Math.abs(pl.fz)) / 2.0D;
         int flat = 0;
         int sloped = 0;
         int skipped = 0;
         int geo = 0;
+        int pieces = 0;
         for (int i = 0; i < n; i++) {
             int cx = cx0 + sx * i;
             int cz = cz0 + sz * i;
             double sc = (cx + 0.5D - a.x) * pl.fx + (cz + 0.5D - a.z) * pl.fz;
             double yc = a.y + pl.slope * sc;
-            double ySurf = yc;
-            // верх миниблоков (ямки, бугорки), если в ячейках рядом нет наклонных частей (pillar, диагональ)
             int base = (int) Math.floor(yc - 0.001D);
-            double top = Double.NaN;
+
+            // высоты поверхности вдоль линии через ячейку (ямки и бугорки миниблоков); если в ячейке есть
+            // наклонная часть (pillar) или поверхность не найдена - берём линейный уклон от A до B
+            double[] tops = LittleBridge.sampleAlong(level, cx, cz, pl.rot, base + 2);
             boolean tilted = false;
-            for (int k = base + 1; k >= base - 2; k--) {
-                double t = LittleBridge.topAt(level, new BlockPos(cx, k, cz), cx + 0.5D, cz + 0.5D);
+            boolean none = false;
+            double maxT = Double.NEGATIVE_INFINITY;
+            double minT = Double.POSITIVE_INFINITY;
+            for (double t : tops) {
                 if (t == Double.POSITIVE_INFINITY) {
-                    tilted = k >= base;
-                    break;
-                }
-                if (!Double.isNaN(t)) {
-                    top = t;
-                    break;
+                    tilted = true;
+                } else if (Double.isNaN(t) || Math.abs(t - yc) > 1.6D) {
+                    none = true;
+                } else {
+                    maxT = Math.max(maxT, t);
+                    minT = Math.min(minT, t);
                 }
             }
-            if (!tilted && !Double.isNaN(top) && Math.abs(top - yc) <= 1.01D) {
-                ySurf = top;
+
+            int cy;
+            double off;
+            double pitchUse;
+            float[] hs = null;
+            if (!tilted && !none) {
+                cy = (int) Math.floor(maxT - 0.001D) + 1;
+                pitchUse = 0.0D;
                 geo++;
+                if (maxT - minT < 0.02D) {
+                    off = (maxT + minT) / 2.0D - cy;
+                } else {
+                    off = 0.0D;
+                    hs = new float[LittleBridge.SUB];
+                    for (int j = 0; j < hs.length; j++) {
+                        hs[j] = (float) (tops[j] - cy);
+                    }
+                }
+            } else {
+                // ячейка над самой высокой точкой поверхности в ячейке (край подъёма может заходить выше центра)
+                cy = (int) Math.floor(yc + Math.abs(pl.slope) * ext - 0.001D) + 1;
+                off = yc - cy;
+                pitchUse = pl.pitch;
             }
-            int cy = (int) Math.floor(ySurf - 0.001D) + 1;
+
             BlockPos pos = new BlockPos(cx, cy, cz);
             if (!canPlace(level, pos)) {
-                skipped++;
-                continue;
+                // занято (например краем подъёма) - пробуем ячейку выше
+                pos = pos.above();
+                off -= 1.0D;
+                if (hs != null) {
+                    for (int j = 0; j < hs.length; j++) {
+                        hs[j] -= 1.0F;
+                    }
+                }
+                if (!canPlace(level, pos)) {
+                    skipped++;
+                    continue;
+                }
             }
-            double off = ySurf - cy;
-            if (Math.abs(pl.pitch) < 0.3D && Math.abs(off) < 0.03D) {
+            if (hs == null && Math.abs(pitchUse) < 0.3D && Math.abs(off) < 0.03D) {
                 level.setBlock(pos, flatState(mb, level, pos, pl.rot), 3);
                 flat++;
             } else {
@@ -239,16 +274,19 @@ public class LineMarkerItem extends Item {
                 BlockEntity be = level.getBlockEntity(pos);
                 if (be instanceof SlopedMarkingBlockEntity) {
                     SlopedMarkingBlockEntity sm = (SlopedMarkingBlockEntity) be;
-                    sm.configure(id, pl.rot, (float) pl.pitch, (float) off);
+                    sm.configure(id, pl.rot, (float) pitchUse, (float) off, hs);
                     sm.register(level);
                     sloped++;
+                    if (hs != null) {
+                        pieces++;
+                    }
                 } else {
                     skipped++;
                 }
             }
         }
         say(player, "Линия: обычных " + flat + ", наклонных " + sloped + (skipped > 0 ? ", пропущено " + skipped : "")
-            + (geo > 0 ? ", по миниблокам " + geo : "")
+            + (geo > 0 ? ", по миниблокам " + geo : "") + (pieces > 0 ? " (кусками " + pieces + ")" : "")
             + ", уклон " + String.format(Locale.ROOT, "%.1f", pl.pitch) + "\u00b0");
     }
 

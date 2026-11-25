@@ -39,6 +39,7 @@ jobs:
         run: |
           mkdir -p src/main/java/com/rinventor/ptm2/fixes
           cp PtmFixes.java src/main/java/com/rinventor/ptm2/fixes/PtmFixes.java
+          python3 tools/patch_fixes.py src/main/java/com/rinventor/ptm2/fixes/PtmFixes.java
           mkdir -p src/main/java/com/rinventor/ptm2/fixes/board
           cp board/*.java src/main/java/com/rinventor/ptm2/fixes/board/
           cat > settings.gradle <<'EOT'

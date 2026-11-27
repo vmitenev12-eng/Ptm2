@@ -20,7 +20,8 @@ import org.objectweb.asm.tree.VarInsnNode;
  *    считались дорогой и тротуаром (LittleBridge);
  * 2) добавление «Разметочного карандаша» во вкладку знаков (ModTabs.addCreative -> LineMarkerItem.creativeExtra);
  * 3) при установке блока разметки (RoadMarking.onPlace) — LittleBridge.onMarkingPlaced: подгонка по верху миниблоков;
- * 4) RoadMarking.connectableTypeAt — LittleBridge.connectable: линии разметки соединяются с наклонными плитками.
+ * 4) RoadMarking.connectableTypeAt — LittleBridge.connectable: линии разметки соединяются с наклонными плитками;
+ * 5) Vehicle.landingY — VehicleGround.landingFix: колёса стоят на верху частей-дороги миниблоков, а не на верху всей ячейки.
  * Usage: Patcher2 in.jar out.jar
  */
 public class Patcher2 implements Opcodes {
@@ -34,7 +35,9 @@ public class Patcher2 implements Opcodes {
     static final String BSTATE = "Lnet/minecraft/world/level/block/state/BlockState;";
     static final String WLEVEL = "Lnet/minecraft/world/level/Level;";
     static final String BPOS = "Lnet/minecraft/core/BlockPos;";
-    static final int EXPECTED = 5;
+    static final String VEHICLE = "com/rinventor/ptm2/objects/entities/vehicle/Vehicle";
+    static final String VG = "com/rinventor/ptm2/fixes/board/VehicleGround";
+    static final int EXPECTED = 6;
 
     public static void main(String[] args) throws Exception {
         int patched = 0;
@@ -59,6 +62,11 @@ public class Patcher2 implements Opcodes {
                         "(Lnet/minecraft/world/item/CreativeModeTab;Lnet/minecraft/resources/ResourceKey;Ljava/util/function/Consumer;)V",
                         LMI, "creativeExtra", "(Ljava/lang/Object;Ljava/lang/Object;)V", 2);
                     data = write(cn);
+                } else if (e.getName().equals(VEHICLE + ".class")) {
+                    ClassNode cn = new ClassNode();
+                    new ClassReader(data).accept(cn, 0);
+                    patched += hook(cn, "landingY", "(DDDD)D", VG, "landingFix", "(DLjava/lang/Object;DDDD)D", 5);
+                    data = write(cn);
                 } else if (e.getName().equals(ROADMARKING + ".class")) {
                     ClassNode cn = new ClassNode();
                     new ClassReader(data).accept(cn, 0);
@@ -75,7 +83,7 @@ public class Patcher2 implements Opcodes {
         }
         System.out.println("Patcher2: hooks = " + patched);
         if (patched != EXPECTED) {
-            System.err.println("ERROR: expected " + EXPECTED + " hooks (PTMBlock.getBlock x2, ModTabs.addCreative, RoadMarking.onPlace, RoadMarking.connectableTypeAt), got " + patched);
+            System.err.println("ERROR: expected " + EXPECTED + " hooks (PTMBlock.getBlock x2, ModTabs.addCreative, RoadMarking.onPlace, RoadMarking.connectableTypeAt, Vehicle.landingY), got " + patched);
             System.exit(1);
         }
     }
@@ -87,11 +95,12 @@ public class Patcher2 implements Opcodes {
     }
 
     /**
-     * kind 0: getBlock(level, x, y, z) - результат (ARETURN) пропускается через target(block, level, x, y, z);
+     * kind 0: getBlock(level, x, y, z) - результат (ARETURN) возвращается через target(block, level, x, y, z);
      * kind 1: getBlock(level, pos) - через target(block, level, pos);
      * kind 2: addCreative(tab, key, consumer) - перед RETURN вызывается target(tab, consumer);
      * kind 3: в начале метода onPlace(state, level, pos, old, moving) вызывается target(this, state, level, pos);
-     * kind 4: connectableTypeAt(level, pos, state, temporary) - результат (IRETURN) пропускается через target(result, level, pos, state, temporary).
+     * kind 4: connectableTypeAt(level, pos, state, temporary) - результат (IRETURN) возвращается через target(result, level, pos, state, temporary);
+     * kind 5: Vehicle.landingY(x, oldY, newY, z) - результат (DRETURN) возвращается через target(result, this, x, oldY, newY, z).
      */
     static int hook(ClassNode cn, String method, String desc, String owner, String target, String targetDesc, int kind) {
         for (MethodNode m : cn.methods) {
@@ -109,7 +118,7 @@ public class Patcher2 implements Opcodes {
                 return 1;
             }
             int n = 0;
-            int op = kind == 2 ? RETURN : (kind == 4 ? IRETURN : ARETURN);
+            int op = kind == 2 ? RETURN : (kind == 4 ? IRETURN : (kind == 5 ? DRETURN : ARETURN));
             for (AbstractInsnNode in : m.instructions.toArray()) {
                 if (in.getOpcode() != op) {
                     continue;
@@ -123,6 +132,12 @@ public class Patcher2 implements Opcodes {
                 } else if (kind == 1) {
                     l.add(new VarInsnNode(ALOAD, 0));
                     l.add(new VarInsnNode(ALOAD, 1));
+                } else if (kind == 5) {
+                    l.add(new VarInsnNode(ALOAD, 0));
+                    l.add(new VarInsnNode(DLOAD, 1));
+                    l.add(new VarInsnNode(DLOAD, 3));
+                    l.add(new VarInsnNode(DLOAD, 5));
+                    l.add(new VarInsnNode(DLOAD, 7));
                 } else if (kind == 4) {
                     l.add(new VarInsnNode(ALOAD, 0));
                     l.add(new VarInsnNode(ALOAD, 1));

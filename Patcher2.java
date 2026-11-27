@@ -9,7 +9,11 @@ import org.objectweb.asm.ClassWriter;
 import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.tree.AbstractInsnNode;
 import org.objectweb.asm.tree.ClassNode;
+import org.objectweb.asm.tree.FrameNode;
 import org.objectweb.asm.tree.InsnList;
+import org.objectweb.asm.tree.InsnNode;
+import org.objectweb.asm.tree.JumpInsnNode;
+import org.objectweb.asm.tree.LabelNode;
 import org.objectweb.asm.tree.MethodInsnNode;
 import org.objectweb.asm.tree.MethodNode;
 import org.objectweb.asm.tree.VarInsnNode;
@@ -21,7 +25,9 @@ import org.objectweb.asm.tree.VarInsnNode;
  * 2) добавление «Разметочного карандаша» во вкладку знаков (ModTabs.addCreative -> LineMarkerItem.creativeExtra);
  * 3) при установке блока разметки (RoadMarking.onPlace) — LittleBridge.onMarkingPlaced: подгонка по верху миниблоков;
  * 4) RoadMarking.connectableTypeAt — LittleBridge.connectable: линии разметки соединяются с наклонными плитками;
- * 5) Vehicle.landingY — VehicleGround.landingFix: колёса стоят на верху частей-дороги миниблоков, а не на верху всей ячейки.
+ * 5) Vehicle.landingY — VehicleGround.landingFix: колёса стоят на верху частей-дороги миниблоков, а не на верху всей ячейки;
+ * 6) TimeHelper.zoneID / setWorldTimeToMatchRealTime — ClimateLink: при установленном real_climate (real_time=true) пояс берётся
+ *    по долготе, а время мира ведёт только климат (необязательные хуки: при несовпадении сигнатуры только предупреждение).
  * Usage: Patcher2 in.jar out.jar
  */
 public class Patcher2 implements Opcodes {
@@ -37,10 +43,13 @@ public class Patcher2 implements Opcodes {
     static final String BPOS = "Lnet/minecraft/core/BlockPos;";
     static final String VEHICLE = "com/rinventor/ptm2/objects/entities/vehicle/Vehicle";
     static final String VG = "com/rinventor/ptm2/fixes/board/VehicleGround";
+    static final String TIMEHELPER = "com/rinventor/ptm2/engine/util/TimeHelper";
+    static final String CL = "com/rinventor/ptm2/fixes/board/ClimateLink";
     static final int EXPECTED = 6;
 
     public static void main(String[] args) throws Exception {
         int patched = 0;
+        int soft = 0;
         try (ZipFile in = new ZipFile(args[0]); ZipOutputStream out = new ZipOutputStream(new FileOutputStream(args[1]))) {
             Enumeration<? extends ZipEntry> en = in.entries();
             while (en.hasMoreElements()) {
@@ -62,6 +71,12 @@ public class Patcher2 implements Opcodes {
                         "(Lnet/minecraft/world/item/CreativeModeTab;Lnet/minecraft/resources/ResourceKey;Ljava/util/function/Consumer;)V",
                         LMI, "creativeExtra", "(Ljava/lang/Object;Ljava/lang/Object;)V", 2);
                     data = write(cn);
+                } else if (e.getName().equals(TIMEHELPER + ".class")) {
+                    ClassNode cn = new ClassNode();
+                    new ClassReader(data).accept(cn, 0);
+                    soft += hook(cn, "zoneID", "(" + WLEVEL + ")Ljava/time/ZoneId;", CL, "zoneFix", "(Ljava/time/ZoneId;" + WLEVEL + ")Ljava/time/ZoneId;", 6);
+                    soft += gate(cn, "setWorldTimeToMatchRealTime", "(" + WLEVEL + ")V", CL, "skipTime", "(" + WLEVEL + ")Z");
+                    data = write(cn);
                 } else if (e.getName().equals(VEHICLE + ".class")) {
                     ClassNode cn = new ClassNode();
                     new ClassReader(data).accept(cn, 0);
@@ -81,7 +96,10 @@ public class Patcher2 implements Opcodes {
                 out.closeEntry();
             }
         }
-        System.out.println("Patcher2: hooks = " + patched);
+        System.out.println("Patcher2: hooks = " + patched + ", climate hooks = " + soft + " of 2");
+        if (soft != 2) {
+            System.err.println("WARNING: climate hooks (TimeHelper.zoneID, setWorldTimeToMatchRealTime) not all applied");
+        }
         if (patched != EXPECTED) {
             System.err.println("ERROR: expected " + EXPECTED + " hooks (PTMBlock.getBlock x2, ModTabs.addCreative, RoadMarking.onPlace, RoadMarking.connectableTypeAt, Vehicle.landingY), got " + patched);
             System.exit(1);
@@ -100,7 +118,8 @@ public class Patcher2 implements Opcodes {
      * kind 2: addCreative(tab, key, consumer) - перед RETURN вызывается target(tab, consumer);
      * kind 3: в начале метода onPlace(state, level, pos, old, moving) вызывается target(this, state, level, pos);
      * kind 4: connectableTypeAt(level, pos, state, temporary) - результат (IRETURN) возвращается через target(result, level, pos, state, temporary);
-     * kind 5: Vehicle.landingY(x, oldY, newY, z) - результат (DRETURN) возвращается через target(result, this, x, oldY, newY, z).
+     * kind 5: Vehicle.landingY(x, oldY, newY, z) - результат (DRETURN) возвращается через target(result, this, x, oldY, newY, z);
+     * kind 6: static m(level) - результат (ARETURN) возвращается через target(result, level).
      */
     static int hook(ClassNode cn, String method, String desc, String owner, String target, String targetDesc, int kind) {
         for (MethodNode m : cn.methods) {
@@ -132,6 +151,8 @@ public class Patcher2 implements Opcodes {
                 } else if (kind == 1) {
                     l.add(new VarInsnNode(ALOAD, 0));
                     l.add(new VarInsnNode(ALOAD, 1));
+                } else if (kind == 6) {
+                    l.add(new VarInsnNode(ALOAD, 0));
                 } else if (kind == 5) {
                     l.add(new VarInsnNode(ALOAD, 0));
                     l.add(new VarInsnNode(DLOAD, 1));
@@ -152,6 +173,26 @@ public class Patcher2 implements Opcodes {
                 n++;
             }
             return n > 0 ? 1 : 0;
+        }
+        return 0;
+    }
+
+    /** В начале статического метода (Level)V: если target(level) вернул true, метод сразу завершается. */
+    static int gate(ClassNode cn, String method, String desc, String owner, String target, String targetDesc) {
+        for (MethodNode m : cn.methods) {
+            if (!m.name.equals(method) || !m.desc.equals(desc)) {
+                continue;
+            }
+            InsnList l = new InsnList();
+            LabelNode go = new LabelNode();
+            l.add(new VarInsnNode(ALOAD, 0));
+            l.add(new MethodInsnNode(INVOKESTATIC, owner, target, targetDesc, false));
+            l.add(new JumpInsnNode(IFEQ, go));
+            l.add(new InsnNode(RETURN));
+            l.add(go);
+            l.add(new FrameNode(F_SAME, 0, null, 0, null));
+            m.instructions.insert(l);
+            return 1;
         }
         return 0;
     }

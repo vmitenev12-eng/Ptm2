@@ -19,11 +19,12 @@ import net.minecraftforge.eventbus.api.SubscribeEvent;
 import net.minecraftforge.fml.common.Mod;
 
 /**
- * Тротуары и другие блоки ptm2 описаны моделями с собственными элементами, у которых нет cullface. LittleTiles берёт грани части
- * через model.getQuads(state, сторона, ...), а грани без cullface возвращаются только для стороны null, так что часть не рисуется
- * (контур и хитбокс есть, картинки нет). Обёртка: если запрос идёт из потока рендера LittleTiles и для стороны граней нет,
- * отдаётся грани без cullface, смотрящие в эту сторону. Обычная отрисовка мира не меняется (иначе грани рисовались бы
- * дважды). Регистрация - по аннотации @Mod.EventBusSubscriber на шине мода (класс входит в итоговый jar).
+ * Обёртка моделей ptm2 для LittleTiles:
+ * 1) грани без cullface: LittleTiles вызывает model.getQuads(state, сторона, ...) и ожидает, что у грани есть cullface,
+ *    иначе грань теряется (дырки в тротуарах из миниблоков);
+ * 2) плитки тротуаров (модели с shape не 0) внутри LittleTiles рисуются плоскими (модель shape=0): замороженный shape
+ *    давал бордюр на всей плитке, настоящий бордюр по краям рисует CurbOverlay. Обычные блоки не затрагиваются.
+ * Работает через @Mod.EventBusSubscriber (подхватывается и из отдельного jar).
  */
 @Mod.EventBusSubscriber(modid = "ptm2", bus = Mod.EventBusSubscriber.Bus.MOD, value = Dist.CLIENT)
 public final class LittleModelFix {
@@ -45,23 +46,35 @@ public final class LittleModelFix {
             if (!"ptm2".equals(key.getNamespace()) || !(key instanceof ModelResourceLocation)) {
                 continue;
             }
-            if ("inventory".equals(((ModelResourceLocation) key).getVariant())) {
+            String variant = ((ModelResourceLocation) key).getVariant();
+            if ("inventory".equals(variant)) {
                 continue;
             }
             BakedModel m = e.getValue();
             if (m != null && !(m instanceof NoCullWrapper)) {
-                e.setValue(new NoCullWrapper(m));
+                BakedModel flat = null;
+                if (CurbOverlay.ENABLED && key.getPath().contains("sidewalk") && variant.contains("shape=") && !variant.contains("shape=0")) {
+                    String alt = variant.replaceAll("shape=\\d+", "shape=0");
+                    flat = models.get(new ModelResourceLocation(key.getNamespace(), key.getPath(), alt));
+                }
+                e.setValue(new NoCullWrapper(m, flat));
             }
         }
     }
 
     private static final class NoCullWrapper extends BakedModelWrapper<BakedModel> {
-        NoCullWrapper(BakedModel original) {
+        private final BakedModel flat;
+
+        NoCullWrapper(BakedModel original, BakedModel flat) {
             super(original);
+            this.flat = flat;
         }
 
         @Override
         public List<BakedQuad> getQuads(BlockState state, Direction side, RandomSource rand, ModelData data, RenderType renderType) {
+            if (flat != null && LITTLE_THREAD.get(Thread.currentThread().getClass())) {
+                return flat.getQuads(state, side, rand, data, renderType);
+            }
             List<BakedQuad> list = super.getQuads(state, side, rand, data, renderType);
             if (side != null && list.isEmpty() && LITTLE_THREAD.get(Thread.currentThread().getClass())) {
                 List<BakedQuad> out = null;
